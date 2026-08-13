@@ -26,7 +26,7 @@ export interface ToolContext {
   cwd: string
   // 路径围栏：非空时文件工具禁止写入该根目录之外（团队成员 worktree 隔离）
   rootLock?: string
-  // 额外允许写路径（rootLock 外,如报告产出目录 D:\reverse-notes——逆向角色的产出物契约）
+  // 额外允许写路径（rootLock 外,如报告产出目录 D:\reverse-notes——专家的产出物契约）
   rootLockExtra?: string[]
   timeoutMs?: number
   permission?: PermissionContext
