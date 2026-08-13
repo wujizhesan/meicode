@@ -1,0 +1,39 @@
+{
+  "name": "meicode",
+  "version": "0.1.0",
+  "description": "MeiCode — 终端命令行 AI 助手",
+  "type": "module",
+  "bin": {
+    "meicode": "src/cli.tsx"
+  },
+  "scripts": {
+    "start": "node --import tsx src/cli.tsx",
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx test/smoke.ts && node --import tsx test/tools_test.ts && node --import tsx test/loop_test.ts && node --import tsx test/permission_test.ts && node --import tsx test/mode_test.ts && node --import tsx test/mcp_test.ts && node --import tsx test/context_test.ts && node --import tsx test/memory_test.ts && node --import tsx test/commands_test.ts && node --import tsx test/skill_test.ts && node --import tsx test/hook_test.ts && node --import tsx test/subagent_test.ts && node --import tsx test/worktree_test.ts && node --import tsx test/team_test.ts && node --import tsx test/provider_test.ts && node --import tsx test/audit_test.ts && node --import tsx test/approval_test.ts && node --import tsx test/tui_smoke.tsx"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "@alcalzone/ansi-tokenize": "^0.3.0",
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "eventsource-parser": "^3.1.0",
+    "ink": "^7.1.1",
+    "minimatch": "^10.2.6",
+    "pixelmatch": "^7.2.0",
+    "playwright-core": "^1.62.1",
+    "pngjs": "^7.0.0",
+    "react": "^19.2.8",
+    "typescript5": "npm:typescript@^5.9.3",
+    "yaml": "^2.9.0"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/node": "^26.2.0",
+    "@types/pngjs": "^6.0.5",
+    "@types/react": "^19.2.18",
+    "tsx": "^4.23.11",
+    "typescript": "^7.0.2"
+  },
+  "engines": {
+    "node": ">=20.11"
+  }
+}

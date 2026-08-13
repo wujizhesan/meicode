@@ -1,0 +1,25 @@
+import { realpath } from 'node:fs/promises'
+import { join, sep, isAbsolute, dirname } from 'node:path'
+
+// 解析符号链接后的真实路径；文件不存在时对最深已存在祖先 realpath 再拼接
+export async function resolveReal(target: string): Promise<string> {
+  let current = target
+  const suffix: string[] = []
+  while (true) {
+    try {
+      const real = await realpath(current)
+      return suffix.length === 0 ? real : join(real, ...suffix.reverse())
+    } catch {
+      suffix.push(current.split(sep).pop() ?? '')
+      const parent = dirname(current)
+      if (parent === current) return target
+      current = parent
+    }
+  }
+}
+
+export async function isPathAllowed(target: string, cwd: string): Promise<boolean> {
+  const absolute = isAbsolute(target) ? target : join(cwd, target)
+  const real = await resolveReal(absolute)
+  return real === cwd || real.startsWith(cwd + sep)
+}
