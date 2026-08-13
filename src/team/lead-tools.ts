@@ -26,7 +26,7 @@ export function createLeadTools(team: TeamManager): Tool[] {
     {
       name: 'team_spawn',
       description:
-        '派生团队成员（协程驻留，独立上下文执行任务）。group=组名 member=成员名 role=角色名。专家角色清单：research-expert 调研（write_paths 允许写报告契约目录）/ data-expert 数据获取 / protocol-expert 协议签名分析 / implement-expert 实现 / qa-expert 验证 / frontend-expert 前端 / backend-expert 后端 / testing-expert 测试 / security-expert 安全 / general-purpose 通用。调研类任务用 research-expert（有契约目录写权限），不要用 general-purpose。',
+        '派生团队成员（协程驻留，独立上下文执行任务）。group=组名 member=成员名 role=角色名。专家角色清单：recon-expert 逆向侦察（write_paths 允许写 D:/reverse-notes 报告契约目录）/ replicator-expert 复刻 / verifier-expert 验证 / jsr-expert JS 签名加密 / acquisition-expert 数据采集 / frontend-expert 前端 / backend-expert 后端 / testing-expert 测试 / security-expert 安全 / general-purpose 通用。逆向侦察类任务必须用 recon-expert（有契约目录写权限），不要用 general-purpose。',
       parameters: {
         type: 'object',
         properties: {

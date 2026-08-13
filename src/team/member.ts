@@ -38,7 +38,7 @@ export class MemberHost {
   private rolePrompt: string // 专家角色 SOP 正文（对齐 Qoder 专家团：角色=领域+专属指令）
   private roleToolsDeny: string[] // 角色禁用的工具（tools_deny frontmatter）
   private roleToolsAllow: string[] // 角色追加的工具（tools_allow frontmatter）
-  private roleMaxRounds: number | undefined // 角色 max_rounds（team-lead 30 轮 vs 默认 15——复杂编排收尾需要）
+  private roleMaxRounds: number | undefined // 角色 max_rounds（reverse-manager 30 轮 vs 默认 15——复杂编排收尾需要）
 
   constructor(
     member: TeamMember,

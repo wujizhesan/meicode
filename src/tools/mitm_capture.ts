@@ -3,7 +3,7 @@ import { join } from 'node:path'
 import { spawn, execSync } from 'node:child_process'
 import type { Tool, ToolContext, ToolResult } from './types.ts'
 
-// 抓包工具(data-expert 用):mitmdump 后台代理 + 请求日志解析
+// 抓包工具(acquisition-expert 用):mitmdump 后台代理 + 请求日志解析
 // 注: mitmdump -w flow 文件在 Windows 被杀时不 flush(0 字节)——改用 stdout 日志
 // (实时写入),list 解析文本日志
 // action=start 启动代理(默认端口 8080,日志写 <cwd>/.mewcode/captures/<ts>.log)
