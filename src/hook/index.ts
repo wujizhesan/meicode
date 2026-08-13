@@ -1,0 +1,5 @@
+export { HookEngine } from './engine.ts'
+export { loadHooks } from './loader.ts'
+export { matchPattern, matchCondition } from './matcher.ts'
+export { setSubagentSpawner } from './runner.ts'
+export type { HookRule, HookAction, HookCondition, HookClause, HookContext, HookEventName } from './types.ts'

@@ -1,0 +1,15 @@
+node_modules/
+.mewcode/
+reverse-notes/
+test/fixtures_*/
+test/fixtures/
+*.log
+.env*
+*.local.*
+dbg_*_tmp.mjs
+.tmp-*/
+_*.mjs
+_*.py
+_*.cjs
+AGENTS.md
+SESSION_LOG.md
