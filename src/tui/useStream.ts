@@ -14,10 +14,13 @@ import type { HookEngine } from '../hook/engine.ts'
 import type { SubAgentManager } from '../subagent/index.ts'
 import type { TeamManager } from '../team/index.ts'
 import { resolveMode } from './mode.ts'
+import type { RuntimeEventLog } from '../runtime/index.ts'
+import { createRuntimeId } from '../runtime/index.ts'
 
 export interface MemoryContext {
   sessionStore?: SessionStore
   sessionId?: string
+  runtimeEvents?: RuntimeEventLog
   instructions?: string
   noteUserDir?: string
   noteProjectDir?: string
@@ -56,6 +59,7 @@ export function useStreamingChat(
   // 可能落在 assistant(tool_calls) 与 tool 结果之间导致 400）；
   // 改为缓存队列，由 loop 每轮请求前注入为末尾 system（见 loop.ts injectSystem）
   const pendingSubResults = useRef<string[]>([])
+  const agentIdRef = useRef(createRuntimeId('agent'))
   subAgentManager?.setOnResult((record) => {
     if (!record.result) return
     const text = `📦 [子任务 ${record.role}] ${record.result}`
@@ -82,6 +86,9 @@ export function useStreamingChat(
 
   const ctx: ToolContext = {
     cwd: process.cwd(),
+    sessionId: memory?.sessionId,
+    agentId: agentIdRef.current,
+    runtimeEvents: memory?.runtimeEvents,
     timeoutMs: 30000,
     permission: { mode: permModeState, engine, autoAcceptEdits: autoEditsRef.current },
     ask,
@@ -97,6 +104,7 @@ export function useStreamingChat(
     hooks: hooks ?? undefined,
   })
   ctx.spill = (results) => spillBatch(results, process.cwd())
+  ctx.contextBudget = () => contextManager.snapshot()
   ctx.beforeRequest = (mode) => contextManager.beforeRequest(mode)
   ctx.afterRequest = (usage, count) => contextManager.afterRequest(usage, count)
 

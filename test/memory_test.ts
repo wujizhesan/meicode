@@ -133,6 +133,21 @@ async function main() {
     if (latest.messages.some((m) => m.content === '后续完整回复')) throw new Error('后续完整消息被误删')
   })
 
+  await check('会话: 非法 ID 不得越界访问', async () => {
+    const dir = join(TMP, 'sessions-safe')
+    const store = new SessionStore(dir)
+    const outside = join(TMP, 'outside-session.jsonl')
+    let rejected = false
+    try {
+      store.append('../outside-session', [{ role: 'user', content: 'blocked' }])
+    } catch {
+      rejected = true
+    }
+    if (!rejected || existsSync(outside)) throw new Error('非法 ID 未被拒绝')
+    if (store.recoverById('../outside-session') !== null) throw new Error('非法 ID 被恢复')
+    if (store.removeById('../outside-session')) throw new Error('非法 ID 被删除')
+  })
+
   await check('会话: 30 天清理', async () => {
     const dir = join(TMP, 'sessions')
     const store = new SessionStore(dir)

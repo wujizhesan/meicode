@@ -1,0 +1,41 @@
+name: Release
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Test
+        run: npm test
+      - name: Package smoke test
+        run: npm run package:smoke
+      - name: Build release asset
+        shell: bash
+        run: |
+          npm run build
+          mkdir -p release
+          npm pack --pack-destination release --ignore-scripts
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          gh release create "v${VERSION}" "release/meicode-${VERSION}.tgz" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "MeiCode v${VERSION}" \
+            --generate-notes

@@ -7,15 +7,26 @@ import type { AgentEvent, AgentHandle, AgentOptions, AgentResult, StopReason } f
 import { buildSystemPrompt, buildEnvironmentInfo, sessionDirective } from './prompt/index.ts'
 import { checkPermission } from '../permission/index.ts'
 import type { Rule } from '../permission/types.ts'
+import type { RuntimeEventInput } from '../runtime/index.ts'
 
 const READ_ONLY_TOOLS = new Set(['read_file', 'find_files', 'grep_code'])
 // 写类工具:重复检测阈值(5 次)——写死循环仍止损,但写同一文件迭代(报告草稿/读回再写)是合法场景,
 // 3 次误杀过主会话写报告(实战实锤)
 const WRITE_TOOLS = new Set(['write_file', 'edit_file'])
 
+function emitRuntimeEvent(ctx: ToolContext, input: Omit<RuntimeEventInput, 'sessionId'>): void {
+  const sessionId = ctx.sessionId ?? ctx.agentId
+  if (!ctx.runtimeEvents || !sessionId) return
+  try {
+    ctx.runtimeEvents.append({ ...input, sessionId })
+  } catch {
+  }
+}
+
 export function runAgent(opts: AgentOptions): AgentHandle {
   const { provider, history, registry, ctx, maxIterations, mode, unknownToolLimit } = opts
   const controller = new AbortController()
+  const toolCtx: ToolContext = { ...ctx, signal: controller.signal }
 
   // ---------- 事件流 ----------
   const eventQueue: AgentEvent[] = []
@@ -63,6 +74,12 @@ export function runAgent(opts: AgentOptions): AgentHandle {
     const recentCallSigs: string[] = []
     const REPEAT_WINDOW = 6
 
+    emitRuntimeEvent(ctx, {
+      type: 'run_started',
+      agentId: ctx.agentId,
+      payload: { mode, maxIterations },
+    })
+
     // 主 system：稳定前缀（与轮次无关，逐字节一致以命中缓存）
     const systemMain = opts.systemPrompt || buildSystemPrompt(mode)
     // P10：Skill 白名单收窄优先于模式过滤
@@ -87,6 +104,12 @@ export function runAgent(opts: AgentOptions): AgentHandle {
       let roundError: string | null = null
 
       // P7：请求前上下文检查（轻量预防 + 重量兜底）
+      emitRuntimeEvent(ctx, {
+        type: 'turn_started',
+        agentId: ctx.agentId,
+        turn: round,
+        payload: { mode },
+      })
       await ctx.beforeRequest?.('auto')
 
       log('info', `round ${round}/${maxIterations} 请求 model=${opts.systemPrompt ? 'custom' : mode} msgs=${history.length}`)
@@ -112,6 +135,19 @@ export function runAgent(opts: AgentOptions): AgentHandle {
         msgs.push({ role: 'system', content: c })
       }
 
+      emitRuntimeEvent(ctx, {
+        type: 'context_snapshot',
+        agentId: ctx.agentId,
+        turn: round,
+        payload: { ...(ctx.contextBudget?.() ?? {}) },
+      })
+      emitRuntimeEvent(ctx, {
+        type: 'model_request',
+        agentId: ctx.agentId,
+        turn: round,
+        payload: { messageCount: msgs.length, toolCount: tools.length, contextBudget: { ...(ctx.contextBudget?.() ?? {}) } },
+      })
+
       for await (const ev of provider.streamChat(msgs, { thinking: false, tools, signal: controller.signal })) {
         if (controller.signal.aborted) break
         if (ev.type === 'text') {
@@ -121,6 +157,13 @@ export function runAgent(opts: AgentOptions): AgentHandle {
           emit({ type: 'thinking', text: ev.text })
         } else if (ev.type === 'tool_call') {
           roundCalls.push(ev)
+          emitRuntimeEvent(ctx, {
+            type: 'tool_call',
+            agentId: ctx.agentId,
+            turn: round,
+            correlationId: ev.id,
+            payload: { name: ev.name, arguments: ev.arguments },
+          })
         } else if (ev.type === 'usage') {
           totalTokens += ev.inputTokens + ev.outputTokens
           ctx.afterRequest?.(ev.inputTokens, history.length)
@@ -209,10 +252,17 @@ export function runAgent(opts: AgentOptions): AgentHandle {
         tool_calls: roundCalls.map((c) => ({ id: c.id, name: c.name, arguments: JSON.stringify(c.arguments) })),
       })
 
-      const executed = await executeBatch(roundCalls, registry, ctx, (call, result) => {
+      const executed = await executeBatch(roundCalls, registry, toolCtx, (call, result) => {
         // P11：tool_after Hook
         void ctx.hooks?.fire('tool_after', { cwd: ctx.cwd, call: { name: call.name, args: call.arguments } })
         log('info', `tool ${call.name} ${result.success ? 'ok' : 'fail'}${result.error ? `: ${result.error.slice(0, 120)}` : ''}`)
+        emitRuntimeEvent(ctx, {
+          type: 'tool_result',
+          agentId: ctx.agentId,
+          turn: round,
+          correlationId: call.id,
+          payload: { name: call.name, success: result.success, truncated: result.truncated, error: result.error, evidence: result.evidence },
+        })
         emit({
           type: 'tool_result',
           id: call.id,
@@ -277,6 +327,11 @@ export function runAgent(opts: AgentOptions): AgentHandle {
       // 忽略
     }
     ctx.hooks?.resetRound()
+    emitRuntimeEvent(ctx, {
+      type: 'run_finished',
+      agentId: ctx.agentId,
+      payload: { reason, rounds: Math.min(round, maxIterations), totalTokens, error: roundErrorMessage ?? fatalError },
+    })
     emit({
       type: 'done',
       reason,
@@ -342,6 +397,11 @@ async function executeOne(
       cwd: ctx.cwd,
       mode: ctx.permission.mode,
       engine: ctx.permission.engine,
+      autoAcceptEdits: ctx.permission.autoAcceptEdits,
+      allowedWritePaths: [
+        ...(ctx.rootLock ? [ctx.rootLock] : []),
+        ...(ctx.rootLockExtra ?? []),
+      ],
     })
     if (decision.type === 'ask') {
       // 权限请求 hook：弹确认前通知外部（审计/自动决策）

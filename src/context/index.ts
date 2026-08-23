@@ -1,4 +1,4 @@
-export { ContextManager, type ContextManagerOptions } from './manager.ts'
+export { ContextManager, type ContextManagerOptions, type ContextBudgetSnapshot } from './manager.ts'
 export { TokenEstimator } from './estimate.ts'
 export { spillBatch, spillContent, needsSpill, SPILL_THRESHOLD, BATCH_THRESHOLD, PREVIEW_LEN } from './spill.ts'
 export {

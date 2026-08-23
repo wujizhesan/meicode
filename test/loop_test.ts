@@ -160,6 +160,20 @@ async function main() {
     if (result.reason !== 'cancelled') throw new Error(`reason=${result.reason}`)
   })
 
+  await check('cancelled: cancel 会终止正在运行的命令', async () => {
+    const p = new FakeAgentProvider(() => ({
+      events: [{ type: 'tool_call', id: 'call_cmd_cancel', name: 'run_command', arguments: { command: 'ping -n 8 127.0.0.1', timeout: 10000 } }, { type: 'done' }],
+    }))
+    const history = new History()
+    history.push({ role: 'user', content: '取消命令' })
+    const agent = runAgent(baseOpts(p, history))
+    const started = Date.now()
+    setTimeout(() => agent.cancel(), 80)
+    const { result } = await consume(agent)
+    if (result.reason !== 'cancelled') throw new Error(`reason=${result.reason}`)
+    if (Date.now() - started > 3000) throw new Error('取消后命令仍等待到超时')
+  })
+
   await check('unknown_tool: 连续 2 次未知工具停止', async () => {
     const p = new FakeAgentProvider(() => ({
       events: [

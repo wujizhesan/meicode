@@ -112,7 +112,7 @@ async function main() {
     if (r.success || !r.error!.includes('超时')) throw new Error(`应超时: ${JSON.stringify(r)}`)
   })
   await check('run_command: 非零退出码', async () => {
-    const r = await tools[3].execute({ command: 'node', args: ['-e', 'process.exit(3)'] }, ctx)
+    const r = await tools[3].execute({ command: 'node', args: ['-e', 'process.exit(3)'], timeout: 5000 }, ctx)
     if (r.success || !r.error!.includes('退出码 3')) throw new Error(`退出码错误: ${JSON.stringify(r)}`)
   })
   await check('run_command: 命令不存在', async () => {
@@ -122,6 +122,12 @@ async function main() {
     if (!r.error!.includes('退出码') && !r.error!.includes('启动失败')) {
       throw new Error(`错误信息不符: ${r.error}`)
     }
+  })
+  await check('run_command: args 也受路径围栏保护', async () => {
+    const lockedCtx: ToolContext = { ...ctx, rootLock: TMP }
+    const outside = `${TMP}-outside.txt`
+    const r = await tools[3].execute({ command: 'echo', args: ['x', '>', outside] }, lockedCtx)
+    if (r.success || !r.error?.includes('工作目录外')) throw new Error(`args 路径未拦截: ${JSON.stringify(r)}`)
   })
 
   // ---------- find_files ----------

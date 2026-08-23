@@ -1,7 +1,7 @@
 import { render } from 'ink'
 import { homedir } from 'node:os'
-import { statSync } from 'node:fs'
 import { join } from 'node:path'
+import { initializeConfig } from './config/init.ts'
 import { loadConfigWithMcp } from './config/loader.ts'
 import { createProvider } from './provider/index.ts'
 import { History } from './session/history.ts'
@@ -12,7 +12,7 @@ import { McpClientManager } from './mcp/index.ts'
 import { SessionStore, loadInstructions, newSessionId } from './memory/index.ts'
 import { SkillManager, createLoadSkillTool } from './skill/index.ts'
 import { loadHooks, HookEngine, setSubagentSpawner } from './hook/index.ts'
-import { SubAgentManager, createSpawnAgentTool, agentDirs } from './subagent/index.ts'
+import { SubAgentManager, SubAgentStore, createSpawnAgentTool, agentDirs } from './subagent/index.ts'
 import { WorktreeManager } from './worktree/index.ts'
 import { createLeadTools } from './team/lead-tools.ts'
 import { runAgent } from './agent/loop.ts'
@@ -21,14 +21,23 @@ import { buildNotesIndex } from './memory/notes.ts'
 import type { ToolContext } from './tools/index.ts'
 import { TeamManager } from './team/index.ts'
 import { createAcpServer } from './acp.ts'
+import { createA2aServer } from './a2a.ts'
+import { createA2aTools } from './a2a/tools.ts'
 import { initLogger, log } from './log.ts'
 import type { MemoryContext } from './tui/useStream.ts'
 import type { ProviderConfig } from './config/types.ts'
+import { RuntimeEventLog, createRuntimeId } from './runtime/index.ts'
 
-function parseArgs(argv: string[]): { config?: string; run?: string; acpPort?: number } {
+function parseArgs(argv: string[]): { config?: string; run?: string; init?: boolean; doctor?: boolean; acpPort?: number; acpHost?: string; acpToken?: string; a2aPort?: number; a2aToken?: string } {
   let config: string | undefined
   let run: string | undefined
+  let init = false
+  let doctor = false
   let acpPort: number | undefined
+  let acpHost: string | undefined
+  let acpToken: string | undefined
+  let a2aPort: number | undefined
+  let a2aToken: string | undefined
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === '--config' && argv[i + 1]) {
       config = argv[i + 1]
@@ -36,23 +45,58 @@ function parseArgs(argv: string[]): { config?: string; run?: string; acpPort?: n
     } else if (argv[i] === '--run' && argv[i + 1]) {
       run = argv[i + 1]
       i++
+    } else if (argv[i] === '--init') {
+      init = true
+    } else if (argv[i] === '--doctor') {
+      doctor = true
     } else if (argv[i] === '--acp-port' && argv[i + 1]) {
       acpPort = Number(argv[i + 1])
       i++
+    } else if (argv[i] === '--acp-host' && argv[i + 1]) {
+      acpHost = argv[i + 1]
+      i++
+    } else if (argv[i] === '--acp-token' && argv[i + 1]) {
+      acpToken = argv[i + 1]
+      i++
+    } else if (argv[i] === '--a2a-port' && argv[i + 1]) {
+      a2aPort = Number(argv[i + 1])
+      i++
+    } else if (argv[i] === '--a2a-token' && argv[i + 1]) {
+      a2aToken = argv[i + 1]
+      i++
     }
   }
-  return { config, run, acpPort }
+  return { config, run, init, doctor, acpPort, acpHost, acpToken, a2aPort, a2aToken }
 }
 
 export async function main(): Promise<void> {
+  const { config, run: runTask, init, doctor, acpPort, acpHost, acpToken, a2aPort, a2aToken } = parseArgs(process.argv.slice(2))
+  if (init) {
+    const target = config ?? join(homedir(), '.mewcode', 'config.yaml')
+    const result = initializeConfig(join(import.meta.dirname, '..', 'config.example.yaml'), target)
+    console.log(result.created ? `已创建配置文件: ${result.path}` : `配置文件已存在，未覆盖: ${result.path}`)
+    return
+  }
+  if (doctor) {
+    try {
+      const loaded = loadConfigWithMcp(config)
+      console.log(`配置有效: provider=${loaded.provider.name} protocol=${loaded.provider.protocol} model=${loaded.provider.model} mcp=${loaded.mcpServers.length} a2a=${loaded.a2aAgents.length}`)
+    } catch (error) {
+      console.error(`配置无效: ${(error as Error).message}`)
+      process.exitCode = 1
+    }
+    return
+  }
   initLogger(process.cwd())
-  const { config, run: runTask, acpPort } = parseArgs(process.argv.slice(2))
   let cfg: ProviderConfig
   let mcpServers
+  let a2aAgents: import('./a2a/config.ts').A2aAgentConfig[] = []
   try {
     const loaded = loadConfigWithMcp(config)
     cfg = loaded.provider
     mcpServers = loaded.mcpServers
+    a2aAgents = loaded.a2aAgents
+    for (const s of loaded.a2aSkipped) console.warn(`[A2A] 配置跳过: ${s}`)
     for (const s of loaded.mcpSkipped) console.warn(`[MCP] 配置跳过: ${s}`)
   } catch (e) {
     log('error', `配置加载失败: ${(e as Error).message}`)
@@ -60,7 +104,7 @@ export async function main(): Promise<void> {
     process.exit(1)
   }
 
-  if (!process.stdin.isTTY && !runTask && !acpPort) {
+  if (!process.stdin.isTTY && !runTask && !acpPort && !a2aPort) {
     log('error', '非 TTY 环境启动被拒')
     console.error('MeiCode: 需要交互式终端（TTY）才能运行 TUI(--run/--acp-port 除外)，请直接在终端中启动')
     process.exit(1)
@@ -70,6 +114,7 @@ export async function main(): Promise<void> {
   const history = new History()
   const registry = new ToolRegistry()
   createTools({ cwd: process.cwd() }).forEach((t) => registry.register(t))
+  createA2aTools(a2aAgents).forEach((t) => registry.register(t))
   const engine = new RuleEngine(
     join(homedir(), '.mewcode', 'rules.yaml'),
     join(process.cwd(), '.mewcode', 'rules.yaml'),
@@ -89,10 +134,12 @@ export async function main(): Promise<void> {
     console.log(`[记忆] 已恢复会话 ${recovered.id}（${recovered.messages.length} 条消息）`)
   }
   const sessionId = recovered?.id ?? newSessionId()
+  const runtimeEvents = new RuntimeEventLog(join(process.cwd(), '.mewcode', 'runtime-events'))
   const instructions = await loadInstructions(process.cwd())
   const memory: MemoryContext = {
     sessionStore,
     sessionId,
+    runtimeEvents,
     instructions: instructions || undefined,
     noteUserDir: join(homedir(), '.mewcode', 'memory'),
     noteProjectDir: join(process.cwd(), '.mewcode', 'memory'),
@@ -121,13 +168,17 @@ export async function main(): Promise<void> {
   const worktreeManager = new WorktreeManager(process.cwd())
   const cleaned = await worktreeManager.cleanup(7).catch(() => 0)
   if (cleaned > 0) console.warn(`[Worktree] 已清理 ${cleaned} 个过期 worktree`)
-  const subAgentManager = new SubAgentManager(agentDirs(process.cwd()), worktreeManager)
+  const subAgentStore = new SubAgentStore(join(process.cwd(), '.mewcode', 'subagents'), sessionId)
+  const subAgentManager = new SubAgentManager(agentDirs(process.cwd()), worktreeManager, subAgentStore)
   subAgentManager.loadRoles()
   registry.register(createSpawnAgentTool(subAgentManager, { provider, registry }))
   // 成员/子 Agent 共享上下文：接入权限系统（黑名单/路径沙箱/规则引擎对成员生效；
   // 无 UI ask 通道，default 模式下 ask 会被拒绝——成员只走界内/规则允许的操作）
   const agentCtx = {
     cwd: process.cwd(),
+    sessionId,
+    runtimeEvents,
+    agentId: createRuntimeId('agent'),
     timeoutMs: 30000,
     // 成员/子 Agent:permissive(未命中规则放行)——成员无 ask 通道,default 下
     // 任何未命中规则的工具调用都失败(实战发现:经理调 team_spawn 被拦);
@@ -166,22 +217,75 @@ export async function main(): Promise<void> {
   // --run 自主模式:非交互执行任务(无人值守,输出结果后退出)
   // 团队编排在自主模式下可用——team_assign 同步等待专家完成
   if (runTask) {
-    await runHeadless(runTask, { provider, history, registry, engine, memory, teamManager })
+    try {
+      await runHeadless(runTask, { provider, history, registry, engine, memory, teamManager })
+    } finally {
+      await Promise.allSettled([teamManager.close(), subAgentManager.close()])
+    }
     process.exit(0)
   }
 
   // ACP server:编程入口(脚本/其他工具通过 HTTP+SSE 驱动 agent)
+  let acpServer: ReturnType<typeof createAcpServer> | null = null
   if (acpPort) {
     const memoryTail = memory?.instructions || memory?.noteUserDir || memory?.noteProjectDir
       ? `\n\n## 项目指令\n${memory?.instructions ?? '（无）'}\n\n## 记忆索引\n${
           memory?.noteUserDir && memory?.noteProjectDir ? buildNotesIndex(memory.noteUserDir, memory.noteProjectDir) : '（无）'
         }`
       : ''
-    const acpServer = createAcpServer({ provider, registry, engine, cwd: process.cwd(), memoryTail })
-    acpServer.listen(acpPort, () => {
-      console.log(`[ACP] 服务已启动 :${acpPort} (POST /session/new → /session/:id/prompt)`)
+    const resolvedAcpHost = acpHost || '127.0.0.1'
+    acpServer = createAcpServer({
+      provider,
+      registry,
+      engine,
+      cwd: process.cwd(),
+      memoryTail,
+      authToken: acpToken || process.env.MEICODE_ACP_TOKEN,
+      runtimeEvents,
+      sessionId,
+    })
+    acpServer.listen(acpPort, resolvedAcpHost, () => {
+      console.log(`[ACP] 服务已启动 ${resolvedAcpHost}:${acpPort} (POST /session/new → /session/:id/prompt)`)
     })
   }
+
+  let a2aServer: ReturnType<typeof createA2aServer> | null = null
+  if (a2aPort) {
+    const a2aMemoryTail = memory?.instructions ?? ''
+    a2aServer = createA2aServer({
+      provider,
+      registry,
+      engine,
+      cwd: process.cwd(),
+      memoryTail: a2aMemoryTail,
+      baseUrl: `http://127.0.0.1:${a2aPort}`,
+      authToken: a2aToken || process.env.MEICODE_A2A_TOKEN,
+      taskRoot: join(process.cwd(), '.mewcode', 'a2a', 'tasks'),
+      runtimeEvents,
+      sessionId,
+    })
+    a2aServer.listen(a2aPort, '127.0.0.1', () => {
+      console.log(`[A2A] 服务已启动:127.0.0.1:${a2aPort} (GET /.well-known/agent-card.json)`)
+    })
+  }
+
+  let shuttingDown = false
+  const shutdown = async (code: number): Promise<void> => {
+    if (shuttingDown) return
+    shuttingDown = true
+    await Promise.allSettled([teamManager.close(), subAgentManager.close(), ...(mcpManager ? [mcpManager.closeAll()] : [])])
+    if (acpServer) {
+      acpServer.closeAllConnections()
+      await new Promise<void>((resolve) => acpServer!.close(() => resolve()))
+    }
+    if (a2aServer) {
+      a2aServer.closeAllConnections()
+      await new Promise<void>((resolve) => a2aServer!.close(() => resolve()))
+    }
+    process.exit(code)
+  }
+  process.once('SIGINT', () => void shutdown(130))
+  process.once('SIGTERM', () => void shutdown(143))
 
   render(
     <App
@@ -221,6 +325,9 @@ async function runHeadless(
     : ''
   const ctx: ToolContext = {
     cwd: process.cwd(),
+    sessionId: memory.sessionId,
+    agentId: createRuntimeId('agent'),
+    runtimeEvents: memory.runtimeEvents,
     timeoutMs: 30000,
     // headless 无人值守:permissive(未命中规则放行,黑名单/只读豁免仍生效),不弹窗
     permission: { mode: 'permissive', engine, autoAcceptEdits: true },
@@ -249,9 +356,7 @@ async function runHeadless(
   // 主会话可能用了异步指派,经理还在跑就 exit 会丢任务(baidupan 轮:120s 死限提前退出,
   // 子任务②协程被杀、history 未 persist、API 报告丢失)
   // 无硬死限(10 分钟兜底) + 卡死检测(60s 无日志活动且有 in_progress → 协程真死才退出)
-  const LOG_FILE = join(process.cwd(), '.mewcode', 'meicode.log')
   // 从等待开始计时(不能用文件旧 mtime——历史日志会让首轮就误判卡死)
-  let lastLogMtime = Date.now()
   const deadline = Date.now() + 600000
   let waited = false
   while (Date.now() < deadline) {
@@ -262,16 +367,8 @@ async function runHeadless(
       console.log('[等待] 团队任务执行中...')
       waited = true
     }
-    await new Promise((r) => setTimeout(r, 3000))
-    let mtime = lastLogMtime
-    try {
-      mtime = statSync(LOG_FILE).mtimeMs
-    } catch {
-      // 日志文件不存在时保持上次值
-    }
-    if (mtime > lastLogMtime) {
-      lastLogMtime = mtime // 有活动(成员在跑)→ 重置卡死计时
-    } else if (Date.now() - lastLogMtime > 60000) {
+    const event = await memory.runtimeEvents?.waitForEvent(memory.sessionId ?? ctx.agentId!, Math.min(60000, deadline - Date.now()))
+    if (!event && opts.teamManager.listGroups().some((g) => opts.teamManager.listTasks(g).some((t) => t.status === 'in_progress'))) {
       console.log('[等待] 团队任务卡死(60s 无日志活动),退出')
       break
     }

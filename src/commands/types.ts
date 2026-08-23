@@ -29,6 +29,7 @@ export interface UiController {
   skillDeactivate(name: string): string
   teamAction(action: string, args: string[]): string
   workflowAction(action: string, args: string[]): string
+  auditAction(args: string[]): string
 }
 
 export interface ParsedCommand {

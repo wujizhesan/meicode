@@ -153,6 +153,18 @@ async function main() {
     if (r1.success || !r1.error!.includes('[MCP 错误]')) throw new Error(`未知 Server 未结构化: ${JSON.stringify(r1)}`)
   })
 
+  await check('stdio: 并发首次调用只建立一个连接', async () => {
+    const manager = new McpClientManager([{ name: 'fixture', type: 'stdio', command: 'node', args: ['--import', 'tsx', FIXTURE] }])
+    const results = await Promise.all([
+      manager.callTool('fixture', 'echo', { text: 'one' }),
+      manager.callTool('fixture', 'echo', { text: 'two' }),
+    ])
+    if (results.some((result) => !result.success) || manager.connectCount !== 1) {
+      throw new Error(`并发连接未合并: ${JSON.stringify({ results, connectCount: manager.connectCount })}`)
+    }
+    await manager.closeAll()
+  })
+
   // ---------- HTTP ----------
   await check('http: 发现并调用', async () => {
     const httpServer = await startHttpServer()

@@ -198,4 +198,15 @@ export const BUILTIN_COMMANDS: CommandDef[] = [
       ui.showMessage(ui.getStatus())
     },
   },
+  {
+    name: 'audit',
+    aliases: ['events'],
+    description: '查询服务审计事件，可按类型、Task 或 Request 过滤',
+    usage: '/audit [kind|task <id>|request <id>] [limit]',
+    type: 'local',
+    paramHint: 'kind | task <id> | request <id>，默认最近 20 条',
+    handler: (args, ui) => {
+      ui.showMessage(ui.auditAction(args))
+    },
+  },
 ]

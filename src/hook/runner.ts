@@ -6,7 +6,9 @@ const DEFAULT_TIMEOUT = 10000 // Hook 命令默认 10s 超时
 // 执行 command 动作；返回输出（用于日志）
 export function runCommandAction(command: string, cwd: string, timeoutMs: number): Promise<string> {
   return new Promise((resolve) => {
-    const child = spawn(command, { cwd, shell: process.platform === 'win32' })
+    const child = process.platform === 'win32'
+      ? spawn(process.env.ComSpec ?? 'cmd.exe', ['/d', '/s', '/c', command], { cwd, shell: false })
+      : spawn(command, { cwd, shell: true })
     let out = ''
     const sink = (chunk: Buffer) => {
       out += chunk.toString('utf8')

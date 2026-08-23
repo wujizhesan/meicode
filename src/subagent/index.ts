@@ -42,5 +42,6 @@ export function createSpawnAgentTool(manager: SubAgentManager, opts: { provider:
 }
 
 export { SubAgentManager } from './manager.ts'
+export { SubAgentStore } from './store.ts'
 export { loadAgentRoles, parseAgentFile, agentDirs } from './loader.ts'
 export type { AgentRole, SpawnRequest, SubAgentRecord, SubAgentStatus } from './types.ts'

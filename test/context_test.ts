@@ -171,6 +171,9 @@ async function main() {
     const before = history.all().length
     await manager.beforeRequest('auto') // 熔断后不再尝试（无变化）
     if (history.all().length !== before) throw new Error('熔断后仍尝试摘要')
+    p.failSummaries = false
+    await manager.beforeRequest('manual')
+    if (manager.breakerOpenState) throw new Error('手动摘要成功后自动熔断未复位')
   })
   await check('manager: 成功清零熔断计数', async () => {
     const p = new FakeCtxProvider()
