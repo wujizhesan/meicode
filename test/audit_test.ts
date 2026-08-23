@@ -45,11 +45,11 @@ await check('围栏: 省略号/中缀不误杀', () => {
 await check('围栏: 界内相对路径放行', () => {
   assert(guardCommand(GCTX, 'cd sub\\dir && npm test') === null, '界内相对误杀')
 })
-await check('guardPath: 只读输入豁免外部/写路径仍拦(实战:dd_extract 读外部目标)', () => {
-  const GCTX_EXTRA = { cwd: 'D:/x/wt', rootLock: 'D:/x/wt', rootLockExtra: ['D:/reverse-notes'] }
+await check('guardPath: 只读输入豁免外部/写路径仍拦(实战:只读工具读取外部目标)', () => {
+  const GCTX_EXTRA = { cwd: 'D:/x/wt', rootLock: 'D:/x/wt', rootLockExtra: ['D:/contract-notes'] }
   assert(guardPath(GCTX_EXTRA, 'D:/tmpnpm-global/node_modules/x.js', false) === null, '只读输入应放行')
   assert(guardPath(GCTX_EXTRA, 'D:/tmpnpm-global/node_modules/x.js') !== null, '写路径应拦')
-  assert(guardPath(GCTX_EXTRA, 'D:/reverse-notes/report.md') === null, '契约目录应放行')
+  assert(guardPath(GCTX_EXTRA, 'D:/contract-notes/report.md') === null, '契约目录应放行')
   assert(guardPath(GCTX_EXTRA, 'D:/x/wt/inside.js') === null, '界内应放行')
 })
 await check('围栏: 只读白名单新命令放行(实战:recon 读外部目标)', () => {

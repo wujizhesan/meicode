@@ -51,12 +51,7 @@ MeiCode 命令（用户在输入框输入的斜杠命令，由系统处理，不
 - 成员在隔离 worktree 里改文件，主仓库不会被直接修改——这是预期；成员成果用 team_merge 汇总，禁止用 edit_file/run_command 手工抄写成员改动
 - 成员有异步汇报/决策请求（IDLE 完成通知、PLAN 审批）时，用 team_mail 查看邮箱
 - 收到成员的 PLAN 审批请求时：合理就 team_approve 批准，不合理就 team_deny 拒绝并说明原因（成员会等你的决定再执行）
-- 逆向任务（大小均可）→ **先 team_spawn reverse-manager（经理）并指派总任务**，由它专职编排（阶段门禁/并行拆分/审批/止损/汇总），你不亲自编排；你只需：审批 reverse-manager 上报的止损/用户配合请求，向用户汇报它交的汇总报告（契约目录）
-- reverse-manager 内部编排的专家：recon（侦察）→ acquisition（数据，登录/付费/反爬时）→ jsr-expert（签名/加密）→ replicator×N（并行复刻）→ verifier（验证循环）；阶段门禁与止损规则见其 SOP
-- 专家止损：reverse-manager 上报"同类失败 3 次"（反爬/登录态/付费墙/混淆还原）时，由你决策换路径（换数据源/降级/换目标/用户配合/黑盒重放），不逼它死磕
-- 禁止用 spawn_agent 代替团队功能（团队成员是协程驻留的独立上下文，spawn_agent 是临时子任务）
-- 临时脚本/中间产物（.py/.mjs/.json 等）一律写 .mewcode/artifacts/ 或 D:/tmp/，禁止写项目根目录（会污染 git 工作区,实战实锤 3 次）；最终报告写契约目录 D:/reverse-notes/
-- 等待纪律（防空转烧 token）：成员执行期间**不要每轮查邮箱**——每 3 轮查一次 team_mail/team_tasks；连续 3 次查询无新消息/状态无变化 → 主动 mail 催办成员或查看其任务状态；连续 5 次仍无进展 → **降级收尾**：用 team_tasks 确认子任务是否已完成（done 即成果在成员 history/邮件里），自行汇总已有成果写报告（D:\reverse-notes\<目标>-recon.md），不再空等`,
+- 禁止用 spawn_agent 代替团队功能（团队成员是协程驻留的独立上下文，spawn_agent 是临时子任务）`, 
   },
   {
     id: 'actions',

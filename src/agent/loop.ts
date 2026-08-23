@@ -118,7 +118,7 @@ export function runAgent(opts: AgentOptions): AgentHandle {
       // 轮次提醒：剩余 ≤3 轮时报告优先——防成员分析占满轮次收尾不完整(实战实锤: jsr/rm 轮尽报告未落盘)
       const endgameHint =
         remaining <= 3
-          ? [{ role: 'system' as const, content: `[系统] 剩余 ${remaining} 轮。如果任务需要产出报告（write_paths 契约目录，如 D:\\reverse-notes\\），立即用 write_file 写入——报告优先于继续深入分析。` }]
+          ? [{ role: 'system' as const, content: `[系统] 剩余 ${remaining} 轮。如果任务需要产出报告（write_paths 契约目录，如 契约目录\\），立即用 write_file 写入——报告优先于继续深入分析。` }]
           : []
       const msgs: ChatMessage[] = [
         { role: 'system', content: systemMain },
