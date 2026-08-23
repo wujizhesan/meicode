@@ -33,6 +33,10 @@ await check('围栏: .\\.. 前缀绕过已堵', () => {
   assert(guardCommand(GCTX, 'cd .\\..\\..\\Users\\evil') !== null, '.\\.. 未拦')
   assert(guardCommand(GCTX, 'echo x > .\\..\\..\\repo\\f.js') !== null, '重定向 .\\.. 未拦')
 })
+await check('围栏: 目录前缀和只读重定向绕过已堵', () => {
+  assert(guardCommand(GCTX, 'echo x > D:/x/wt-evil/out.txt') !== null, '相邻目录前缀未拦')
+  assert(guardCommand(GCTX, 'dir D:/x/wt > D:/outside.txt') !== null, '只读命令重定向未拦')
+})
 await check('围栏: 省略号/中缀不误杀', () => {
   assert(guardCommand(GCTX, 'echo hello...') === null, '句尾省略号误杀')
   assert(guardCommand(GCTX, 'a..b && dir') === null, '点中缀误杀')

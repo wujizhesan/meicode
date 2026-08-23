@@ -6,6 +6,8 @@ import type { ProviderConfig } from './types.ts'
 import { loadModelCatalog, resolveCatalogEndpoint } from './model-catalog.ts'
 import { parseMcpServers } from '../mcp/config.ts'
 import type { McpServerConfig } from '../mcp/config.ts'
+import { parseA2aAgents } from '../a2a/config.ts'
+import type { A2aAgentConfig } from '../a2a/config.ts'
 
 const REQUIRED_FIELDS = ['name', 'protocol', 'model', 'base_url', 'api_key'] as const
 
@@ -73,6 +75,8 @@ export interface LoadedConfig {
   provider: ProviderConfig
   mcpServers: McpServerConfig[]
   mcpSkipped: string[]
+  a2aAgents: A2aAgentConfig[]
+  a2aSkipped: string[]
 }
 
 // 加载主配置 + 合并用户级/项目级 MCP Server 列表
@@ -86,7 +90,11 @@ export function loadConfigWithMcp(path?: string): LoadedConfig {
     userRaw.mcpServers ?? userRaw.mcp_servers,
     projectRaw.mcpServers ?? projectRaw.mcp_servers,
   )
-  return { provider, mcpServers: servers, mcpSkipped: skipped }
+  const a2a = parseA2aAgents(
+    userRaw.a2aAgents ?? userRaw.a2a_agents,
+    projectRaw.a2aAgents ?? projectRaw.a2a_agents,
+  )
+  return { provider, mcpServers: servers, mcpSkipped: skipped, a2aAgents: a2a.agents, a2aSkipped: a2a.skipped }
 }
 
 function readOptionalYaml(file: string): unknown {

@@ -1,9 +1,10 @@
-import { appendFileSync, readdirSync, readFileSync, rmSync, statSync, mkdirSync, existsSync } from 'node:fs'
-import { join } from 'node:path'
+import { appendFileSync, readdirSync, readFileSync, rmSync, statSync, mkdirSync, existsSync, lstatSync } from 'node:fs'
+import { join, resolve, sep } from 'node:path'
 import type { ChatMessage } from '../provider/types.ts'
 
 const HOUR = 3600 * 1000
 const DAY = 24 * HOUR
+const SESSION_ID_RE = /^[A-Za-z0-9_-]{1,128}$/
 
 // 防御校验：assistant(tool_calls) 后面必须紧跟配对的 tool 消息（否则 DeepSeek/OpenAI 400）
 // 两重检查：① 每个 tool_call id 有配对 tool；② 紧邻性——配对完成前不允许插入任何其他消息
@@ -62,13 +63,23 @@ export class SessionStore {
     mkdirSync(dir, { recursive: true })
   }
 
-  private fileFor(id: string): string {
-    return join(this.dir, `${id}.jsonl`)
+  private fileFor(id: string): string | null {
+    if (!SESSION_ID_RE.test(id)) return null
+    const root = resolve(this.dir)
+    const file = resolve(join(root, `${id}.jsonl`))
+    if (file !== root && !file.startsWith(root + sep)) return null
+    try {
+      if (lstatSync(file).isSymbolicLink()) return null
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== 'ENOENT') return null
+    }
+    return file
   }
 
   append(id: string, messages: ChatMessage[]): void {
     if (messages.length === 0) return
     const file = this.fileFor(id)
+    if (!file) throw new Error('非法会话 ID')
     for (const m of messages) {
       appendFileSync(file, JSON.stringify(m) + '\n', 'utf8')
     }
@@ -77,7 +88,7 @@ export class SessionStore {
   // 恢复：坏行跳过、工具调用无结果截断
   recoverLatest(): { id: string; messages: ChatMessage[] } | null {
     const files = readdirSync(this.dir)
-      .filter((f) => f.endsWith('.jsonl'))
+      .filter((f) => f.endsWith('.jsonl') && SESSION_ID_RE.test(f.slice(0, -'.jsonl'.length)))
       .sort()
       .reverse()
     if (files.length === 0) return null
@@ -86,7 +97,7 @@ export class SessionStore {
 
   recoverById(id: string): { id: string; messages: ChatMessage[] } | null {
     const file = this.fileFor(id)
-    if (!existsSync(file)) return null
+    if (!file || !existsSync(file)) return null
     const raw = readFileSync(file, 'utf8')
     const messages: ChatMessage[] = []
     for (const line of raw.split('\n')) {
@@ -126,13 +137,14 @@ export class SessionStore {
 
   listSessions(limit = 5): { id: string; count: number; mtime: number }[] {
     return readdirSync(this.dir)
-      .filter((f) => f.endsWith('.jsonl'))
+      .filter((f) => f.endsWith('.jsonl') && SESSION_ID_RE.test(f.slice(0, -'.jsonl'.length)))
       .sort()
       .reverse()
       .slice(0, limit)
       .map((f) => {
         const id = f.replace(/\.jsonl$/, '')
         const file = this.fileFor(id)
+        if (!file) return { id, count: 0, mtime: 0 }
         const lines = readFileSync(file, 'utf8').split('\n').filter(Boolean)
         let mtime = 0
         try {
@@ -147,7 +159,7 @@ export class SessionStore {
   // 删除单个会话（当前会话由调用方防护）
   removeById(id: string): boolean {
     const file = this.fileFor(id)
-    if (!existsSync(file)) return false
+    if (!file || !existsSync(file)) return false
     rmSync(file, { force: true })
     return true
   }
@@ -155,7 +167,7 @@ export class SessionStore {
   // 距上次活动 >24h 的提醒消息
   timeGapMessage(id: string): ChatMessage | null {
     const file = this.fileFor(id)
-    if (!existsSync(file)) return null
+    if (!file || !existsSync(file)) return null
     const mtime = statSync(file).mtimeMs
     const gap = Date.now() - mtime
     if (gap <= 24 * HOUR) return null
@@ -169,8 +181,9 @@ export class SessionStore {
   cleanup(olderThanDays = 30): number {
     let removed = 0
     for (const f of readdirSync(this.dir)) {
-      if (!f.endsWith('.jsonl')) continue
-      const file = join(this.dir, f)
+      if (!f.endsWith('.jsonl') || !SESSION_ID_RE.test(f.slice(0, -'.jsonl'.length))) continue
+      const file = this.fileFor(f.slice(0, -'.jsonl'.length))
+      if (!file) continue
       const age = Date.now() - statSync(file).mtimeMs
       if (age > olderThanDays * DAY) {
         rmSync(file, { force: true })

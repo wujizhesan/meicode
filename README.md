@@ -1,5 +1,22 @@
 # MeiCode
 
+## 安装发行版
+
+发布包安装后直接使用 `meicode` 命令：
+
+```bash
+gh release download v0.1.0 -R wujizhesan/meicode -p "meicode-*.tgz"
+npm install -g ./meicode-0.1.0.tgz
+meicode --help
+meicode --version
+meicode --init
+meicode --doctor
+```
+
+GitHub Release 提供编译后的发行包，不需要 npm 账户，也不需要安装或加载 `tsx`。
+`meicode --init` 会创建 `~/.mewcode/config.yaml`，如果配置已存在则不会覆盖。
+`meicode --doctor` 只读检查配置和已登记的 MCP/A2A 条目，不会调用模型。
+
 MeiCode 是一个运行在终端里的命令行 AI 助手：可以直接操作文件系统、执行命令、搜索代码，通过 Skill 系统扩展能力，并内置**多智能体团队编排**——主会话可以派生专职专家成员（协程驻留、worktree 隔离），并行拆解复杂任务。
 
 TypeScript / ESM / Node.js，无框架依赖（终端 UI 用 Ink）。
@@ -41,8 +58,31 @@ TypeScript / ESM / Node.js，无框架依赖（终端 UI 用 Ink）。
 npm install
 npm start          # 交互模式
 npm start -- --run "任务描述"   # 无人值守模式
-npm test           # 18 个测试文件，全部通过
+npm test           # 类型检查 + 全量测试
 ```
+
+### ACP / A2A 服务
+
+ACP 默认只监听本机：
+
+```bash
+npm start -- --acp-port 8787
+npm start -- --acp-port 8787 --acp-token "$MEICODE_ACP_TOKEN"
+```
+
+需要远程访问时必须同时显式指定 host 和 token：
+
+```bash
+npm start -- --acp-port 8787 --acp-host 0.0.0.0 --acp-token "$MEICODE_ACP_TOKEN"
+```
+
+A2A 默认也只监听 `127.0.0.1`，可通过 `--a2a-token` 或 `MEICODE_A2A_TOKEN` 开启 Bearer 认证：
+
+```bash
+npm start -- --a2a-port 8788 --a2a-token "$MEICODE_A2A_TOKEN"
+```
+
+服务审计事件写入 `.mewcode/runtime-events/`，普通文本日志写入 `.mewcode/meicode.log`。审计事件包含 `requestId`、`agentId`、`taskId`、耗时、结束原因、配额拒绝和 Push 失败信息，不记录 token、请求正文或模型输出正文。
 
 ## 配置
 
@@ -55,6 +95,7 @@ npm test           # 18 个测试文件，全部通过
 /team create|spawn|assign|tasks|merge   团队编排
 /workflow create|validate|run   工作流
 /session /compact /resume       会话管理
+/audit [kind|task|request]      查询审计事件
 ```
 
 ## 目录结构

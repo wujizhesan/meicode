@@ -88,8 +88,10 @@ export function loadAgentRoles(dirs: { builtin: string; user: string; project: s
 }
 
 export function agentDirs(cwd: string): { builtin: string; user: string; project: string } {
+  const packaged = join(import.meta.dirname, 'agents')
+  const source = join(import.meta.dirname, '..', 'agents')
   return {
-    builtin: join(import.meta.dirname, '..', 'agents'),
+    builtin: existsSync(packaged) ? packaged : source,
     user: join(homedir(), '.mewcode', 'agents'),
     project: join(cwd, 'agents'),
   }

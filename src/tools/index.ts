@@ -19,5 +19,5 @@ export function createTools(_ctx: ToolContext): Tool[] {
   return [readFileTool, writeFileTool, editFileTool, runCommandTool, findFilesTool, grepCodeTool, extractStringsTool, deobfuscateTool, shotDiffTool, ddExtractTool, mitmCaptureTool, snapshotTool, rollbackTool, codeIntelTool, browserTool, elicitTool]
 }
 
-export type { Tool, ToolResult, ToolContext, JsonSchema } from './types.ts'
+export type { Tool, ToolResult, ToolContext, ToolEvidence, JsonSchema } from './types.ts'
 export { ToolRegistry, type OpenAITool } from './registry.ts'

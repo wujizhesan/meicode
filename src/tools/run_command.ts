@@ -20,20 +20,31 @@ export const runCommandTool: Tool = {
   async execute(args: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult> {
     const command = args.command as string
     if (!command) return { success: false, output: '', error: '缺少参数 command' }
-    const blocked = guardCommand(ctx, command)
-    if (blocked) return { success: false, output: '', error: blocked }
     const argList = Array.isArray(args.args) ? (args.args as string[]).map(String) : []
     const timeoutMs = typeof args.timeout === 'number' ? args.timeout : (ctx.timeoutMs ?? 30000)
+    const commandLine = [command, ...argList].join(' ')
+    const blocked = guardCommand(ctx, commandLine)
+    if (blocked) return { success: false, output: '', error: blocked }
 
     return new Promise<ToolResult>((resolve) => {
-      const child = spawn(command, argList, {
-        cwd: ctx.cwd,
-        shell: process.platform === 'win32',
-      })
+      const child = process.platform === 'win32'
+        ? spawn(process.env.ComSpec ?? 'cmd.exe', ['/d', '/s', '/c', commandLine], { cwd: ctx.cwd, shell: false })
+        : spawn(command, argList, { cwd: ctx.cwd, shell: false })
 
       let out = ''
       let killed = false
+      let cancelled = false
       let settled = false
+      const terminate = () => {
+        if (process.platform === 'win32' && child.pid) {
+          try {
+            spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { shell: false })
+          } catch {
+            // 忽略
+          }
+        }
+        child.kill()
+      }
       const timer = setTimeout(() => {
         killed = true
         // Windows 下 kill 只杀 cmd 包装进程,孙进程仍持管道 → close 永不触发。
@@ -45,15 +56,37 @@ export const runCommandTool: Tool = {
             // 忽略
           }
         }
-        child.kill()
+        terminate()
         setTimeout(() => {
           if (!settled) {
             settled = true
+            ctx.signal?.removeEventListener('abort', onAbort)
             const { output, truncated } = truncateOutput(out)
-            resolve({ success: false, output, truncated, error: `命令超时（${timeoutMs}ms）已被终止` })
+            resolve({ success: false, output, truncated, error: `命令超时（${timeoutMs}ms）已被终止`, evidence: { commands: [commandLine] } })
           }
         }, 1500)
       }, timeoutMs)
+
+      function onAbort() {
+        if (settled) return
+        cancelled = true
+        clearTimeout(timer)
+        terminate()
+        setTimeout(() => {
+          if (!settled) {
+            settled = true
+            ctx.signal?.removeEventListener('abort', onAbort)
+            const { output, truncated } = truncateOutput(out)
+            resolve({ success: false, output, truncated, error: '命令已取消', evidence: { commands: [commandLine] } })
+          }
+        }, 1500)
+      }
+
+      if (ctx.signal?.aborted) {
+        onAbort()
+      } else {
+        ctx.signal?.addEventListener('abort', onAbort, { once: true })
+      }
 
       const sink = (chunk: Buffer) => {
         out += chunk.toString('utf8')
@@ -63,25 +96,33 @@ export const runCommandTool: Tool = {
       child.stderr?.on('data', sink)
 
       child.on('error', (e) => {
+        if (settled) return
+        settled = true
         clearTimeout(timer)
-        resolve({ success: false, output: '', error: `命令启动失败: ${e.message}` })
+        ctx.signal?.removeEventListener('abort', onAbort)
+        resolve({ success: false, output: '', error: `命令启动失败: ${e.message}`, evidence: { commands: [commandLine] } })
       })
 
       child.on('close', (code, signal) => {
         if (settled) return
         settled = true
         clearTimeout(timer)
+        ctx.signal?.removeEventListener('abort', onAbort)
         const { output, truncated } = truncateOutput(out)
+        if (cancelled) {
+          resolve({ success: false, output, truncated, error: '命令已取消', evidence: { commands: [commandLine] } })
+          return
+        }
         if (killed) {
-          resolve({ success: false, output, truncated, error: `命令超时（${timeoutMs}ms）已被终止` })
+          resolve({ success: false, output, truncated, error: `命令超时（${timeoutMs}ms）已被终止`, evidence: { commands: [commandLine] } })
           return
         }
         if (code === 0) {
-          resolve({ success: true, output, truncated })
+          resolve({ success: true, output, truncated, evidence: { commands: [commandLine], exitCode: 0 } })
         } else if (signal) {
-          resolve({ success: false, output, truncated, error: `命令被信号 ${signal} 终止` })
+          resolve({ success: false, output, truncated, error: `命令被信号 ${signal} 终止`, evidence: { commands: [commandLine] } })
         } else {
-          resolve({ success: false, output, truncated, error: `命令退出码 ${code}${out ? '\n--- 输出尾部 ---\n' + output.slice(-500) : ''}` })
+          resolve({ success: false, output, truncated, error: `命令退出码 ${code}${out ? '\n--- 输出尾部 ---\n' + output.slice(-500) : ''}`, evidence: { commands: [commandLine], exitCode: code ?? undefined } })
         }
       })
     })
