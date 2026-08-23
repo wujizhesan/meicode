@@ -28,6 +28,14 @@ import type { MemoryContext } from './tui/useStream.ts'
 import type { ProviderConfig } from './config/types.ts'
 import { RuntimeEventLog, createRuntimeId } from './runtime/index.ts'
 
+function sessionDirectory(): string {
+  const cwd = process.cwd()
+  if (process.platform === 'win32' && /^[A-Za-z]:\\Windows\\(?:System32|SysWOW64)(?:\\|$)/i.test(cwd)) {
+    return join(homedir(), '.mewcode', 'sessions')
+  }
+  return join(cwd, '.mewcode', 'sessions')
+}
+
 function parseArgs(argv: string[]): { config?: string; run?: string; init?: boolean; doctor?: boolean; acpPort?: number; acpHost?: string; acpToken?: string; a2aPort?: number; a2aToken?: string } {
   let config: string | undefined
   let run: string | undefined
@@ -124,7 +132,7 @@ export async function main(): Promise<void> {
   const mcpManager = mcpServers.length > 0 ? new McpClientManager(mcpServers) : null
 
   // P8：记忆系统初始化（清理 + 恢复 + 指令 + 笔记目录）
-  const sessionStore = new SessionStore(join(process.cwd(), '.mewcode', 'sessions'))
+  const sessionStore = new SessionStore(sessionDirectory())
   const removed = sessionStore.cleanup(30)
   if (removed > 0) console.warn(`[记忆] 已清理 ${removed} 个过期会话（>30 天）`)
   const recovered = sessionStore.recoverLatest()
