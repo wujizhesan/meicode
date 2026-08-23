@@ -103,6 +103,7 @@ async function main() {
     manager.loadRoles()
     const provider = new FakeSubProvider()
     const registry = makeRegistry()
+    const startedAt = Date.now()
     let onResultCalled = false
     manager.setOnResult(() => {
       onResultCalled = true
@@ -113,9 +114,13 @@ async function main() {
     )
     if (res.async) throw new Error('同步应返回结果')
     if (!res.syncResult) throw new Error('无结果')
+    if (Date.now() - startedAt > 5000) throw new Error('快速完成的同步子 Agent 被超时定时器拖住')
     if (!onResultCalled) throw new Error('onResult 未回调')
     const records = manager.listRecords()
     if (records.length !== 1 || records[0].status !== 'done') throw new Error('记录状态不符')
+    await manager.close()
+    const closed = await manager.spawn({ type: 'defined', role: 'reviewer', prompt: 'closed' }, { provider, registry, ctx: { cwd: TMP } })
+    if (!manager.isClosed() || !closed.syncResult?.includes('已关闭')) throw new Error('SubAgentManager close 未阻止新任务')
   })
   await check('spawn: async 立即后台', async () => {
     const manager = new SubAgentManager({ builtin: BUILTIN, user: USER, project: PROJECT })
@@ -161,6 +166,26 @@ async function main() {
     if (!sync.success || !sync.output.includes('子任务')) throw new Error(`sync 失败: ${JSON.stringify(sync)}`)
     const async = await tool.execute({ type: 'defined', role: 'reviewer', prompt: '审查', async: true }, { cwd: TMP })
     if (!async.output.includes('后台')) throw new Error(`async 失败: ${JSON.stringify(async)}`)
+  })
+
+  await check('spawn: close 取消后记录为 cancelled', async () => {
+    const manager = new SubAgentManager({ builtin: BUILTIN, user: USER, project: PROJECT })
+    const slowProvider: Provider = {
+      protocol: 'openai',
+      async *streamChat() {
+        yield { type: 'text', text: 'slow' }
+        await new Promise((resolve) => setTimeout(resolve, 200))
+        yield { type: 'done' }
+      },
+    }
+    const res = await manager.spawn(
+      { type: 'fork', prompt: 'slow' },
+      { provider: slowProvider, registry: makeRegistry(), ctx: { cwd: TMP } },
+    )
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    await manager.close(1000)
+    const record = manager.getRecord(res.id)
+    if (record?.status !== 'cancelled') throw new Error(`取消状态错误: ${record?.status}`)
   })
 
   rmSync(TMP, { recursive: true, force: true })

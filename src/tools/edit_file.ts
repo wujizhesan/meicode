@@ -52,7 +52,7 @@ export const editFileTool: Tool = {
     try {
       await writeFile(target, updated, 'utf8')
       const summary = `已替换 1 处\n--- 旧 ---\n${oldText}\n--- 新 ---\n${newText}`
-      return { success: true, output: summary }
+      return { success: true, output: summary, evidence: { files: [target], changedFiles: [target] } }
     } catch (e) {
       return { success: false, output: '', error: `写入失败: ${(e as Error).message}` }
     }

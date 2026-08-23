@@ -23,7 +23,7 @@ export const readFileTool: Tool = {
     try {
       const content = await readFile(target, 'utf8')
       const { output, truncated } = truncateOutput(content)
-      return { success: true, output, truncated }
+      return { success: true, output, truncated, evidence: { files: [target] } }
     } catch (e) {
       return { success: false, output: '', error: `读取失败: ${(e as Error).message}` }
     }

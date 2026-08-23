@@ -37,7 +37,8 @@ export class AnthropicProvider implements Provider {
     // 外部取消（用户 Ctrl+C）→ abort 请求；超时也 abort（见 withRequestTimeout）
     const controller = new AbortController()
     const onAbort = () => controller.abort()
-    opts.signal?.addEventListener('abort', onAbort, { once: true })
+    if (opts.signal?.aborted) controller.abort()
+    else opts.signal?.addEventListener('abort', onAbort, { once: true })
 
     const body = toAnthropicBody(messages, this.cfg.model, thinking, opts.tools)
 
@@ -172,6 +173,7 @@ export class AnthropicProvider implements Provider {
     opts.signal?.addEventListener('abort', onStreamAbort, { once: true })
     try {
       reader = res.body.getReader()
+      if (opts.signal?.aborted) await reader.cancel()
       const decoder = new TextDecoder()
       const IDLE_TIMEOUT = 30000 // 30s 无数据视为挂起，报错结束
       while (true) {

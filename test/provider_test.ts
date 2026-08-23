@@ -1,12 +1,13 @@
-import { toOpenAIMessages } from '../src/provider/openai.ts'
-import { toAnthropicBody } from '../src/provider/anthropic.ts'
+import { OpenAIProvider, toOpenAIMessages } from '../src/provider/openai.ts'
+import { AnthropicProvider, toAnthropicBody } from '../src/provider/anthropic.ts'
+import type { ProviderConfig } from '../src/config/types.ts'
 import type { ChatMessage } from '../src/provider/types.ts'
 
 let passed = 0
 let failed = 0
-async function check(name: string, fn: () => void): Promise<void> {
+async function check(name: string, fn: () => void | Promise<void>): Promise<void> {
   try {
-    fn()
+    await fn()
     passed++
     console.log(`  ✓ ${name}`)
   } catch (e) {
@@ -136,6 +137,28 @@ await check('anthropic: thinking 参数', () => {
   const body = toAnthropicBody([{ role: 'user', content: 'x' }], 'm', true)
   assert((body.thinking as { type: string }).type === 'enabled', 'thinking 未开启')
   assert(body.max_tokens === 32000, 'thinking 时 max_tokens 应 32000')
+})
+
+await check('provider: 预取消信号会传递到请求', async () => {
+  const originalFetch = globalThis.fetch
+  const seen: boolean[] = []
+  globalThis.fetch = (async (...args: Parameters<typeof fetch>) => {
+    seen.push(Boolean(args[1]?.signal?.aborted))
+    return new Response('', { status: 500 })
+  }) as typeof fetch
+  const cfg: ProviderConfig = { name: 'test', protocol: 'openai', model: 'm', base_url: 'http://provider.test', api_key: 'x' }
+  try {
+    const openaiController = new AbortController()
+    openaiController.abort()
+    for await (const _event of new OpenAIProvider(cfg).streamChat([], { signal: openaiController.signal })) {}
+
+    const anthropicController = new AbortController()
+    anthropicController.abort()
+    for await (const _event of new AnthropicProvider({ ...cfg, protocol: 'anthropic' }).streamChat([], { signal: anthropicController.signal })) {}
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+  assert(seen.length === 2 && seen.every(Boolean), `预取消信号未传递: ${JSON.stringify(seen)}`)
 })
 
 console.log(`\nprovider_test: ${passed} passed, ${failed} failed`)

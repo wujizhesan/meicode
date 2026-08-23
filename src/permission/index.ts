@@ -19,6 +19,14 @@ export interface PermissionConfig {
   mode: PermissionMode
   engine: PermissionEngineLike
   autoAcceptEdits?: boolean
+  allowedWritePaths?: string[]
+}
+
+const SHELL_OPERATOR_RE = /[&;<>\r\n]/
+
+function isReadOnlyCommand(command: string): boolean {
+  if (SHELL_OPERATOR_RE.test(command) || /\|\|/.test(command)) return false
+  return command.split('|').every((part) => READONLY_CMD_RE.test(part.trim()))
 }
 
 export async function checkPermission(call: ToolCallInfo, cfg: PermissionConfig): Promise<Decision> {
@@ -43,7 +51,7 @@ export async function checkPermission(call: ToolCallInfo, cfg: PermissionConfig)
     // ①.6 只读命令豁免：git status/log、dir、cat 等安全查询不弹窗（回归发现：
     // 模型检查状态时 git status 也要确认,体验差）。黑名单/警告表之后——危险只读已被拦
     // strict 白名单制除外：未配置规则一律拒绝
-    if (READONLY_CMD_RE.test(full)) {
+    if (isReadOnlyCommand(full)) {
       const rule = cfg.engine.match(call)
       if (rule) return rule.action === 'allow' ? { type: 'allow' } : { type: 'deny', reason: `规则拒绝（${rule.source} 级）` }
       if (cfg.mode === 'strict') return { type: 'deny', reason: 'strict 模式：未配置放行规则' }
@@ -55,7 +63,7 @@ export async function checkPermission(call: ToolCallInfo, cfg: PermissionConfig)
   if (FILE_TOOLS.has(call.name)) {
     const target = call.args.path
     if (typeof target === 'string') {
-      const allowed = await isPathAllowed(target, cfg.cwd)
+      const allowed = await isPathAllowed(target, cfg.cwd, cfg.allowedWritePaths ?? [])
       if (!allowed) {
         const rule = cfg.engine.match(call)
         if (rule) return rule.action === 'allow' ? { type: 'allow' } : { type: 'deny', reason: `规则拒绝（${rule.source} 级）` }

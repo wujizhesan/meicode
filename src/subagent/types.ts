@@ -1,6 +1,7 @@
 import type { PermissionMode } from '../permission/types.ts'
 import type { ChatMessage } from '../provider/types.ts'
 import type { Tool } from '../tools/index.ts'
+import type { RuntimeEvidenceSummary } from '../runtime/index.ts'
 
 export type AgentRoleSource = 'builtin' | 'user' | 'project'
 
@@ -23,20 +24,28 @@ export interface SpawnRequest {
   role?: string
   prompt: string
   async?: boolean
+  taskId?: string
+  parentAgentId?: string
   parentHistory?: ChatMessage[]
   parentTools?: Tool[]
 }
 
-export type SubAgentStatus = 'running' | 'done' | 'error'
+export type SubAgentStatus = 'created' | 'running' | 'done' | 'error' | 'cancelled' | 'timed_out'
 
 export interface SubAgentRecord {
   id: string
   role: string
   type: 'defined' | 'fork'
   status: SubAgentStatus
+  sessionId?: string
+  parentAgentId?: string
+  taskId?: string
   startedAt: number
+  updatedAt?: number
   finishedAt?: number
   tokens?: number
+  reportId?: string
   result?: string
   error?: string
+  evidence?: RuntimeEvidenceSummary
 }

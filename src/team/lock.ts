@@ -1,7 +1,7 @@
 import { writeFileSync, readFileSync, rmSync, openSync, closeSync } from 'node:fs'
 
-const LOCK_TTL_MS = 5000
-const MAX_RETRY = 3
+const LOCK_TTL_MS = 30000
+const MAX_RETRY = 50
 
 function sleepSync(ms: number): void {
   const sab = new Int32Array(new SharedArrayBuffer(4))
@@ -21,13 +21,13 @@ export function withLock(lockFile: string, fn: () => void): void {
     } catch {
       // 已存在：检查 TTL
     }
-    let ts = 0
+    let ts: number | null = null
     try {
-      ts = Number(readFileSync(lockFile, 'utf8'))
+      const value = Number(readFileSync(lockFile, 'utf8'))
+      if (Number.isFinite(value) && value > 0) ts = value
     } catch {
-      // 读取失败按 0 处理（过期）
     }
-    if (Date.now() - ts > LOCK_TTL_MS) {
+    if (ts !== null && Date.now() - ts > LOCK_TTL_MS) {
       try {
         rmSync(lockFile, { force: true })
         const fd = openSync(lockFile, 'wx')

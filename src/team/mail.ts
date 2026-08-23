@@ -1,12 +1,15 @@
-import { existsSync, readFileSync, writeFileSync, appendFileSync, mkdirSync, readdirSync } from 'node:fs'
+import { existsSync, readFileSync, appendFileSync, mkdirSync, readdirSync, watch, type FSWatcher } from 'node:fs'
 import { join } from 'node:path'
 import type { MailMessage } from './types.ts'
 import { withLock } from './lock.ts'
+import { createRuntimeId } from '../runtime/index.ts'
+import { atomicWriteFile } from './atomic.ts'
 
 const SUMMARY_LEN = 80
 
 export class TeamMail {
   private mailDir: string
+  private waiters = new Map<string, Set<() => void>>()
 
   constructor(mailDir: string) {
     this.mailDir = mailDir
@@ -30,7 +33,7 @@ export class TeamMail {
     withLock(join(this.mailDir, 'registry.lock'), () => {
       const reg = this.readRegistry()
       reg[name] = this.mailboxFile(name)
-      writeFileSync(this.registryFile(), JSON.stringify(reg, null, 2), 'utf8')
+      atomicWriteFile(this.registryFile(), JSON.stringify(reg, null, 2))
     })
   }
 
@@ -49,7 +52,7 @@ export class TeamMail {
   }
 
   // 发送：目标邮箱 append JSONL（to='*' → broadcast.mail）
-  send(from: string, to: string, body: string): void {
+  send(from: string, to: string, body: string, metadata: Pick<MailMessage, 'groupId' | 'kind' | 'taskId' | 'correlationId'> = {}): void {
     if (to !== '*' && !TeamMail.validName(to)) {
       console.warn(`[团队] 非法收件人名，丢弃: ${to}`)
       return
@@ -59,6 +62,8 @@ export class TeamMail {
       return
     }
     const msg: MailMessage = {
+      messageId: createRuntimeId('message'),
+      ...metadata,
       from,
       to,
       body,
@@ -70,10 +75,62 @@ export class TeamMail {
     withLock(join(this.mailDir, '.lock'), () => {
       appendFileSync(target, JSON.stringify(msg) + '\n', 'utf8')
     })
+    this.notify(to === '*' ? '*' : to)
+  }
+
+  waitForMessage(name: string, predicate: (message: MailMessage) => boolean, timeoutMs = 0, signal?: AbortSignal): Promise<MailMessage | null> {
+    if (!TeamMail.validName(name)) return Promise.resolve(null)
+    return new Promise((resolve) => {
+      let watcher: FSWatcher | undefined
+      let timer: ReturnType<typeof setTimeout> | undefined
+      let abortHandler: (() => void) | undefined
+      const check = (): void => {
+        const message = this.read(name).find(predicate)
+        if (message) finish(message)
+      }
+      const finish = (message: MailMessage | null): void => {
+        const listeners = this.waiters.get(name)
+        listeners?.delete(check)
+        if (listeners?.size === 0) this.waiters.delete(name)
+        watcher?.close()
+        if (timer) clearTimeout(timer)
+        if (abortHandler) signal?.removeEventListener('abort', abortHandler)
+        resolve(message)
+      }
+      const listeners = this.waiters.get(name) ?? new Set<() => void>()
+      listeners.add(check)
+      this.waiters.set(name, listeners)
+      try {
+        watcher = watch(this.mailDir, { persistent: false }, () => check())
+      } catch {
+      }
+      if (timeoutMs > 0) {
+        timer = setTimeout(() => finish(null), timeoutMs)
+      }
+      if (signal) {
+        abortHandler = () => finish(null)
+        if (signal.aborted) {
+          finish(null)
+          return
+        }
+        signal.addEventListener('abort', abortHandler, { once: true })
+      }
+      check()
+    })
+  }
+
+  private notify(name: string): void {
+    if (name === '*') {
+      for (const listeners of this.waiters.values()) for (const listener of listeners) listener()
+      return
+    }
+    for (const listener of this.waiters.get(name) ?? []) listener()
+    for (const listener of this.waiters.get('*') ?? []) listener()
   }
 
   // 读取：自己邮箱 + 广播，过滤（to=自己/from=自己/广播），按 ts 排序
   read(name: string, markRead = false): MailMessage[] {
+    if (!TeamMail.validName(name)) return []
     const out: MailMessage[] = []
     const files = [this.mailboxFile(name), join(this.mailDir, 'broadcast.mail')]
     for (const file of files) {
@@ -96,22 +153,25 @@ export class TeamMail {
   }
 
   private markRead(name: string, msgs: MailMessage[]): void {
-    const file = this.mailboxFile(name)
-    if (!existsSync(file)) return
+    const files = [this.mailboxFile(name), join(this.mailDir, 'broadcast.mail')]
     // 复合键 ts:from——同毫秒多条消息不会被误标（仅按 ts 会一起标记）
-    const keys = new Set(msgs.map((m) => `${m.ts}:${m.from}`))
+    const keyFor = (msg: MailMessage): string => msg.messageId ? `id:${msg.messageId}` : `legacy:${msg.ts}:${msg.from}:${msg.body}`
+    const keys = new Set(msgs.map(keyFor))
     withLock(join(this.mailDir, '.lock'), () => {
-      const lines = readFileSync(file, 'utf8').split('\n').filter(Boolean)
+      for (const file of files) {
+        if (!existsSync(file)) continue
+        const lines = readFileSync(file, 'utf8').split('\n').filter(Boolean)
       const updated = lines.map((line) => {
         try {
           const msg = JSON.parse(line) as MailMessage
-          if (keys.has(`${msg.ts}:${msg.from}`)) msg.read = true
+          if (keys.has(keyFor(msg))) msg.read = true
           return JSON.stringify(msg)
         } catch {
           return line
         }
       })
-      writeFileSync(file, updated.join('\n') + (updated.length ? '\n' : ''), 'utf8')
+        atomicWriteFile(file, updated.join('\n') + (updated.length ? '\n' : ''))
+      }
     })
   }
 
