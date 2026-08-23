@@ -24,6 +24,7 @@ export class OpenAIProvider implements Provider {
     opts: { thinking?: boolean; tools?: { type: 'function'; function: { name: string; description: string; parameters: JsonSchema } }[]; signal?: AbortSignal },
   ): AsyncGenerator<StreamEvent> {
     const base = this.cfg.base_url.replace(/\/+$/, '')
+    const endpoint = /\/chat\/completions$/i.test(base) ? base : `${base}/v1/chat/completions`
     // 外部取消（用户 Ctrl+C）→ abort 请求；超时也 abort（见 withRequestTimeout）
     const controller = new AbortController()
     const onAbort = () => controller.abort()
@@ -33,7 +34,7 @@ export class OpenAIProvider implements Provider {
     let res: Response
     try {
       res = await withRequestTimeout(
-        fetch(`${base}/v1/chat/completions`, {
+        fetch(endpoint, {
           method: 'POST',
           headers: {
             'content-type': 'application/json',
