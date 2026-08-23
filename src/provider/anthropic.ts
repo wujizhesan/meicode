@@ -34,6 +34,7 @@ export class AnthropicProvider implements Provider {
   ): AsyncGenerator<StreamEvent> {
     const thinking = opts.thinking ?? this.cfg.thinking ?? false
     const base = this.cfg.base_url.replace(/\/+$/, '')
+    const endpoint = /\/messages$/i.test(base) ? base : `${base}/v1/messages`
     // 外部取消（用户 Ctrl+C）→ abort 请求；超时也 abort（见 withRequestTimeout）
     const controller = new AbortController()
     const onAbort = () => controller.abort()
@@ -45,7 +46,7 @@ export class AnthropicProvider implements Provider {
     let res: Response
     try {
       res = await withRequestTimeout(
-        fetch(`${base}/v1/messages`, {
+        fetch(endpoint, {
           method: 'POST',
           headers: {
             'content-type': 'application/json',
