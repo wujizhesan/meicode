@@ -43,7 +43,7 @@ export interface ToolContext {
   contextBudget?: () => import('../context/manager.ts').ContextBudgetSnapshot
   // 路径围栏：非空时文件工具禁止写入该根目录之外（团队成员 worktree 隔离）
   rootLock?: string
-  // 额外允许写路径（rootLock 外,如报告产出目录 D:\reverse-notes——专家的产出物契约）
+  // 额外允许写路径（rootLock 外,如报告产出目录 .mewcode/artifacts——专家的产出物契约）
   rootLockExtra?: string[]
   timeoutMs?: number
   signal?: AbortSignal
@@ -63,7 +63,7 @@ export const MAX_RESULT_BYTES = 8192
 
 // 路径围栏检查：rootLock 非空时，目标路径必须在根内（resolve 后比较，防 ../ 穿越）
 // checkWrite=false 表示只读输入路径——读外部目标是核心需求(同 read_file 无围栏)，
-// 纯读工具(extract_strings/dd_extract 输入等)用;写路径(产物/输出)必须查围栏防写绕过
+// 纯读工具(只读输入等)用;写路径(产物/输出)必须查围栏防写绕过
 export function guardPath(ctx: ToolContext, target: string, checkWrite = true): string | null {
   if (!ctx.rootLock) return null
   if (!checkWrite) return null

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.3
+
+- 公共发行包移除逆向专用 Agent、工具和 Prompt；逆向模块保留在本机私有目录
+
 ## 0.1.2
 
 - 修复完整 OpenAI/Anthropic endpoint 被重复追加路径导致 DeepSeek 返回 404

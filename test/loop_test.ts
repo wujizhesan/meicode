@@ -341,7 +341,7 @@ async function main() {
     history.push({ role: 'user', content: '执行' })
     await consume(runAgent(baseOpts(p, history, 'full')))
     const tools = p.capturedTools as { function: { name: string } }[]
-    if (!tools || tools.length !== 16) throw new Error(`full tools 数 ${tools?.length}`)
+    if (!tools || tools.length !== 12) throw new Error(`full tools 数 ${tools?.length}`)
   })
 
   // ---------- system 注入 ----------
