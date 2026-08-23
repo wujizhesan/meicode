@@ -30,7 +30,7 @@ async function main() {
 
   // ---------- registry ----------
   await check('registry: 十六工具登记齐全', () => {
-    if (registry.list().length !== 16) throw new Error(`数量 ${registry.list().length}`)
+    if (registry.list().length !== 12) throw new Error(`数量 ${registry.list().length}`)
   })
   await check('registry: 按名查找', () => {
     if (!registry.get('read_file') || registry.get('nope')) throw new Error('get 失败')

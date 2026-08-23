@@ -48,7 +48,6 @@ TypeScript / ESM / Node.js，无框架依赖（终端 UI 用 Ink）。
 
 ### 5. 工具链
 - 读写/编辑文件、执行命令（Windows/cmd 兼容提示）、代码搜索（grep/find）
-- 代码分析工具：字符串提取 / 反混淆 / 字节偏移提取 / 截图 diff
 - 浏览器自动化、MCP 客户端集成
 - 子 Agent（spawn_agent + 16 个预置角色）、Hook 引擎（round_start/subagent_start 等）
 
