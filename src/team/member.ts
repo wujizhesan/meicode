@@ -20,7 +20,7 @@ const MEMBER_SYSTEM = `你是团队成员。使用团队协作工具（team_task
 需要审批时：先发 PLAN 计划给 Lead，等 APPROVE 后再执行。
 文件操作规范：写文件一律用 write_file/edit_file 工具（只能在当前工作目录内，这是隔离预期）；
 禁止用 run_command 写文件或修改工作目录外的路径（run_command 仅用于构建/测试/查询等非写文件命令）。
-中间产物共享：抓取的页面/提取的片段等中间文件写 .mewcode/artifacts/（团队共享区，其他成员可读可写）；最终报告写契约目录（D:\reverse-notes）。`
+中间产物共享：抓取的页面/提取的片段等中间文件写 .mewcode/artifacts/（团队共享区，其他成员可读可写）；最终报告写契约目录（.mewcode/artifacts）。`
 
 // 团队成员可用的基础工具（不含 load_skill——绑定主会话 SkillManager 会污染主会话状态）
 const MEMBER_BASE_TOOLS = ['read_file', 'find_files', 'grep_code', 'run_command', 'write_file', 'edit_file', 'team_task', 'team_send']
@@ -43,7 +43,7 @@ export class MemberHost {
   private rolePrompt: string // 专家角色 SOP 正文（对齐 Qoder 专家团：角色=领域+专属指令）
   private roleToolsDeny: string[] // 角色禁用的工具（tools_deny frontmatter）
   private roleToolsAllow: string[] // 角色追加的工具（tools_allow frontmatter）
-  private roleMaxRounds: number | undefined // 角色 max_rounds（reverse-manager 30 轮 vs 默认 15——复杂编排收尾需要）
+  private roleMaxRounds: number | undefined // 角色 max_rounds（复杂角色 30 轮 vs 默认 15——复杂编排收尾需要）
 
   constructor(
     member: TeamMember,
