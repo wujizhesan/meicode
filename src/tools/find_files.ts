@@ -1,8 +1,23 @@
-import { glob } from 'node:fs/promises'
+import { readdir } from 'node:fs/promises'
 import { join, isAbsolute, relative } from 'node:path'
+import { minimatch } from 'minimatch'
 import type { Tool, ToolContext, ToolResult } from './types.ts'
 
 const MAX_RESULTS = 100
+
+async function* walkFiles(dir: string, base: string): AsyncGenerator<string> {
+  const entries = await readdir(dir, { withFileTypes: true })
+  for (const entry of entries) {
+    const fullPath = join(dir, entry.name)
+    const relPath = relative(base, fullPath).replaceAll('\\', '/')
+    if (entry.name === 'node_modules' || entry.name === '.git' || relPath.split('/').includes('node_modules') || relPath.split('/').includes('.git')) continue
+    if (entry.isDirectory()) {
+      yield* walkFiles(fullPath, base)
+    } else if (entry.isFile()) {
+      yield relPath
+    }
+  }
+}
 
 export const findFilesTool: Tool = {
   name: 'find_files',
@@ -23,11 +38,9 @@ export const findFilesTool: Tool = {
 
     const results: string[] = []
     try {
-      const iter = glob(pattern, { cwd: base })
-      for await (const entry of iter) {
-        const p = String(entry)
-        if (p.includes('node_modules') || p.includes('.git')) continue
-        results.push(p)
+      for await (const entry of walkFiles(base, base)) {
+        if (!minimatch(entry, pattern)) continue
+        results.push(entry)
         if (results.length >= MAX_RESULTS) break
       }
     } catch (e) {
