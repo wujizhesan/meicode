@@ -20,7 +20,7 @@ export function parseSkillFile(file: string, source: SkillSource): SkillDef | nu
     return null
   }
   // frontmatter：---\n...\n---
-  const m = raw.match(/^---\n([\s\S]*?)\n---\n?([\s\S]*)$/)
+  const m = raw.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/)
   if (!m) {
     console.warn(`[Skill] 缺少 frontmatter，跳过: ${file}`)
     return null
