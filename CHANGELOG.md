@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.1
+
+- 修复 Windows CRLF 文件导致内置 Skill 与子 Agent frontmatter 被跳过的问题
+
 ## 0.1.0
 
 - 初始发行版

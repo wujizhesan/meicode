@@ -22,7 +22,7 @@ export function parseAgentFile(file: string, source: AgentRoleSource): AgentRole
   } catch {
     return null
   }
-  const m = raw.match(/^---\n([\s\S]*?)\n---\n?([\s\S]*)$/)
+  const m = raw.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/)
   if (!m) {
     console.warn(`[子Agent] 缺少 frontmatter，跳过: ${file}`)
     return null
