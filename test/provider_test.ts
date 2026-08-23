@@ -161,5 +161,24 @@ await check('provider: 预取消信号会传递到请求', async () => {
   assert(seen.length === 2 && seen.every(Boolean), `预取消信号未传递: ${JSON.stringify(seen)}`)
 })
 
+await check('provider: 完整 endpoint 不重复追加路径', async () => {
+  const originalFetch = globalThis.fetch
+  const urls: string[] = []
+  globalThis.fetch = (async (input: Parameters<typeof fetch>[0]) => {
+    urls.push(String(input))
+    return new Response('data: [DONE]\n\n', { status: 200, headers: { 'content-type': 'text/event-stream' } })
+  }) as typeof fetch
+  try {
+    const cfg: ProviderConfig = { name: 'test', protocol: 'openai', model: 'm', base_url: 'https://api.deepseek.com/chat/completions', api_key: 'x' }
+    for await (const _event of new OpenAIProvider(cfg).streamChat([], {})) {}
+    const anthropic = { ...cfg, protocol: 'anthropic' as const, base_url: 'https://api.example.com/v1/messages' }
+    for await (const _event of new AnthropicProvider(anthropic).streamChat([], {})) {}
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+  assert(urls[0] === 'https://api.deepseek.com/chat/completions', `OpenAI endpoint 错误: ${urls[0]}`)
+  assert(urls[1] === 'https://api.example.com/v1/messages', `Anthropic endpoint 错误: ${urls[1]}`)
+})
+
 console.log(`\nprovider_test: ${passed} passed, ${failed} failed`)
 if (failed > 0) process.exit(1)
