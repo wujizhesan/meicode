@@ -4,10 +4,12 @@ import type { Provider } from '../provider/types.ts'
 import type { ToolContext, ToolRegistry } from '../tools/index.ts'
 import { History } from '../session/history.ts'
 import { runAgent } from '../agent/loop.ts'
+import type { AgentHandle } from '../agent/events.ts'
 import { summarize, tailKeep, summaryMessage, boundaryMessage } from '../context/summary.ts'
 import type { TeamGroupStore } from './group.ts'
 import type { TeamMail } from './mail.ts'
-import type { TeamMember } from './types.ts'
+import type { TeamMember, TeamTaskReport } from './types.ts'
+import { collectRuntimeEvidence, createRuntimeId } from '../runtime/index.ts'
 
 // 成员上下文压缩阈值:历史估算超限时,摘要早期对话(对齐主会话 compact)
 // 大任务几十轮后成员历史无限累积——不压缩会上下文爆炸
@@ -34,11 +36,14 @@ export class MemberHost {
   private groupName: string
   private store: TeamGroupStore
   private mail: TeamMail
+  private activeAgent: AgentHandle | null = null
+  private closeController = new AbortController()
+  private closed = false
 
   private rolePrompt: string // 专家角色 SOP 正文（对齐 Qoder 专家团：角色=领域+专属指令）
   private roleToolsDeny: string[] // 角色禁用的工具（tools_deny frontmatter）
   private roleToolsAllow: string[] // 角色追加的工具（tools_allow frontmatter）
-  private roleMaxRounds: number | undefined // 角色 max_rounds（team-lead 30 轮 vs 默认 15——复杂编排收尾需要）
+  private roleMaxRounds: number | undefined // 角色 max_rounds（reverse-manager 30 轮 vs 默认 15——复杂编排收尾需要）
 
   constructor(
     member: TeamMember,
@@ -99,6 +104,13 @@ export class MemberHost {
     return this.member.status === 'busy'
   }
 
+  close(): void {
+    if (this.closed) return
+    this.closed = true
+    this.closeController.abort()
+    this.activeAgent?.cancel()
+  }
+
   // 上下文压缩:历史估算超阈值 → 摘要早期对话,保留尾部(对齐主会话 compact)
   private async compactIfNeeded(): Promise<void> {
     const msgs = this.history.all()
@@ -123,25 +135,29 @@ export class MemberHost {
     // 只认本 PLAN 发出之后的审批消息——历史 APPROVE 残留会被后续任务误复用
     const planTs = Date.now()
     this.mail.send(this.member.name, lead, `PLAN 任务: ${taskTitle}\n计划: 按任务要求直接执行，等待 Lead 审批`)
-    const deadline = planTs + 60000
-    while (Date.now() < deadline) {
-      const msgs = this.mail.read(this.member.name)
-      const decision = msgs.find((m) => m.from === lead && m.ts >= planTs && /^(APPROVE|DENY)/.test(m.body))
-      if (decision) {
-        if (decision.body.startsWith('DENY')) {
-          return `任务被 Lead 拒绝: ${decision.body.slice(6).trim() || '未说明原因'}`
-        }
-        return null // APPROVE → 继续执行
-      }
-      await new Promise((r) => setTimeout(r, 1000))
+    const decision = await this.mail.waitForMessage(
+      this.member.name,
+      (message) => message.from === lead && message.ts >= planTs && /^(APPROVE|DENY)/.test(message.body),
+      Math.max(0, planTs + 60000 - Date.now()),
+      this.closeController.signal,
+    )
+    if (this.closed) return '成员正在关闭，已放弃执行'
+    if (decision) {
+      if (decision.body.startsWith('DENY')) return `任务被 Lead 拒绝: ${decision.body.slice(6).trim() || '未说明原因'}`
+      return null
     }
     return '等待 Lead 审批超时（60s），已放弃执行'
   }
 
   // 执行任务（协程驻留：runAgent 跑到底）
   // 返回结构化结果：status 供任务状态落库（拒绝/超时 → failed）
-  async execute(taskTitle: string): Promise<{ status: 'done' | 'failed'; text: string }> {
+  async execute(taskTitle: string): Promise<{ status: 'done' | 'failed'; text: string; report: TeamTaskReport }> {
+    if (this.closed) {
+      const reportId = createRuntimeId('report')
+      return { status: 'failed', text: '成员正在关闭，无法执行新任务', report: { reportId, status: 'failed', summary: '成员正在关闭，无法执行新任务' } }
+    }
     this.member.status = 'busy'
+    try {
     const startedAt = Date.now()
     // 成员上下文压缩:历史超限时摘要早期对话(大任务多轮后防爆炸)
     await this.compactIfNeeded()
@@ -155,7 +171,8 @@ export class MemberHost {
       const denied = await this.waitApproval(taskTitle)
       if (denied !== null) {
         this.member.status = 'idle'
-        return { status: 'failed', text: denied }
+        const reportId = createRuntimeId('report')
+        return { status: 'failed', text: denied, report: { reportId, status: 'failed', summary: denied, error: denied } }
       }
     }
     this.history.push({ role: 'user', content: taskTitle })
@@ -177,6 +194,7 @@ export class MemberHost {
       unknownToolLimit: 2,
       toolsOverride: toolsOverride as never,
     })
+    this.activeAgent = agent
 
     let output = ''
     for await (const ev of agent.events) {
@@ -190,6 +208,19 @@ export class MemberHost {
     const outcome: { status: 'done' | 'failed'; text: string } = ABORT_REASONS.has(result.reason)
       ? { status: 'failed', text: `执行失败（${result.reason}）: ${result.errorMessage ?? '未知原因'}` }
       : { status: 'done', text: output }
+    const report: TeamTaskReport = {
+      reportId: createRuntimeId('report'),
+      status: outcome.status,
+      summary: outcome.text.slice(0, 4000),
+      tokens: result.totalTokens,
+      durationMs: Date.now() - startedAt,
+      evidence: collectRuntimeEvidence(
+        this.ctx.runtimeEvents?.read(this.ctx.sessionId ?? this.ctx.agentId ?? this.member.name) ?? [],
+        this.ctx.agentId ?? this.member.agentId ?? this.member.name,
+        startedAt,
+      ),
+      ...(result.errorMessage ? { error: result.errorMessage } : {}),
+    }
     // subagent_stop hook：成员任务结束
     void this.ctx.hooks?.fire('subagent_stop', {
       cwd: this.ctx.cwd,
@@ -204,6 +235,10 @@ export class MemberHost {
       role: `member:${this.member.role}`,
       stats: `status=${outcome.status}`,
     })
-    return outcome
+    return { ...outcome, report }
+    } finally {
+      this.activeAgent = null
+      this.member.status = 'idle'
+    }
   }
 }

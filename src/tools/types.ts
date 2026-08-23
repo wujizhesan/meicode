@@ -17,18 +17,36 @@ export interface ToolResult {
   output: string
   truncated?: boolean
   error?: string
+  callId?: string
+  evidence?: ToolEvidence
+}
+
+export interface ToolEvidence {
+  files?: string[]
+  commands?: string[]
+  changedFiles?: string[]
+  artifactPaths?: string[]
+  exitCode?: number
+  tests?: { command: string; passed: boolean; output?: string }[]
 }
 
 import type { AskResult, PermissionContext, ToolCallInfo } from '../permission/types.ts'
-import { resolve, sep } from 'node:path'
+import { basename, dirname, join, resolve, sep } from 'node:path'
+import { existsSync, realpathSync } from 'node:fs'
 
 export interface ToolContext {
+  sessionId?: string
+  agentId?: string
+  taskId?: string
   cwd: string
+  runtimeEvents?: import('../runtime/index.ts').RuntimeEventLog
+  contextBudget?: () => import('../context/manager.ts').ContextBudgetSnapshot
   // 路径围栏：非空时文件工具禁止写入该根目录之外（团队成员 worktree 隔离）
   rootLock?: string
   // 额外允许写路径（rootLock 外,如报告产出目录 D:\reverse-notes——专家的产出物契约）
   rootLockExtra?: string[]
   timeoutMs?: number
+  signal?: AbortSignal
   permission?: PermissionContext
   ask?: (call: ToolCallInfo) => Promise<AskResult>
   // Elicitation(对齐 Claude Code):agent 主动反问用户,拿自由文本回答继续
@@ -49,12 +67,30 @@ export const MAX_RESULT_BYTES = 8192
 export function guardPath(ctx: ToolContext, target: string, checkWrite = true): string | null {
   if (!ctx.rootLock) return null
   if (!checkWrite) return null
-  const resolved = resolve(target)
-  const roots = [resolve(ctx.rootLock), ...(ctx.rootLockExtra ?? []).map((r) => resolve(r))]
-  for (const root of roots) {
-    if (resolved === root || resolved.startsWith(root + sep)) return null
+  const resolved = resolveWritePath(target)
+  const roots = [ctx.rootLock, ...(ctx.rootLockExtra ?? [])].map(resolveWritePath)
+  const comparable = (value: string): string => (process.platform === 'win32' ? value.toLowerCase() : value)
+  const targetPath = comparable(resolved)
+  for (const root of roots.map(comparable)) {
+    if (targetPath === root || targetPath.startsWith(root + sep)) return null
   }
   return `路径越界: ${target}（只能在工作目录 ${ctx.rootLock} 内操作）`
+}
+
+function resolveWritePath(target: string): string {
+  let current = resolve(target)
+  const suffix: string[] = []
+  while (!existsSync(current)) {
+    const parent = dirname(current)
+    if (parent === current) return current
+    suffix.push(basename(current))
+    current = parent
+  }
+  try {
+    return join(realpathSync.native(current), ...suffix.reverse())
+  } catch {
+    return resolve(target)
+  }
 }
 
 // 命令围栏：rootLock 非空时，命令文本中引用的盘符绝对路径必须在根内
@@ -72,10 +108,17 @@ const DOTDOT_RE = /(?<=^|[\s"'&|;()\\/])\.\.(?=[\\/\s"'&|;()]|$)/
 const READONLY_CMD_RE =
   /^\s*(ls|dir|type|cat|where|head|tail|wc|file|stat|du|strings|xxd|od|grep|findstr|more|git\s+(status|log|diff|show|branch|remote|fetch|ls-files|rev-parse)|node\s+-v|npm\s+(ls|view))\b/i
 
+const SHELL_OPERATOR_RE = /[&;<>\r\n]/
+
+export function isReadOnlyCommand(command: string): boolean {
+  if (SHELL_OPERATOR_RE.test(command) || /\|\|/.test(command)) return false
+  return command.split('|').every((part) => READONLY_CMD_RE.test(part.trim()))
+}
+
 export function guardCommand(ctx: ToolContext, command: string): string | null {
   if (!ctx.rootLock) return null
   // 只读命令豁免——调研/经理要查看外部目标目录(核心需求),只读不改文件
-  if (READONLY_CMD_RE.test(command)) return null
+  if (isReadOnlyCommand(command)) return null
   if (DOTDOT_RE.test(command)) {
     return `命令包含相对路径穿越（..），只能在工作目录 ${ctx.rootLock} 内操作。读取外部目标文件请改用 read_file 工具——它不受目录限制`
   }
@@ -83,7 +126,10 @@ export function guardCommand(ctx: ToolContext, command: string): string | null {
   for (const m of command.matchAll(ABS_PATH_RE)) {
     const p = m[0].replace(/[\\/]+$/, '')
     const r = resolve(p).toLowerCase()
-    if (roots.some((root) => r === root.toLowerCase() || r.startsWith(root.toLowerCase()))) continue
+    if (roots.some((root) => {
+      const comparableRoot = root.toLowerCase()
+      return r === comparableRoot || r.startsWith(comparableRoot + sep)
+    })) continue
     return `命令引用了工作目录外的绝对路径: ${p}（只能在工作目录 ${ctx.rootLock} 内操作。读取外部目标文件请改用 read_file 工具——它不受目录限制）`
   }
   return null

@@ -1,6 +1,7 @@
 // 团队系统测试：小组/邮箱锁/任务/成员/coordinator/协议
 import { mkdirSync, rmSync, writeFileSync, existsSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
+import { spawn } from 'node:child_process'
 import { TeamManager, TeamGroupStore, TeamMail } from '../src/team/index.ts'
 import { withLock } from '../src/team/lock.ts'
 import type { ChatMessage, Provider, StreamEvent } from '../src/provider/types.ts'
@@ -54,6 +55,14 @@ async function main() {
     const loaded = store.loadGroup('dev')
     if (!loaded || loaded.lead !== 'lead1' || loaded.members.length !== 1) throw new Error('加载失败')
     if (!existsSync(join(TEAM_ROOT, 'dev', 'tasks.json'))) throw new Error('tasks.json 缺失')
+    if (store.loadGroup('../outside') !== null) throw new Error('非法团队名称未拒绝')
+    let rejected = false
+    try {
+      store.createGroup('../outside', 'lead1')
+    } catch {
+      rejected = true
+    }
+    if (!rejected) throw new Error('创建非法团队名称未拒绝')
   })
   await check('小组: 任务 CRUD 持久化', () => {
     const store = new TeamGroupStore(TEAM_ROOT)
@@ -62,6 +71,29 @@ async function main() {
     if (tasks.length !== 1 || tasks[0].depends_on?.[0] !== 't2') throw new Error('任务持久化失败')
     const updated = store.updateTask('dev', 't1', { status: 'done', result: 'ok' })
     if (!updated || updated.status !== 'done') throw new Error('任务更新失败')
+    store.saveTasks('dev', [{ id: 'claim-1', title: '领取竞争', status: 'todo' }])
+    const firstClaim = store.claimTask('dev', 'claim-1', { status: 'in_progress', attempt: 1 })
+    const secondClaim = new TeamGroupStore(TEAM_ROOT).claimTask('dev', 'claim-1', { status: 'in_progress', attempt: 2 })
+    const staleA = new TeamGroupStore(TEAM_ROOT)
+    const staleB = new TeamGroupStore(TEAM_ROOT)
+    const snapshotA = staleA.loadGroup('dev')
+    const snapshotB = staleB.loadGroup('dev')
+    if (!snapshotA || !snapshotB) throw new Error('成员快照读取失败')
+    staleA.addMember(snapshotA, { name: 'bob', agentId: 'agent-bob', role: 'worker', workdir: REPO, backend: 'coroutine', needsApproval: false, status: 'idle' })
+    staleB.addMember(snapshotB, { name: 'carol', agentId: 'agent-carol', role: 'worker', workdir: REPO, backend: 'coroutine', needsApproval: false, status: 'idle' })
+    const membersAfterRace = store.loadGroup('dev')?.members ?? []
+    if (!membersAfterRace.some((member) => member.name === 'bob') || !membersAfterRace.some((member) => member.name === 'carol')) throw new Error('成员原子注册覆盖了并发成员')
+    const manager = new TeamManager(TEAM_ROOT, REPO, { provider: new FakeTeamProvider(), registry: { toOpenAITools: () => [] } as never, ctx })
+    const appended = manager.addTask('dev', 'atomic append')
+    if (!store.listTasks('dev').some((task) => task.id === appended.id)) throw new Error('任务原子追加失败')
+    store.saveTasks('dev', [
+      { id: 'stale', title: 'stale', status: 'in_progress', attempt: 1, maxAttempts: 2, leaseId: 'old', leaseExpiresAt: 10 },
+      { id: 'fresh', title: 'fresh', status: 'todo' },
+    ])
+    const recovered = manager.recoverStaleTasks('dev', 20)
+    const afterRecovery = store.listTasks('dev')
+    if (recovered.length !== 1 || afterRecovery.length !== 2 || afterRecovery.find((task) => task.id === 'fresh')?.status !== 'todo') throw new Error('过期任务恢复覆盖了其他任务')
+    if (!firstClaim || secondClaim) throw new Error('任务条件领取未串行化')
   })
 
   // ---------- 邮箱 ----------
@@ -76,12 +108,32 @@ async function main() {
     if (!msgs[0].summary || msgs[0].summary.length > 80) throw new Error('摘要截断失败')
     mail.read('alice', true)
     if (!mail.read('alice')[0].read) throw new Error('已读标记失败')
+    if (mail.read('../outside').length !== 0) throw new Error('非法邮箱名称未拒绝')
   })
   await check('邮箱: 广播', () => {
     const mail = new TeamMail(join(TEAM_ROOT, 'mail'))
     mail.send('lead', '*', '全员通知')
     const msgs = mail.read('alice')
     if (!msgs.some((m) => m.to === '*')) throw new Error('广播未收到')
+    mail.read('alice', true)
+    const broadcast = mail.read('alice').find((m) => m.body === '全员通知')
+    if (!broadcast?.read) throw new Error('广播已读状态未落盘')
+  })
+  await check('邮箱: 事件等待消息', async () => {
+    const mail = new TeamMail(join(TEAM_ROOT, 'wait-mail'))
+    mail.register('alice')
+    const pending = mail.waitForMessage('alice', (message) => message.body === 'wake', 1000)
+    setTimeout(() => mail.send('lead', 'alice', 'wake'), 20)
+    const message = await pending
+    if (!message || message.body !== 'wake') throw new Error('邮件事件等待未唤醒')
+  })
+  await check('邮件等待支持取消', async () => {
+    const mail = new TeamMail(join(TEAM_ROOT, 'abort-mail'))
+    mail.register('alice')
+    const controller = new AbortController()
+    const pending = mail.waitForMessage('alice', () => true, 5000, controller.signal)
+    controller.abort()
+    if (await pending !== null) throw new Error('邮件等待取消失败')
   })
   await check('邮箱: 锁并发与过期', () => {
     // 锁：同锁文件串行不冲突
@@ -94,12 +146,20 @@ async function main() {
     })
     if (counter !== 2) throw new Error('锁串行失败')
     // 过期锁：伪造旧锁 → 覆盖
-    writeFileSync(join(TMP, 'stale.lock'), String(Date.now() - 10000), 'utf8')
+    writeFileSync(join(TMP, 'stale.lock'), String(Date.now() - 60000), 'utf8')
     let executed = false
     withLock(join(TMP, 'stale.lock'), () => {
       executed = true
     })
     if (!executed) throw new Error('过期锁未覆盖')
+    const waitLock = join(TMP, 'wait.lock')
+    const holder = spawn(process.execPath, ['-e', `const fs=require('fs'); fs.writeFileSync(${JSON.stringify(waitLock)}, String(Date.now())); setTimeout(() => fs.unlinkSync(${JSON.stringify(waitLock)}), 500)`], { stdio: 'ignore' })
+    const deadline = Date.now() + 2000
+    while (!existsSync(waitLock) && Date.now() < deadline) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10)
+    const started = Date.now()
+    withLock(waitLock, () => {})
+    if (Date.now() - started < 300) throw new Error('锁竞争未等待')
+    holder.kill()
   })
   await check('邮箱: 协议解析', () => {
     const p1 = TeamMail.parseProtocol('APPROVE 计划可行')
@@ -216,12 +276,25 @@ async function main() {
     await manager.assignTask(group, task, 'alice')
     await new Promise((r) => setTimeout(r, 500))
     const updated = manager.listTasks('death').find((t) => t.id === 'dt1')
+    if (manager.getMember('alice')?.isBusy()) throw new Error('成员异常后未释放 busy 状态')
     if (updated?.status !== 'failed') throw new Error(`应 failed: ${updated?.status}`)
     const mail = new TeamMail(join(TEAM_ROOT, '_shared', 'mail'))
     const msgs = mail.read('lead')
     if (!msgs.some((m) => m.from === 'alice' && m.body.includes('ERR'))) {
       throw new Error('Lead 未收到 ERR 邮件(协程死亡静默)')
     }
+  })
+  await check('TeamManager: close 取消审批等待并清理成员', async () => {
+    const manager = new TeamManager(TEAM_ROOT, REPO, { provider: new FakeTeamProvider(), registry: { toOpenAITools: () => [] } as never, ctx })
+    const group = manager.createGroup('shutdown', 'lead')
+    await manager.spawnMember(group, 'alice', 'worker', { needsApproval: true, workdir: REPO })
+    const task = { id: 'shutdown-task', title: 'shutdown', status: 'todo' as const }
+    manager['store'].saveTasks('shutdown', [task])
+    const pending = manager.runTask(group, task, 'alice')
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    await manager.close()
+    const result = await pending
+    if (!manager.isClosed() || manager.getMember('alice')?.isBusy() || !result.includes('关闭')) throw new Error('TeamManager close 未取消成员执行')
   })
 
   rmSync(TMP, { recursive: true, force: true })

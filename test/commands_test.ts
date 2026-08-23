@@ -72,6 +72,10 @@ function makeMockUi() {
       calls.push({ method: 'workflowAction', args: [a, args] })
       return `wf:${a}`
     },
+    auditAction: (args) => {
+      calls.push({ method: 'auditAction', args: [args] })
+      return 'audit-ok'
+    },
   }
   return { ui, calls }
 }
@@ -86,7 +90,7 @@ async function main() {
   // ---------- 注册中心 ----------
   await check('注册: 十二命令登记齐全', () => {
     const r = makeRegistry()
-    if (r.list().length !== 16) throw new Error(`数量 ${r.list().length}`)
+    if (r.list().length !== 17) throw new Error(`数量 ${r.list().length}`)
   })
   await check('注册: 别名冲突抛错', () => {
     const r = makeRegistry()
@@ -188,6 +192,12 @@ async function main() {
     if (!calls.some((c) => c.method === 'sessionAction' && c.args[0] === 'resume' && c.args[1] === '20260809-1')) {
       throw new Error('resume 别名未生效')
     }
+  })
+  await check('分发: /audit → auditAction', () => {
+    const { ui, calls } = makeMockUi()
+    const d = createDispatcher(makeRegistry(), ui)
+    d.dispatch('/audit task task-1 10')
+    if (!calls.some((c) => c.method === 'auditAction' && JSON.stringify(c.args[0]).includes('task-1'))) throw new Error('auditAction 未调用')
   })
 
   // ---------- 补全 ----------

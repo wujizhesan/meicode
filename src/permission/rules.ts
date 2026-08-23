@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs'
+import { readFileSync, writeFileSync, mkdirSync, existsSync, renameSync, rmSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { parse, stringify } from 'yaml'
 import { minimatch } from 'minimatch'
@@ -7,6 +7,15 @@ import type { Rule, RuleSource, ToolCallInfo } from './types.ts'
 interface RuleFileShape {
   mode?: string
   rules?: { tool: string; pattern: string; action: string }[]
+}
+
+function normalizeShape(value: unknown): RuleFileShape {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return { rules: [] }
+  const shape = value as { mode?: unknown; rules?: unknown }
+  return {
+    mode: typeof shape.mode === 'string' ? shape.mode : undefined,
+    rules: Array.isArray(shape.rules) ? (shape.rules as RuleFileShape['rules']) : [],
+  }
 }
 
 const SOURCE_ORDER: RuleSource[] = ['session', 'local', 'project', 'user']
@@ -25,6 +34,9 @@ export class RuleEngine {
   }
 
   loadAll(): void {
+    const sessionRules = this.rulesBySource.session
+    this.rulesBySource = { session: sessionRules, local: [], project: [], user: [] }
+    this.userMode = null
     this.loadFile(this.userFile, 'user')
     this.loadFile(this.projectFile, 'project')
     this.loadFile(this.localFile, 'local')
@@ -34,7 +46,7 @@ export class RuleEngine {
     if (!existsSync(file)) return
     let parsed: RuleFileShape
     try {
-      parsed = parse(readFileSync(file, 'utf8')) ?? {}
+      parsed = normalizeShape(parse(readFileSync(file, 'utf8')))
     } catch (e) {
       console.warn(`[权限] 规则文件解析失败，已跳过: ${file}（${(e as Error).message}）`)
       return
@@ -60,14 +72,27 @@ export class RuleEngine {
     let shape: RuleFileShape = { rules: [] }
     if (existsSync(file)) {
       try {
-        shape = parse(readFileSync(file, 'utf8')) ?? {}
+        shape = normalizeShape(parse(readFileSync(file, 'utf8')))
       } catch {
         shape = { rules: [] }
       }
     }
     shape.rules = [...(shape.rules ?? []), { tool: rule.tool, pattern: rule.pattern, action: rule.action }]
     mkdirSync(dirname(file), { recursive: true })
-    writeFileSync(file, stringify(shape), 'utf8')
+    const content = stringify(shape)
+    const temp = `${file}.${process.pid}.${Date.now()}.tmp`
+    try {
+      writeFileSync(temp, content, 'utf8')
+      try {
+        renameSync(temp, file)
+      } catch {
+        writeFileSync(file, content, 'utf8')
+        rmSync(temp, { force: true })
+      }
+    } catch (error) {
+      rmSync(temp, { force: true })
+      throw error
+    }
     this.rulesBySource.project.push({ ...rule, source: 'project' })
   }
 

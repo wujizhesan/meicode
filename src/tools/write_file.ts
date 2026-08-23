@@ -27,7 +27,7 @@ export const writeFileTool: Tool = {
     try {
       await mkdir(dirname(target), { recursive: true })
       await writeFile(target, content, 'utf8')
-      return { success: true, output: `已写入 ${target}（${Buffer.byteLength(content, 'utf8')} 字节）` }
+      return { success: true, output: `已写入 ${target}（${Buffer.byteLength(content, 'utf8')} 字节）`, evidence: { files: [target], changedFiles: [target] } }
     } catch (e) {
       return { success: false, output: '', error: `写入失败: ${(e as Error).message}` }
     }

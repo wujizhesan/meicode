@@ -15,6 +15,17 @@ export interface ContextManagerOptions {
   hooks?: HookEngine // pre/post_compact hook
 }
 
+export interface ContextBudgetSnapshot {
+  window: number
+  estimatedTokens: number
+  remainingTokens: number
+  autoMargin: number
+  manualMargin: number
+  historyMessages: number
+  lastInputTokens?: number
+  breakerOpen: boolean
+}
+
 export class ContextManager {
   private estimator = new TokenEstimator()
   private failCount = 0
@@ -26,6 +37,7 @@ export class ContextManager {
   private window: number
   private autoMargin: number
   private manualMargin: number
+  private lastInputTokens: number | undefined
   lastSummary: string | null = null
 
   constructor(opts: ContextManagerOptions) {
@@ -40,6 +52,20 @@ export class ContextManager {
 
   get breakerOpenState(): boolean {
     return this.breakerOpen
+  }
+
+  snapshot(): ContextBudgetSnapshot {
+    const estimatedTokens = this.estimator.estimate(this.history.all())
+    return {
+      window: this.window,
+      estimatedTokens,
+      remainingTokens: Math.max(0, this.window - estimatedTokens),
+      autoMargin: this.autoMargin,
+      manualMargin: this.manualMargin,
+      historyMessages: this.history.all().length,
+      ...(this.lastInputTokens === undefined ? {} : { lastInputTokens: this.lastInputTokens }),
+      breakerOpen: this.breakerOpen,
+    }
   }
 
   async beforeRequest(mode: 'auto' | 'manual'): Promise<void> {
@@ -74,6 +100,7 @@ export class ContextManager {
       this.lastSummary = summary
       this.history.replaceRange(0, drop.length, [summaryMessage(summary), boundaryMessage()])
       this.failCount = 0
+      this.breakerOpen = false
       // post_compact hook：压缩完成（校验/记录）
       await this.hooks?.fire('post_compact', {
         cwd: this.cwd,
@@ -89,6 +116,7 @@ export class ContextManager {
   }
 
   afterRequest(usageInputTokens: number, messageCount: number): void {
+    this.lastInputTokens = usageInputTokens
     this.estimator.update(usageInputTokens, messageCount)
   }
 }

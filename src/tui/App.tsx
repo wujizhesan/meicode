@@ -156,6 +156,31 @@ export function App({
       parts.push(`消息数: ${history.length}`)
       return parts.join('\n')
     },
+    auditAction: (args) => {
+      const events = memory?.runtimeEvents?.read(memory.sessionId ?? '').filter((event) => event.type === 'audit') ?? []
+      if (events.length === 0) return '暂无审计事件'
+      let filtered = events
+      let filterLabel = ''
+      if (args[0] === 'task' || args[0] === 'request') {
+        const value = args[1]
+        if (!value) return '用法: /audit task <taskId> [limit] 或 /audit request <requestId> [limit]'
+        filtered = filtered.filter((event) => args[0] === 'task' ? event.taskId === value : event.correlationId === value || event.payload?.requestId === value)
+        filterLabel = `${args[0]}=${value}`
+      } else if (args[0] && !/^\d+$/.test(args[0])) {
+        filtered = filtered.filter((event) => event.payload?.kind === args[0])
+        filterLabel = `kind=${args[0]}`
+      }
+      const rawLimit = args.at(-1)
+      const limit = rawLimit && /^\d+$/.test(rawLimit) ? Math.min(100, Math.max(1, Number(rawLimit))) : 20
+      const lines = filtered.slice(-limit).map((event) => {
+        const payload = event.payload ?? {}
+        const kind = String(payload.kind ?? event.type)
+        const links = [event.taskId ? `task=${event.taskId}` : '', event.correlationId ? `request=${event.correlationId}` : '', event.agentId ? `agent=${event.agentId}` : ''].filter(Boolean).join(' ')
+        const details = JSON.stringify(payload)
+        return `${event.seq} ${new Date(event.ts).toLocaleTimeString()} ${kind}${links ? ` ${links}` : ''}${details !== '{}' ? ` ${details.slice(0, 240)}` : ''}`
+      })
+      return `审计事件${filterLabel ? `（${filterLabel}）` : ''}，共 ${filtered.length} 条：\n${lines.join('\n')}`
+    },
     listCommands: (includeHidden) => commandRegistry.list(includeHidden),
     skillList: () => {
       if (!skillManager) return 'Skill 系统未启用'
@@ -380,7 +405,7 @@ export function App({
       }
       if (key.ctrl && input.toLowerCase() === 'c') {
         if (isRunning) stream.cancel()
-        else mcpManager?.closeAll().finally(() => process.exit(0))
+        else Promise.allSettled([teamManager?.close(), subAgentManager?.close(), mcpManager?.closeAll()]).finally(() => process.exit(0))
       }
     },
     { isActive: process.stdin.isTTY === true },

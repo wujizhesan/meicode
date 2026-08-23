@@ -216,6 +216,35 @@ async function main() {
     if (d.type !== 'deny' || !d.reason.includes('规则拒绝')) throw new Error(`规则 deny 应直接拒: ${JSON.stringify(d)}`)
   })
 
+  await check('权限: 只读命令不允许链式操作', async () => {
+    const engine = new RuleEngine('', '', '')
+    for (const command of ['git status && del /s /q C:\\Windows\\temp', 'dir & echo chained', 'git log | findstr secret']) {
+      const decision = await checkPermission(call('run_command', { command }), { cwd: TMP, mode: 'default', engine })
+      if (decision.type === 'allow') throw new Error(`链式命令被错误放行: ${command}`)
+    }
+  })
+
+  await check('规则: loadAll 幂等且不重复加载', () => {
+    const projectFile = join(TMP, 'rules-idempotent.yaml')
+    writeFileSync(projectFile, JSON.stringify({ rules: [{ tool: 'read_file', pattern: 'src/**', action: 'allow' }] }), 'utf8')
+    const engine = new RuleEngine('', projectFile, '')
+    engine.loadAll()
+    const first = (engine as unknown as { rulesBySource: { project: Rule[] } }).rulesBySource.project.length
+    engine.loadAll()
+    const second = (engine as unknown as { rulesBySource: { project: Rule[] } }).rulesBySource.project.length
+    if (first !== 1 || second !== 1) throw new Error(`规则重复加载: ${first} -> ${second}`)
+  })
+
+  await check('规则: 非对象配置可安全追加', () => {
+    const projectFile = join(TMP, 'rules-invalid.yaml')
+    writeFileSync(projectFile, '[]', 'utf8')
+    const engine = new RuleEngine('', projectFile, '')
+    engine.appendProjectRule({ tool: 'read_file', pattern: 'src/**', action: 'allow' })
+    const reloaded = new RuleEngine('', projectFile, '')
+    reloaded.loadAll()
+    if (!reloaded.match(call('read_file', { path: 'src/index.ts' }))) throw new Error('坏配置追加后规则未生效')
+  })
+
   rmSync(TMP, { recursive: true, force: true })
   rmSync(OUTSIDE, { recursive: true, force: true })
   console.log(`\n${passed} passed, ${failed} failed`)

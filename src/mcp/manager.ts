@@ -19,6 +19,7 @@ export interface DiscoverResult {
 export class McpClientManager {
   private clients = new Map<string, Client>()
   private toolCache = new Map<string, RemoteToolInfo[]>()
+  private pendingConnections = new Map<string, Promise<Client>>()
   connectCount = 0 // 测试观察用：连接次数
   private servers: McpServerConfig[]
 
@@ -57,6 +58,65 @@ export class McpClientManager {
     return client
   }
 
+  private async connectWithTimeout(server: McpServerConfig): Promise<Client> {
+    let settled = false
+    const pending = this.connect(server)
+    pending
+      .then((client) => {
+        if (settled) void this.closeClient(client)
+      })
+      .catch(() => {})
+    try {
+      return await withIdleTimeout(pending, 15000)
+    } finally {
+      settled = true
+    }
+  }
+
+  private async closeClient(client: Client | undefined): Promise<void> {
+    if (!client) return
+    try {
+      await client.close()
+    } catch {
+      // 关闭失败不应阻塞其他 Server 的清理
+    }
+  }
+
+  private async ensureConnected(server: McpServerConfig): Promise<Client> {
+    const cached = this.clients.get(server.name)
+    if (cached) return cached
+
+    const pending = this.pendingConnections.get(server.name)
+    if (pending) return pending
+
+    const connection = (async () => {
+      let client: Client | undefined
+      try {
+        client = await this.connectWithTimeout(server)
+        const { tools } = await withIdleTimeout(client.listTools(), 15000)
+        this.clients.set(server.name, client)
+        this.toolCache.set(
+          server.name,
+          tools.map((t) => ({
+            name: t.name,
+            description: t.description ?? '',
+            inputSchema: (t.inputSchema as Record<string, unknown>) ?? {},
+          })),
+        )
+        return client
+      } catch (error) {
+        await this.closeClient(client)
+        throw error
+      }
+    })()
+    this.pendingConnections.set(server.name, connection)
+    try {
+      return await connection
+    } finally {
+      if (this.pendingConnections.get(server.name) === connection) this.pendingConnections.delete(server.name)
+    }
+  }
+
   // 懒发现：已有缓存直接返回；否则连接 + listTools + 缓存
   private async discoverOne(name: string): Promise<{ ok: boolean; error?: string }> {
     if (this.toolCache.has(name)) return { ok: true }
@@ -64,17 +124,7 @@ export class McpClientManager {
     if (!server) return { ok: false, error: `未找到 Server: ${name}` }
     try {
       // 超时兜底：connect/listTools 挂起时不阻塞 Agent Loop（callTool 已有 30s 包装）
-      const client = await withIdleTimeout(this.connect(server), 15000)
-      const { tools } = await withIdleTimeout(client.listTools(), 15000)
-      this.clients.set(name, client)
-      this.toolCache.set(
-        name,
-        tools.map((t) => ({
-          name: t.name,
-          description: t.description ?? '',
-          inputSchema: (t.inputSchema as Record<string, unknown>) ?? {},
-        })),
-      )
+      await this.ensureConnected(server)
       return { ok: true }
     } catch (e) {
       return { ok: false, error: (e as Error).message }
@@ -102,9 +152,7 @@ export class McpClientManager {
       const server = this.findServer(serverName)
       if (!server) return { success: false, output: '', error: `[MCP 错误] 未找到 Server: ${serverName}` }
       try {
-        client = await withIdleTimeout(this.connect(server), 15000)
-        this.clients.set(serverName, client)
-        await withIdleTimeout(client.listTools(), 15000) // 确保握手完成
+        client = await this.ensureConnected(server)
       } catch (e) {
         return { success: false, output: '', error: `[MCP 错误] 连接失败: ${(e as Error).message}` }
       }
@@ -114,11 +162,17 @@ export class McpClientManager {
       const result = await withIdleTimeout(client.callTool({ name: toolName, arguments: args }), 30000)
       return toToolResult(result)
     } catch (e) {
+      if (this.clients.get(serverName) === client) {
+        this.clients.delete(serverName)
+        this.toolCache.delete(serverName)
+        await this.closeClient(client)
+      }
       return { success: false, output: '', error: `[MCP 错误] ${(e as Error).message}` }
     }
   }
 
   async closeAll(): Promise<void> {
+    await Promise.allSettled(this.pendingConnections.values())
     for (const [name, client] of this.clients) {
       try {
         await client.close()
@@ -127,6 +181,7 @@ export class McpClientManager {
       }
       this.clients.delete(name)
     }
+    this.pendingConnections.clear()
     this.toolCache.clear()
   }
 }

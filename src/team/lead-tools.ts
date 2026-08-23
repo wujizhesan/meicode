@@ -26,7 +26,7 @@ export function createLeadTools(team: TeamManager): Tool[] {
     {
       name: 'team_spawn',
       description:
-        '派生团队成员（协程驻留，独立上下文执行任务）。group=组名 member=成员名 role=角色名。专家角色清单：research-expert 调研（write_paths 允许写报告契约目录）/ data-expert 数据获取 / protocol-expert 协议签名分析 / implement-expert 实现 / qa-expert 验证 / frontend-expert 前端 / backend-expert 后端 / testing-expert 测试 / security-expert 安全 / general-purpose 通用。调研类任务用 research-expert（有契约目录写权限），不要用 general-purpose。',
+        '派生团队成员（协程驻留，独立上下文执行任务）。group=组名 member=成员名 role=角色名。专家角色清单：recon-expert 逆向侦察（write_paths 允许写 D:/reverse-notes 报告契约目录）/ replicator-expert 复刻 / verifier-expert 验证 / jsr-expert JS 签名加密 / acquisition-expert 数据采集 / frontend-expert 前端 / backend-expert 后端 / testing-expert 测试 / security-expert 安全 / general-purpose 通用。逆向侦察类任务必须用 recon-expert（有契约目录写权限），不要用 general-purpose。',
       parameters: {
         type: 'object',
         properties: {
@@ -100,6 +100,8 @@ export function createLeadTools(team: TeamManager): Tool[] {
           group: { type: 'string', description: '组名' },
           task: { type: 'string', description: '任务描述' },
           member: { type: 'string', description: '成员名' },
+          depends_on: { type: 'array', items: { type: 'string' }, description: '依赖任务 ID 列表' },
+          max_attempts: { type: 'number', description: '最多执行次数' },
         },
         required: ['group', 'task', 'member'],
       },
@@ -107,7 +109,14 @@ export function createLeadTools(team: TeamManager): Tool[] {
         const g = loadGroup(String(args.group ?? ''))
         if (!g) return { success: false, output: '', error: `小组不存在: ${args.group}（先 team_create）` }
         const member = String(args.member ?? '')
-        const task = team.addTask(g.name, String(args.task ?? ''), member)
+        const dependsOn = Array.isArray(args.depends_on) ? args.depends_on.filter((v): v is string => typeof v === 'string') : []
+        const maxAttempts = typeof args.max_attempts === 'number' && args.max_attempts > 0 ? Math.floor(args.max_attempts) : 1
+        let task
+        try {
+          task = team.addTask(g.name, String(args.task ?? ''), member, dependsOn, maxAttempts)
+        } catch (e) {
+          return { success: false, output: '', error: (e as Error).message }
+        }
         const result = await team.runTask(g, task, member)
         return { success: true, output: `任务 ${task.id} 已完成\n${result.slice(0, 4000)}` }
       },
@@ -130,6 +139,21 @@ export function createLeadTools(team: TeamManager): Tool[] {
           return t.result ? `${base}\n    结果: ${t.result.slice(0, 1500)}` : base
         })
         return { success: true, output: lines.join('\n') }
+      },
+    },
+    {
+      name: 'team_schedule',
+      description: '扫描并派发当前可执行的 Team 任务。group=组名。任务必须有负责人且依赖已完成。',
+      parameters: {
+        type: 'object',
+        properties: { group: { type: 'string', description: '组名' } },
+        required: ['group'],
+      },
+      async execute(args: Record<string, unknown>): Promise<ToolResult> {
+        const g = loadGroup(String(args.group ?? ''))
+        if (!g) return { success: false, output: '', error: `小组不存在: ${args.group}（先 team_create）` }
+        const scheduled = team.scheduleReadyTasks(g.name)
+        return { success: true, output: scheduled.length ? `已派发任务: ${scheduled.join(', ')}` : '当前没有可派发任务' }
       },
     },
     {
