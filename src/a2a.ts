@@ -1,7 +1,5 @@
 import { createServer } from 'node:http'
 import type { IncomingMessage, ServerResponse } from 'node:http'
-import { existsSync, mkdirSync, readFileSync, renameSync } from 'node:fs'
-import { join } from 'node:path'
 import type { Provider } from './provider/types.ts'
 import { History } from './session/history.ts'
 import type { ToolContext, ToolRegistry } from './tools/index.ts'
@@ -10,67 +8,45 @@ import { runAgent } from './agent/loop.ts'
 import { buildPrompt } from './agent/prompt/index.ts'
 import { createRuntimeId, recordAudit } from './runtime/index.ts'
 import type { RuntimeEventLog } from './runtime/index.ts'
-import { atomicWriteFile } from './team/atomic.ts'
-import { withLock } from './team/lock.ts'
+import {
+  A2aLimitError,
+  clone,
+  DEFAULT_TASK_TTL_MS,
+  firstText,
+  isObject,
+  methodName,
+  normalizePushNotificationConfig,
+  now,
+  optionalInt,
+  parseMessage,
+  rpcRequest,
+  TASK_STATES,
+  TERMINAL_STATES,
+  textMessage,
+} from './a2a/protocol.ts'
+import { agentCard, isAuthorized, readBody, sendError, sendJson } from './a2a/http.ts'
+import { A2aTaskStore } from './a2a/store.ts'
+import type {
+  A2AArtifact,
+  A2AMessage,
+  A2APushNotificationConfig,
+  A2AStreamResponse,
+  A2ATask,
+  TaskState,
+} from './a2a/types.ts'
 
-type TaskState =
-  | 'TASK_STATE_SUBMITTED'
-  | 'TASK_STATE_WORKING'
-  | 'TASK_STATE_COMPLETED'
-  | 'TASK_STATE_FAILED'
-  | 'TASK_STATE_CANCELED'
-
-export interface A2APart {
-  kind: 'text'
-  text: string
-}
-
-export interface A2AMessage {
-  messageId: string
-  role: 'ROLE_USER' | 'ROLE_AGENT'
-  parts: A2APart[]
-  contextId?: string
-  taskId?: string
-}
-
-export interface A2AStatus {
-  state: TaskState
-  timestamp: string
-  message?: A2AMessage
-}
-
-export interface A2AArtifact {
-  artifactId: string
-  name?: string
-  parts: A2APart[]
-}
-
-export interface A2ATask {
-  id: string
-  contextId: string
-  status: A2AStatus
-  history: A2AMessage[]
-  artifacts: A2AArtifact[]
-}
-
-export interface A2AStreamResponse {
-  task?: A2ATask
-  statusUpdate?: { taskId: string; contextId: string; status: A2AStatus; final?: boolean }
-  artifactUpdate?: { taskId: string; contextId: string; artifact: A2AArtifact; append: boolean; lastChunk: boolean }
-}
-
-export interface A2APushNotificationConfig {
-  id: string
-  taskId: string
-  url: string
-  token?: string
-  authentication?: { scheme: string; credentials: string }
-}
-
-interface A2AStoredTask {
-  task: A2ATask
-  pushNotificationConfigs: A2APushNotificationConfig[]
-}
+export { A2aTaskStore } from './a2a/store.ts'
+export type {
+  A2AArtifact,
+  A2AMessage,
+  A2APart,
+  A2APushNotificationConfig,
+  A2AStatus,
+  A2AStoredTask,
+  A2AStreamResponse,
+  A2ATask,
+  TaskState,
+} from './a2a/types.ts'
 
 interface A2ATaskRecord {
   task: A2ATask
@@ -83,60 +59,6 @@ interface A2ATaskRecord {
   pushNotificationConfigs: Map<string, A2APushNotificationConfig>
   pushQueue: Promise<void>
   requestId?: string
-}
-
-export class A2aTaskStore {
-  private readonly file: string
-
-  constructor(root: string) {
-    mkdirSync(root, { recursive: true })
-    this.file = join(root, 'tasks.json')
-  }
-
-  load(): A2AStoredTask[] {
-    if (!existsSync(this.file)) return []
-    try {
-      const parsed = JSON.parse(readFileSync(this.file, 'utf8'))
-      if (!Array.isArray(parsed)) throw new Error('invalid task store')
-      return parsed.flatMap((value) => {
-        if (isPersistedTask(value)) return [{ task: clone(value), pushNotificationConfigs: [] }]
-        if (!isObject(value) || !isPersistedTask(value.task)) return []
-        const configs = Array.isArray(value.pushNotificationConfigs)
-          ? value.pushNotificationConfigs.filter(isPushNotificationConfig).map((config) => clone(config))
-          : []
-        return [{ task: clone(value.task), pushNotificationConfigs: configs }]
-      })
-    } catch {
-      const backup = `${this.file}.corrupt.${Date.now()}.json`
-      try {
-        renameSync(this.file, backup)
-      } catch {
-      }
-      return []
-    }
-  }
-
-  save(task: A2ATask, pushNotificationConfigs: A2APushNotificationConfig[] = []): void {
-    withLock(`${this.file}.lock`, () => {
-      const tasks = this.load().filter((item) => item.task.id !== task.id)
-      tasks.push({ task: clone(task), pushNotificationConfigs: clone(pushNotificationConfigs) })
-      atomicWriteFile(this.file, JSON.stringify(tasks, null, 2))
-    })
-  }
-
-  remove(taskId: string): void {
-    withLock(`${this.file}.lock`, () => {
-      const tasks = this.load().filter((item) => item.task.id !== taskId)
-      atomicWriteFile(this.file, JSON.stringify(tasks, null, 2))
-    })
-  }
-}
-
-interface RpcRequest {
-  jsonrpc?: unknown
-  id?: string | number | null
-  method?: unknown
-  params?: unknown
 }
 
 export interface A2aOptions {
@@ -158,130 +80,8 @@ export interface A2aOptions {
   description?: string
 }
 
-const TERMINAL_STATES = new Set<TaskState>([
-  'TASK_STATE_COMPLETED',
-  'TASK_STATE_FAILED',
-  'TASK_STATE_CANCELED',
-])
-const MAX_BODY_BYTES = 2 * 1024 * 1024
-const MAX_TEXT_LENGTH = 200_000
-const DEFAULT_TASK_TTL_MS = 7 * 24 * 60 * 60 * 1000
-const TASK_STATES = new Set<TaskState>([
-  'TASK_STATE_SUBMITTED',
-  'TASK_STATE_WORKING',
-  'TASK_STATE_COMPLETED',
-  'TASK_STATE_FAILED',
-  'TASK_STATE_CANCELED',
-])
-
-function isObject(value: unknown): value is Record<string, unknown> {
-  return Boolean(value) && typeof value === 'object' && !Array.isArray(value)
-}
-
-function clone<T>(value: T): T {
-  return JSON.parse(JSON.stringify(value)) as T
-}
-
-function isPersistedTask(value: unknown): value is A2ATask {
-  if (!isObject(value) || typeof value.id !== 'string' || typeof value.contextId !== 'string') return false
-  if (!isObject(value.status) || typeof value.status.timestamp !== 'string' || typeof value.status.state !== 'string' || !TASK_STATES.has(value.status.state as TaskState)) return false
-  return Array.isArray(value.history) && Array.isArray(value.artifacts)
-}
-
-function isPushNotificationConfig(value: unknown): value is A2APushNotificationConfig {
-  if (!isObject(value) || typeof value.id !== 'string' || typeof value.taskId !== 'string' || typeof value.url !== 'string') return false
-  if (value.token !== undefined && typeof value.token !== 'string') return false
-  return value.authentication === undefined || (
-    isObject(value.authentication)
-    && typeof value.authentication.scheme === 'string'
-    && typeof value.authentication.credentials === 'string'
-  )
-}
-
-function textMessage(text: string, role: A2AMessage['role'], contextId?: string, taskId?: string): A2AMessage {
-  return {
-    messageId: createRuntimeId('message'),
-    role,
-    parts: [{ kind: 'text', text }],
-    ...(contextId ? { contextId } : {}),
-    ...(taskId ? { taskId } : {}),
-  }
-}
-
-function firstText(message: A2AMessage): string {
-  return message.parts.map((part) => part.text).join('\n').trim()
-}
-
 function stateMessage(record: A2ATaskRecord, text: string): A2AMessage {
   return textMessage(text, 'ROLE_AGENT', record.task.contextId, record.task.id)
-}
-
-function now(): string {
-  return new Date().toISOString()
-}
-
-function optionalInt(value: unknown, name: string, max: number): number | undefined {
-  if (value === undefined || value === null) return undefined
-  const parsed = typeof value === 'number' ? value : Number(value)
-  if (!Number.isInteger(parsed) || parsed < 0 || parsed > max) throw new Error(`${name} 无效`)
-  return parsed
-}
-
-function normalizePushNotificationConfig(value: unknown, taskId: string): A2APushNotificationConfig {
-  if (!isObject(value) || typeof value.url !== 'string' || value.url.length > 2048) throw new Error('Push Notification url 无效')
-  let parsed: URL
-  try {
-    parsed = new URL(value.url)
-  } catch {
-    throw new Error('Push Notification url 无效')
-  }
-  if (parsed.username || parsed.password || (parsed.protocol !== 'https:' && !(parsed.protocol === 'http:' && ['localhost', '127.0.0.1', '[::1]'].includes(parsed.hostname)))) {
-    throw new Error('Push Notification 只允许 HTTPS，HTTP 仅限本机')
-  }
-  const token = value.token === undefined ? undefined : String(value.token)
-  if (token && (token.length > 1024 || /[\r\n]/.test(token))) throw new Error('Push Notification token 无效')
-  let authentication: A2APushNotificationConfig['authentication']
-  if (value.authentication !== undefined) {
-    if (!isObject(value.authentication) || typeof value.authentication.scheme !== 'string' || typeof value.authentication.credentials !== 'string') {
-      throw new Error('Push Notification authentication 无效')
-    }
-    if (!/^[A-Za-z][A-Za-z0-9-]{0,31}$/.test(value.authentication.scheme) || value.authentication.credentials.length > 2048 || /[\r\n]/.test(value.authentication.credentials)) {
-      throw new Error('Push Notification authentication 无效')
-    }
-    authentication = { scheme: value.authentication.scheme, credentials: value.authentication.credentials }
-  }
-  return {
-    id: typeof value.id === 'string' && value.id ? value.id : createRuntimeId('event'),
-    taskId,
-    url: parsed.toString(),
-    ...(token ? { token } : {}),
-    ...(authentication ? { authentication } : {}),
-  }
-}
-
-function parseMessage(value: unknown): A2AMessage {
-  if (!isObject(value)) throw new Error('message 必须是对象')
-  const role = value.role
-  if (role !== undefined && role !== 'ROLE_USER' && role !== 'user') throw new Error('只接受 ROLE_USER 消息')
-  if (!Array.isArray(value.parts) || value.parts.length === 0) throw new Error('message.parts 不能为空')
-  const parts: A2APart[] = []
-  for (const part of value.parts) {
-    if (!isObject(part) || typeof part.text !== 'string') throw new Error('当前只支持 text part')
-    if (part.text.length > MAX_TEXT_LENGTH) throw new Error('message.text 超出长度限制')
-    parts.push({ kind: 'text', text: part.text })
-  }
-  if (!parts.some((part) => part.text.trim())) throw new Error('message.parts 不能全为空')
-  return {
-    messageId: typeof value.messageId === 'string' && value.messageId ? value.messageId : createRuntimeId('message'),
-    role: 'ROLE_USER',
-    parts,
-    ...(typeof value.contextId === 'string' ? { contextId: value.contextId } : {}),
-    ...(typeof value.taskId === 'string' ? { taskId: value.taskId } : {}),
-  }
-}
-
-class A2aLimitError extends Error {
-  readonly statusCode = 429
 }
 
 export function createA2aServer(opts: A2aOptions): ReturnType<typeof createServer> {
@@ -330,77 +130,6 @@ export function createA2aServer(opts: A2aOptions): ReturnType<typeof createServe
     const page = filtered.slice(token, token + pageSize).map((record) => clone(record.task))
     const next = token + page.length < filtered.length ? Buffer.from(String(token + page.length)).toString('base64url') : undefined
     return { tasks: page, totalSize: filtered.length, ...(next ? { nextPageToken: next } : {}) }
-  }
-
-  const sendJson = (res: ServerResponse, code: number, body: unknown): void => {
-    if (res.writableEnded) return
-    res.writeHead(code, { 'content-type': 'application/a2a+json; charset=utf-8' })
-    res.end(JSON.stringify(body))
-  }
-
-  const sendError = (res: ServerResponse, code: number, message: string, rpcId?: string | number | null, rpcCode?: number): void => {
-    if (rpcId !== undefined) {
-      sendJson(res, code, { jsonrpc: '2.0', id: rpcId, error: { code: rpcCode ?? -32000, message } })
-      return
-    }
-    sendJson(res, code, { error: { code, status: message.toUpperCase().replaceAll(' ', '_'), message } })
-  }
-
-  const readBody = (req: IncomingMessage): Promise<unknown> =>
-    new Promise((resolve, reject) => {
-      let raw = ''
-      let size = 0
-      req.on('data', (chunk: Buffer | string) => {
-        size += Buffer.byteLength(chunk)
-        if (size > MAX_BODY_BYTES) {
-          reject(new Error('请求体过大'))
-          req.destroy()
-          return
-        }
-        raw += chunk.toString()
-      })
-      req.on('end', () => {
-        try {
-          resolve(raw ? JSON.parse(raw) : {})
-        } catch {
-          reject(new Error('JSON 解析失败'))
-        }
-      })
-      req.on('error', reject)
-    })
-
-  const baseUrl = (req: IncomingMessage): string => {
-    if (opts.baseUrl) return opts.baseUrl.replace(/\/$/, '')
-    const host = req.headers.host ?? '127.0.0.1'
-    return `http://${host}`
-  }
-
-  const agentCard = (req: IncomingMessage): Record<string, unknown> => ({
-    name: opts.name ?? 'MeiCode Agent',
-    description: opts.description ?? 'MeiCode coding agent with tool execution and task streaming.',
-    supportedInterfaces: [
-      { url: `${baseUrl(req)}/`, protocolBinding: 'JSONRPC', protocolVersion: '1.0' },
-      { url: `${baseUrl(req)}`, protocolBinding: 'HTTP+JSON', protocolVersion: '1.0' },
-    ],
-    capabilities: { streaming: true, pushNotifications: true, extendedAgentCard: false },
-    defaultInputModes: ['text/plain', 'application/a2a+json'],
-    defaultOutputModes: ['text/plain', 'application/a2a+json'],
-    skills: [{
-      id: 'meicode-coding-agent',
-      name: 'MeiCode coding agent',
-      description: '分析、修改、测试和验证代码项目。',
-      tags: ['coding', 'debugging', 'testing'],
-    }],
-    ...(opts.authToken ? {
-      securitySchemes: { bearer: { httpAuthSecurityScheme: { scheme: 'bearer', bearerFormat: 'opaque' } } },
-      securityRequirements: [{ schemes: { bearer: { list: [] } } }],
-    } : {}),
-    version: '0.1.0',
-  })
-
-  const isAuthorized = (req: IncomingMessage): boolean => {
-    if (!opts.authToken) return true
-    return req.headers.authorization === `Bearer ${opts.authToken}`
   }
 
   const deliverPush = async (record: A2ATaskRecord, event: A2AStreamResponse): Promise<void> => {
@@ -455,6 +184,41 @@ export function createA2aServer(opts: A2aOptions): ReturnType<typeof createServe
       ...(message ? { message: stateMessage(record, message) } : {}),
     }
     notify(record, { statusUpdate: { taskId: record.task.id, contextId: record.task.contextId, status: clone(record.task.status), final } })
+    persist(record)
+  }
+
+  const cancelTask = (record: A2ATaskRecord, requestId: string): A2ATask => {
+    record.canceled = true
+    record.handle?.cancel()
+    recordAudit(opts.runtimeEvents, {
+      kind: 'a2a_cancel_requested',
+      sessionId: opts.sessionId ?? record.task.contextId,
+      taskId: record.task.id,
+      requestId,
+      payload: { status: record.task.status.state },
+    })
+    if (!TERMINAL_STATES.has(record.task.status.state)) setStatus(record, 'TASK_STATE_CANCELED', '任务已取消', true)
+    return clone(record.task)
+  }
+
+  const addPushConfig = (record: A2ATaskRecord, value: unknown): A2APushNotificationConfig => {
+    const config = normalizePushNotificationConfig(value, record.task.id)
+    record.pushNotificationConfigs.set(config.id, config)
+    persist(record)
+    return config
+  }
+
+  const getPushConfig = (record: A2ATaskRecord, configId: string): A2APushNotificationConfig => {
+    const config = record.pushNotificationConfigs.get(configId)
+    if (!config) throw new Error(`Push Notification config not found: ${configId}`)
+    return clone(config)
+  }
+
+  const listPushConfigs = (record: A2ATaskRecord): A2APushNotificationConfig[] =>
+    [...record.pushNotificationConfigs.values()].map((config) => clone(config))
+
+  const deletePushConfig = (record: A2ATaskRecord, configId: string): void => {
+    record.pushNotificationConfigs.delete(configId)
     persist(record)
   }
 
@@ -657,37 +421,12 @@ export function createA2aServer(opts: A2aOptions): ReturnType<typeof createServe
     req.on('close', close)
   }
 
-  const rpcRequest = (body: unknown): { request: RpcRequest; params: Record<string, unknown>; id: string | number | null } => {
-    if (!isObject(body) || body.jsonrpc !== '2.0' || typeof body.method !== 'string') throw new Error('无效 JSON-RPC 请求')
-    if (body.id !== null && typeof body.id !== 'string' && typeof body.id !== 'number') throw new Error('无效 JSON-RPC id')
-    return { request: body as RpcRequest, params: isObject(body.params) ? body.params : {}, id: (body.id ?? null) as string | number | null }
-  }
-
-  const methodName = (method: string): string => ({
-    SendMessage: 'send',
-    'message/send': 'send',
-    SendStreamingMessage: 'stream',
-    'message/stream': 'stream',
-    GetTask: 'get',
-    'tasks/get': 'get',
-    ListTasks: 'list',
-    'tasks/list': 'list',
-    CancelTask: 'cancel',
-    'tasks/cancel': 'cancel',
-    SubscribeToTask: 'subscribe',
-    'tasks/subscribe': 'subscribe',
-    CreateTaskPushNotificationConfig: 'push_create',
-    GetTaskPushNotificationConfig: 'push_get',
-    ListTaskPushNotificationConfigs: 'push_list',
-    DeleteTaskPushNotificationConfig: 'push_delete',
-  }[method] ?? '')
-
   const server = createServer(async (req, res) => {
     const url = new URL(req.url ?? '/', 'http://localhost')
     const requestHeader = req.headers['x-request-id']
     const requestId = typeof requestHeader === 'string' && /^[A-Za-z0-9._:-]{1,128}$/.test(requestHeader) ? requestHeader : createRuntimeId('request')
     res.setHeader('x-request-id', requestId)
-    if (!isAuthorized(req)) {
+    if (!isAuthorized(req, opts.authToken)) {
       recordAudit(opts.runtimeEvents, { kind: 'a2a_auth_rejected', sessionId: opts.sessionId ?? 'a2a', requestId, level: 'warn', payload: { method: req.method, path: url.pathname } })
       res.writeHead(401, { 'content-type': 'application/a2a+json; charset=utf-8', 'www-authenticate': 'Bearer' })
       res.end(JSON.stringify({ error: { code: 401, status: 'UNAUTHENTICATED', message: '需要 Bearer token' } }))
@@ -700,7 +439,7 @@ export function createA2aServer(opts: A2aOptions): ReturnType<typeof createServe
     }
     try {
       if (req.method === 'GET' && (url.pathname === '/.well-known/agent-card.json' || url.pathname === '/.well-known/agent.json')) {
-        sendJson(res, 200, agentCard(req))
+        sendJson(res, 200, agentCard(req, opts))
         return
       }
       if (req.method === 'GET' && url.pathname === '/health') {
@@ -745,19 +484,13 @@ export function createA2aServer(opts: A2aOptions): ReturnType<typeof createServe
         }
         if (mapped === 'cancel') {
           const record = findRecord(params.id)
-          record.canceled = true
-          record.handle?.cancel()
-          recordAudit(opts.runtimeEvents, { kind: 'a2a_cancel_requested', sessionId: opts.sessionId ?? record.task.contextId, taskId: record.task.id, requestId, payload: { status: record.task.status.state } })
-          if (!TERMINAL_STATES.has(record.task.status.state)) setStatus(record, 'TASK_STATE_CANCELED', '任务已取消', true)
-          sendJson(res, 200, { jsonrpc: '2.0', id, result: { task: clone(record.task) } })
+          sendJson(res, 200, { jsonrpc: '2.0', id, result: { task: cancelTask(record, requestId) } })
           return
         }
         if (mapped === 'push_create') {
           const taskId = typeof params.taskId === 'string' ? params.taskId : typeof params.id === 'string' ? params.id : ''
           const record = findRecord(taskId)
-          const config = normalizePushNotificationConfig(isObject(params.config) ? params.config : params, record.task.id)
-          record.pushNotificationConfigs.set(config.id, config)
-          persist(record)
+          const config = addPushConfig(record, isObject(params.config) ? params.config : params)
           sendJson(res, 200, { jsonrpc: '2.0', id, result: { config } })
           return
         }
@@ -765,20 +498,18 @@ export function createA2aServer(opts: A2aOptions): ReturnType<typeof createServe
           const taskId = typeof params.taskId === 'string' ? params.taskId : ''
           const record = findRecord(taskId)
           const configId = typeof params.configId === 'string' ? params.configId : typeof params.id === 'string' ? params.id : ''
-          const config = record.pushNotificationConfigs.get(configId)
-          if (!config) throw new Error(`Push Notification config not found: ${configId}`)
           if (mapped === 'push_delete') {
-            record.pushNotificationConfigs.delete(configId)
-            persist(record)
+            getPushConfig(record, configId)
+            deletePushConfig(record, configId)
             sendJson(res, 200, { jsonrpc: '2.0', id, result: {} })
           } else {
-            sendJson(res, 200, { jsonrpc: '2.0', id, result: { config: clone(config) } })
+            sendJson(res, 200, { jsonrpc: '2.0', id, result: { config: getPushConfig(record, configId) } })
           }
           return
         }
         if (mapped === 'push_list') {
           const record = findRecord(params.taskId)
-          sendJson(res, 200, { jsonrpc: '2.0', id, result: { configs: [...record.pushNotificationConfigs.values()].map((config) => clone(config)) } })
+          sendJson(res, 200, { jsonrpc: '2.0', id, result: { configs: listPushConfigs(record) } })
           return
         }
         const record = findRecord(params.id)
@@ -816,25 +547,19 @@ export function createA2aServer(opts: A2aOptions): ReturnType<typeof createServe
         const configId = pushMatch[2] ? decodeURIComponent(pushMatch[2]) : undefined
         if (req.method === 'POST' && !configId) {
           const value = isObject(body) && isObject(body.config) ? body.config : body
-          const config = normalizePushNotificationConfig(value, record.task.id)
-          record.pushNotificationConfigs.set(config.id, config)
-          persist(record)
-          sendJson(res, 200, config)
+          sendJson(res, 200, addPushConfig(record, value))
           return
         }
         if (req.method === 'GET' && !configId) {
-          sendJson(res, 200, { configs: [...record.pushNotificationConfigs.values()].map((config) => clone(config)) })
+          sendJson(res, 200, { configs: listPushConfigs(record) })
           return
         }
         if (req.method === 'GET' && configId) {
-          const config = record.pushNotificationConfigs.get(configId)
-          if (!config) throw new Error(`Push Notification config not found: ${configId}`)
-          sendJson(res, 200, config)
+          sendJson(res, 200, getPushConfig(record, configId))
           return
         }
         if (req.method === 'DELETE' && configId) {
-          record.pushNotificationConfigs.delete(configId)
-          persist(record)
+          deletePushConfig(record, configId)
           sendJson(res, 200, {})
           return
         }
@@ -847,11 +572,7 @@ export function createA2aServer(opts: A2aOptions): ReturnType<typeof createServe
           return
         }
         if (req.method === 'POST' && taskMatch[2] === 'cancel') {
-          record.canceled = true
-          record.handle?.cancel()
-          recordAudit(opts.runtimeEvents, { kind: 'a2a_cancel_requested', sessionId: opts.sessionId ?? record.task.contextId, taskId: record.task.id, requestId, payload: { status: record.task.status.state } })
-          if (!TERMINAL_STATES.has(record.task.status.state)) setStatus(record, 'TASK_STATE_CANCELED', '任务已取消', true)
-          sendJson(res, 200, { task: clone(record.task) })
+          sendJson(res, 200, { task: cancelTask(record, requestId) })
           return
         }
         if (req.method === 'POST' && taskMatch[2] === 'subscribe') {
@@ -873,7 +594,7 @@ export function createA2aServer(opts: A2aOptions): ReturnType<typeof createServe
         return
       }
       if (req.method === 'GET' && url.pathname === '/extendedAgentCard') {
-        sendJson(res, 200, agentCard(req))
+        sendJson(res, 200, agentCard(req, opts))
         return
       }
       sendError(res, 404, '未找到 A2A 端点')

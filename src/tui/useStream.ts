@@ -1,4 +1,4 @@
-import { useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import type { Provider } from '../provider/types.ts'
 import type { History } from '../session/history.ts'
 import { runAgent } from '../agent/loop.ts'
@@ -60,12 +60,6 @@ export function useStreamingChat(
   // 改为缓存队列，由 loop 每轮请求前注入为末尾 system（见 loop.ts injectSystem）
   const pendingSubResults = useRef<string[]>([])
   const agentIdRef = useRef(createRuntimeId('agent'))
-  subAgentManager?.setOnResult((record) => {
-    if (!record.result) return
-    const text = `📦 [子任务 ${record.role}] ${record.result}`
-    pendingSubResults.current.push(`[子任务 ${record.role} 结果] ${record.result}`)
-    setMessages((prev) => [...prev, { role: 'tool', text: text.slice(0, 300) }])
-  })
   const [messages, setMessages] = useState<UIMessage[]>([])
   const [mode, setMode] = useState<Mode>('idle')
   const [error, setError] = useState<string | null>(null)
@@ -96,13 +90,21 @@ export function useStreamingChat(
     hooks: hooks ?? undefined,
   }
   // P7：上下文管理挂钩
-  const contextManager = new ContextManager({
-    provider,
-    history,
-    cwd: process.cwd(),
-    window: contextWindow,
-    hooks: hooks ?? undefined,
-  })
+  useEffect(() => {
+    if (!subAgentManager) return
+    subAgentManager.setOnResult((record) => {
+      if (!record.result) return
+      const text = `📦 [子任务 ${record.role}] ${record.result}`
+      pendingSubResults.current.push(`[子任务 ${record.role} 结果] ${record.result}`)
+      setMessages((prev) => [...prev, { role: 'tool', text: text.slice(0, 300) }])
+    })
+    return () => subAgentManager.setOnResult(() => {})
+  }, [subAgentManager])
+
+  const contextManager = useMemo(
+    () => new ContextManager({ provider, history, cwd: process.cwd(), window: contextWindow, hooks: hooks ?? undefined }),
+    [provider, history, contextWindow, hooks],
+  )
   ctx.spill = (results) => spillBatch(results, process.cwd())
   ctx.contextBudget = () => contextManager.snapshot()
   ctx.beforeRequest = (mode) => contextManager.beforeRequest(mode)

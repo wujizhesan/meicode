@@ -414,13 +414,15 @@ export function App({
   const currentAsk = pendingAsks[0] ?? null
   const argsBrief = currentAsk ? JSON.stringify(currentAsk.call.args).slice(0, 100) : ''
 
+  const status = statusLine(userMode, roundInfo, totalTokens, cacheRate)
+
   return (
     <Box flexDirection="column" paddingX={1}>
       <ChatView messages={messages} mode={mode} />
       {error ? <Text color="red">⚠ {error}</Text> : null}
       {compactMsg ? <Text color="cyan">📦 {compactMsg}</Text> : null}
-      {statusLine(userMode, roundInfo, totalTokens, cacheRate) ? (
-        <Text dimColor>{statusLine(userMode, roundInfo, totalTokens, cacheRate)}</Text>
+      {status ? (
+        <Text dimColor>{status}</Text>
       ) : null}
       {isPlan ? <Text dimColor>计划模式：仅读类工具，/do 切回执行</Text> : null}
       {completeCandidates.length > 0 ? (

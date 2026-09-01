@@ -1,9 +1,7 @@
-import { spawn } from 'node:child_process'
-import { existsSync, mkdirSync, readFileSync } from 'node:fs'
+import { mkdirSync } from 'node:fs'
 import { join, resolve } from 'node:path'
-import { parse } from 'yaml'
 import type { Provider } from '../provider/types.ts'
-import type { Tool, ToolContext, ToolRegistry, ToolResult } from '../tools/index.ts'
+import type { Tool, ToolContext, ToolRegistry } from '../tools/index.ts'
 import type { WorktreeManager } from '../worktree/index.ts'
 import { loadAgentRoles, agentDirs } from '../subagent/loader.ts'
 import { TeamGroupStore } from './group.ts'
@@ -13,8 +11,17 @@ import type { MailMessage, TeamGroup, TeamMember, TeamTask, TeamTaskReport } fro
 import { log } from '../log.ts'
 import { createRuntimeId } from '../runtime/index.ts'
 import type { RuntimeEventInput } from '../runtime/index.ts'
+import { readCoordinatorConfig } from './config.ts'
+import { createMemberTools } from './member-tools.ts'
+import { mergeTeamWorktrees } from './merge.ts'
+import { readyTasks, recoverExpiredTasks, taskBlockers, validateTaskDependencies } from './task-graph.ts'
 
 const TASK_LEASE_MS = 10 * 60 * 1000
+
+interface TaskExecutionClaim {
+  host: MemberHost
+  member?: TeamMember
+}
 
 function emitRuntimeEvent(ctx: ToolContext, input: Omit<RuntimeEventInput, 'sessionId'>): void {
   const sessionId = ctx.sessionId ?? ctx.agentId
@@ -23,17 +30,6 @@ function emitRuntimeEvent(ctx: ToolContext, input: Omit<RuntimeEventInput, 'sess
     ctx.runtimeEvents.append({ ...input, sessionId })
   } catch {
   }
-}
-
-function git(args: string[], cwd?: string): Promise<{ code: number; out: string }> {
-  return new Promise((resolve) => {
-    const child = spawn('git', args, { cwd, shell: false })
-    let out = ''
-    child.stdout?.on('data', (d: Buffer) => (out += d.toString()))
-    child.stderr?.on('data', (d: Buffer) => (out += d.toString()))
-    child.on('close', (code) => resolve({ code: code ?? -1, out }))
-    child.on('error', () => resolve({ code: -1, out }))
-  })
 }
 
 export class TeamManager {
@@ -254,114 +250,22 @@ export class TeamManager {
 
   // 成员协作工具（全局注册一份）：执行时按 ctx.cwd 解析成员身份
   memberTools(): Tool[] {
-    return [
-      {
-        name: 'team_task',
-        description:
-          '团队共享任务操作。action=list 查看任务清单；create 创建（title/assignee）；update 更新状态（id/status: todo|in_progress|done|failed）；result 记录结果。',
-        parameters: {
-          type: 'object',
-          properties: {
-            action: { type: 'string', description: 'list / create / update' },
-            id: { type: 'string', description: '任务 id（update 用）' },
-            title: { type: 'string', description: '任务标题（create 用）' },
-            assignee: { type: 'string', description: '负责人（create 用）' },
-            depends_on: { type: 'array', items: { type: 'string' }, description: '依赖任务 ID 列表（create 用）' },
-            max_attempts: { type: 'number', description: '最多执行次数（create 用）' },
-            status: { type: 'string', description: '任务状态' },
-            result: { type: 'string', description: '任务结果摘要（update 用）' },
-          },
-          required: ['action'],
-        },
-        execute: async (args: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult> => {
-          const hit = this.resolveMemberByCwd(ctx.cwd)
-          if (!hit) return { success: false, output: '', error: '无法识别成员身份（ctx.cwd 不在任何成员 workdir）' }
-          const groupName = hit.group.name
-          const memberName = hit.member.name
-          const action = String(args.action ?? '')
-          if (action === 'list') {
-            const tasks = this.store.listTasks(groupName)
-            return { success: true, output: tasks.length ? JSON.stringify(tasks, null, 2) : '（无任务）' }
-          }
-          if (action === 'create') {
-            const dependsOn = Array.isArray(args.depends_on) ? args.depends_on.filter((v): v is string => typeof v === 'string') : []
-            const maxAttempts = typeof args.max_attempts === 'number' && args.max_attempts > 0 ? Math.floor(args.max_attempts) : 1
-            let task: TeamTask
-            try {
-              task = this.addTask(groupName, String(args.title ?? '未命名'), typeof args.assignee === 'string' ? args.assignee : memberName, dependsOn, maxAttempts)
-            } catch (e) {
-              return { success: false, output: '', error: (e as Error).message }
-            }
-            return { success: true, output: `已创建任务 ${task.id}: ${task.title}` }
-          }
-          if (action === 'update') {
-            const id = String(args.id ?? '')
-            const patch: Record<string, unknown> = {}
-            if (typeof args.status === 'string') patch.status = args.status
-            if (typeof args.result === 'string') patch.result = args.result
-            const updated = this.store.updateTask(groupName, id, patch)
-            if (!updated) return { success: false, output: '', error: `任务不存在: ${id}` }
-            return { success: true, output: `任务 ${id} 已更新: ${updated.status}` }
-          }
-          return { success: false, output: '', error: `未知 action: ${action}` }
-        },
-      },
-      {
-        name: 'team_send',
-        description:
-          '团队消息。to=成员名或 *（广播）或 Lead。协议消息首行：PLAN（计划待审批）、APPROVE/DENY（审批回复）、IDLE（任务完成通知）。',
-        parameters: {
-          type: 'object',
-          properties: {
-            to: { type: 'string', description: '收件人（成员名 / Lead / * 广播）' },
-            body: { type: 'string', description: '消息正文（可含协议首行）' },
-          },
-          required: ['to', 'body'],
-        },
-        execute: async (args: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult> => {
-          const hit = this.resolveMemberByCwd(ctx.cwd)
-          // 身份:成员用自己,Lead(主会话,不在任何 workdir)用 lead——Lead 要能发消息给成员
-          const from = hit ? hit.member.name : 'lead'
-          const to = String(args.to ?? '')
-          const body = String(args.body ?? '')
-          if (!to || !body) return { success: false, output: '', error: '缺少 to/body' }
-          this.mail.send(from, to, body)
-          return { success: true, output: `已发送消息给 ${to}` }
-        },
-      },
-    ]
+    return createMemberTools({
+      resolveMemberByCwd: (cwd) => this.resolveMemberByCwd(cwd),
+      listTasks: (groupName) => this.store.listTasks(groupName),
+      addTask: (groupName, title, assignee, dependencies, maxAttempts) =>
+        this.addTask(groupName, title, assignee, dependencies, maxAttempts),
+      updateTask: (groupName, taskId, patch) => this.store.updateTask(groupName, taskId, patch),
+      sendMail: (from, to, body) => this.mail.send(from, to, body),
+    })
   }
 
   // Lead 指派：更新任务状态 + 触发成员执行（异步协程）
   async assignTask(group: TeamGroup, task: TeamTask, memberName: string): Promise<string> {
     if (this.closed) return 'TeamManager 已关闭，无法分派任务'
-    const host = this.members.get(memberName)
-    if (!host) return `成员不存在: ${memberName}`
-    const current = this.store.listTasks(group.name).find((item) => item.id === task.id)
-    if (!current) return `任务不存在: ${task.id}`
-    const blockers = this.taskBlockers(group.name, current)
-    if (blockers.length > 0) return `任务 ${task.id} 仍被依赖阻塞: ${blockers.join(', ')}`
-    // busy 检查：并发指派同一成员会让两个 runAgent 交错写同一 History
-    if (host.isBusy()) return `成员 ${memberName} 正在执行其他任务，等它空闲再派`
-    const attempt = (current.attempt ?? 0) + 1
-    if (attempt > (current.maxAttempts ?? 1)) return `任务 ${task.id} 已达到最大执行次数`
-    const member = group.members.find((item) => item.name === memberName)
-    const leaseId = createRuntimeId('lease')
-    const claimed = this.store.claimTask(group.name, task.id, { status: 'in_progress', assignee: memberName, attempt, activeAgentId: member?.agentId, leaseId, leaseExpiresAt: Date.now() + TASK_LEASE_MS, nextRetryAt: undefined, updatedAt: Date.now() })
-    if (!claimed) return `任务 ${task.id} 已被其他执行者领取`
-    emitRuntimeEvent(this.opts.ctx, { type: 'task_assigned', taskId: task.id, agentId: member?.agentId, payload: { groupId: group.name, memberName, attempt } })
-    // needsApproval 成员：execute 内部发 PLAN 等 Lead 审批后再执行（审批在成员层等待）
-    const execution = host
-      .execute(task.title)
-      .then((result) => {
-        this.completeTask(group, task, memberName, member?.agentId, result)
-      })
-      .catch((e) => {
-        const error = (e as Error).message
-        const reportId = createRuntimeId('report')
-        this.completeTask(group, task, memberName, member?.agentId, { status: 'failed', text: `执行异常: ${error}`, report: { reportId, status: 'failed', summary: `执行异常: ${error}`, error } })
-      })
-    this.trackRun(execution)
+    const claim = this.claimTask(group, task, memberName)
+    if (typeof claim === 'string') return claim
+    void this.executeClaimedTask(group, task, memberName, claim, false)
     const groupMember = group.members.find((m) => m.name === memberName)
     return groupMember?.needsApproval
       ? `已派发任务 ${task.id} 给 ${memberName}（需审批，成员已发 PLAN 等待 Lead 决定）`
@@ -373,38 +277,9 @@ export class TeamManager {
   // 超时后成员完成仍会写 done（完成逻辑在 execPromise 内）
   async runTask(group: TeamGroup, task: TeamTask, memberName: string): Promise<string> {
     if (this.closed) return 'TeamManager 已关闭，无法执行任务'
-    const host = this.members.get(memberName)
-    if (!host) return `成员不存在: ${memberName}`
-    if (host.isBusy()) return `成员 ${memberName} 正在执行其他任务，等它空闲再派`
-    const current = this.store.listTasks(group.name).find((item) => item.id === task.id)
-    if (!current) return `任务不存在: ${task.id}`
-    const blockers = this.taskBlockers(group.name, current)
-    if (blockers.length > 0) return `任务 ${task.id} 仍被依赖阻塞: ${blockers.join(', ')}`
-    const attempt = (current.attempt ?? 0) + 1
-    if (attempt > (current.maxAttempts ?? 1)) return `任务 ${task.id} 已达到最大执行次数`
-    const member = group.members.find((item) => item.name === memberName)
-    const leaseId = createRuntimeId('lease')
-    const claimed = this.store.claimTask(group.name, task.id, { status: 'in_progress', assignee: memberName, attempt, activeAgentId: member?.agentId, leaseId, leaseExpiresAt: Date.now() + TASK_LEASE_MS, nextRetryAt: undefined, updatedAt: Date.now() })
-    if (!claimed) return `任务 ${task.id} 已被其他执行者领取`
-    emitRuntimeEvent(this.opts.ctx, { type: 'task_assigned', taskId: task.id, agentId: member?.agentId, payload: { groupId: group.name, memberName, attempt } })
-    const execPromise = this.trackRun(host
-      .execute(task.title)
-      .then((result) => {
-        this.completeTask(group, task, memberName, member?.agentId, result)
-        // task_completed hook:外部感知任务完成(主会话自动汇报/流水线下一步)
-        void this.opts.ctx.hooks?.fire('task_completed', {
-          cwd: this.opts.ctx.cwd,
-          stats: `task=${task.id} "${task.title.slice(0, 40)}" member=${memberName} status=${result.status}`,
-        })
-        return result.text
-      })
-      .catch((e) => {
-        const error = (e as Error).message
-        const reportId = createRuntimeId('report')
-        this.completeTask(group, task, memberName, member?.agentId, { status: 'failed', text: `执行异常: ${error}`, report: { reportId, status: 'failed', summary: `执行异常: ${error}`, error } })
-        return `任务执行异常: ${error}`
-      })
-    )
+    const claim = this.claimTask(group, task, memberName)
+    if (typeof claim === 'string') return claim
+    const execPromise = this.executeClaimedTask(group, task, memberName, claim, true)
     let timeout: ReturnType<typeof setTimeout> | undefined
     const timeoutPromise = new Promise<string>((resolve) => {
       timeout = setTimeout(() => resolve('__TIMEOUT__'), 120000)
@@ -416,58 +291,78 @@ export class TeamManager {
       : settled
   }
 
+  private claimTask(group: TeamGroup, task: TeamTask, memberName: string): TaskExecutionClaim | string {
+    const host = this.members.get(memberName)
+    if (!host) return `成员不存在: ${memberName}`
+    const current = this.store.listTasks(group.name).find((item) => item.id === task.id)
+    if (!current) return `任务不存在: ${task.id}`
+    const blockers = this.taskBlockers(group.name, current)
+    if (blockers.length > 0) return `任务 ${task.id} 仍被依赖阻塞: ${blockers.join(', ')}`
+    if (host.isBusy()) return `成员 ${memberName} 正在执行其他任务，等它空闲再派`
+    const attempt = (current.attempt ?? 0) + 1
+    if (attempt > (current.maxAttempts ?? 1)) return `任务 ${task.id} 已达到最大执行次数`
+    const member = group.members.find((item) => item.name === memberName)
+    const claimed = this.store.claimTask(group.name, task.id, {
+      status: 'in_progress',
+      assignee: memberName,
+      attempt,
+      activeAgentId: member?.agentId,
+      leaseId: createRuntimeId('lease'),
+      leaseExpiresAt: Date.now() + TASK_LEASE_MS,
+      nextRetryAt: undefined,
+      updatedAt: Date.now(),
+    })
+    if (!claimed) return `任务 ${task.id} 已被其他执行者领取`
+    emitRuntimeEvent(this.opts.ctx, {
+      type: 'task_assigned',
+      taskId: task.id,
+      agentId: member?.agentId,
+      payload: { groupId: group.name, memberName, attempt },
+    })
+    return { host, member }
+  }
+
+  private executeClaimedTask(
+    group: TeamGroup,
+    task: TeamTask,
+    memberName: string,
+    claim: TaskExecutionClaim,
+    fireCompletionHook: boolean,
+  ): Promise<string> {
+    const execution = claim.host.execute(task.title).then((result) => {
+      this.completeTask(group, task, memberName, claim.member?.agentId, result)
+      if (fireCompletionHook) {
+        void this.opts.ctx.hooks?.fire('task_completed', {
+          cwd: this.opts.ctx.cwd,
+          stats: `task=${task.id} "${task.title.slice(0, 40)}" member=${memberName} status=${result.status}`,
+        })
+      }
+      return result.text
+    }).catch((error: unknown) => {
+      const message = (error as Error).message
+      const reportId = createRuntimeId('report')
+      this.completeTask(group, task, memberName, claim.member?.agentId, {
+        status: 'failed',
+        text: `执行异常: ${message}`,
+        report: { reportId, status: 'failed', summary: `执行异常: ${message}`, error: message },
+      })
+      return `任务执行异常: ${message}`
+    })
+    return this.trackRun(execution)
+  }
+
   listTasks(groupName: string): TeamTask[] {
     return this.store.listTasks(groupName)
   }
 
-  private dependencyError(tasks: TeamTask[], taskId: string, dependsOn: string[]): string | null {
-    const graph = new Map(tasks.map((task) => [task.id, task.depends_on ?? []]))
-    graph.set(taskId, dependsOn)
-    for (const dependency of dependsOn) {
-      if (!graph.has(dependency)) return `依赖任务不存在: ${dependency}`
-    }
-    const visiting = new Set<string>()
-    const visited = new Set<string>()
-    const visit = (id: string): string | null => {
-      if (visiting.has(id)) return `任务依赖形成循环: ${id}`
-      if (visited.has(id)) return null
-      visiting.add(id)
-      for (const dependency of graph.get(id) ?? []) {
-        const error = visit(dependency)
-        if (error) return error
-      }
-      visiting.delete(id)
-      visited.add(id)
-      return null
-    }
-    for (const id of graph.keys()) {
-      const error = visit(id)
-      if (error) return error
-    }
-    return null
-  }
-
   taskBlockers(groupName: string, task: TeamTask): string[] {
-    const tasks = this.store.listTasks(groupName)
-    const byId = new Map(tasks.map((item) => [item.id, item]))
-    return (task.depends_on ?? []).filter((dependency) => byId.get(dependency)?.status !== 'done')
+    return taskBlockers(this.store.listTasks(groupName), task)
   }
 
   recoverStaleTasks(groupName: string, now = Date.now()): TeamTask[] {
-    const recovered: TeamTask[] = []
+    let recovered: TeamTask[] = []
     this.store.mutateTasks(groupName, (tasks) => {
-      for (const task of tasks) {
-        if (task.status !== 'in_progress' || !task.leaseExpiresAt || task.leaseExpiresAt > now) continue
-        const retryable = (task.attempt ?? 0) < (task.maxAttempts ?? 1)
-        task.status = retryable ? 'todo' : 'failed'
-        task.updatedAt = now
-      task.lastError = '任务租约过期，执行进程可能已退出'
-        task.nextRetryAt = retryable ? now : undefined
-        task.activeAgentId = undefined
-        task.leaseId = undefined
-        task.leaseExpiresAt = undefined
-        recovered.push({ ...task })
-      }
+      recovered = recoverExpiredTasks(tasks, now)
     })
     return recovered
   }
@@ -527,8 +422,7 @@ export class TeamManager {
   }
 
   listReadyTasks(groupName: string): TeamTask[] {
-    const now = Date.now()
-    return this.store.listTasks(groupName).filter((task) => task.status === 'todo' && (task.nextRetryAt ?? 0) <= now && this.taskBlockers(groupName, task).length === 0)
+    return readyTasks(this.store.listTasks(groupName))
   }
 
   scheduleReadyTasks(groupName: string): string[] {
@@ -563,7 +457,7 @@ export class TeamManager {
     }
     let dependencyError: string | null = null
     this.store.mutateTasks(groupName, (tasks) => {
-      dependencyError = this.dependencyError(tasks, id, normalizedDeps)
+      dependencyError = validateTaskDependencies(tasks, id, normalizedDeps)
       if (!dependencyError) tasks.push(task)
     })
     if (dependencyError) throw new Error(dependencyError)
@@ -589,43 +483,7 @@ export class TeamManager {
 
   // 全部完成后合并各成员 worktree：成员改动先 commit，再合并回主仓库
   async mergeAll(group: TeamGroup): Promise<string> {
-    const results: string[] = []
-    for (const member of group.members) {
-      if (!this.worktrees) {
-        results.push(`成员 ${member.name} 无 worktree 支持，跳过`)
-        continue
-      }
-      const wtName = `member-${member.name}`
-      try {
-        const info = await this.worktrees.exit(wtName)
-        if (!info.dirty) {
-          results.push(`成员 ${member.name} 无变更，跳过`)
-          continue
-        }
-        // 先提交成员 worktree 内的改动（merge 只能合 commit）
-        const add = await git(['-C', info.path, 'add', '-A'])
-        const commit = await git(['-C', info.path, 'commit', '-m', `team: ${member.name} changes`])
-        if (add.code !== 0 || commit.code !== 0) {
-          results.push(`✗ 成员 ${member.name} commit 失败: ${add.out || commit.out}`.slice(0, 150))
-          continue
-        }
-        const res = await git(['merge', `wt-${wtName}`], this.repoRoot)
-        if (res.code === 0) {
-          results.push(`✓ 合并 ${member.name} 成功`)
-        } else {
-          // 冲突：先取冲突文件列表（abort 后 diff 看不到），再回滚（worktree 保留待人工处理）
-          const conflicts = await git(['diff', '--name-only', '--diff-filter=U'], this.repoRoot)
-          await git(['merge', '--abort'], this.repoRoot)
-          const files = conflicts.out.trim()
-          results.push(
-            `✗ 合并 ${member.name} 冲突，已回滚（worktree ${wtName} 保留待处理）\n  冲突文件: ${files || '(未检测到)'}`,
-          )
-        }
-      } catch (e) {
-        results.push(`✗ 成员 ${member.name} 合并失败: ${(e as Error).message}`)
-      }
-    }
-    return results.join('\n')
+    return mergeTeamWorktrees(group, this.worktrees, this.repoRoot)
   }
 
   // coordinator 开启时 Lead 工具集：移除 write/edit（保留读 + run_command + spawn）
@@ -634,17 +492,6 @@ export class TeamManager {
     return this.opts.registry
       .toOpenAITools()
       .filter((t) => t.function.name !== 'write_file' && t.function.name !== 'edit_file')
-  }
-}
-
-function readCoordinatorConfig(root: string): boolean {
-  const file = join(root, 'team.yaml')
-  if (!existsSync(file)) return false
-  try {
-    const cfg = parse(readFileSync(file, 'utf8')) as { coordinator_enabled?: boolean }
-    return cfg.coordinator_enabled === true
-  } catch {
-    return false
   }
 }
 
