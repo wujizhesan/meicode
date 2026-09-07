@@ -80,11 +80,12 @@ export async function updateNotes(
     ...recent,
   ]
 
-  let text = ''
+  const textParts: string[] = []
   for await (const ev of provider.streamChat(msgs, { thinking: false })) {
-    if (ev.type === 'text') text += ev.text
+    if (ev.type === 'text') textParts.push(ev.text)
     else if (ev.type === 'error') throw new Error(`笔记请求失败: ${ev.message}`)
   }
+  const text = textParts.join('')
 
   let parsed: { notes?: NoteUpdate[] }
   try {

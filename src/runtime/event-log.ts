@@ -1,22 +1,31 @@
 import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, watch, writeFileSync, type FSWatcher } from 'node:fs'
 import { createHash } from 'node:crypto'
-import { basename, dirname, join } from 'node:path'
+import { basename, join } from 'node:path'
 import { createRuntimeId } from './ids.ts'
 import type { RuntimeEvent, RuntimeEventInput } from './events.ts'
 
 interface RuntimeEventIndex {
   lastSeq: number
   segments: string[]
+  activeBytes?: number
+}
+
+interface RuntimeEventState extends RuntimeEventIndex {
+  activeBytes: number
+  pending: number
 }
 
 export class RuntimeEventLog {
   private waiters = new Map<string, Set<(event: RuntimeEvent) => void>>()
   private readonly root: string
   private readonly maxBytes: number
+  private readonly checkpointInterval: number
+  private states = new Map<string, RuntimeEventState>()
 
-  constructor(root: string, options: { maxBytes?: number } = {}) {
+  constructor(root: string, options: { maxBytes?: number; checkpointInterval?: number } = {}) {
     this.root = root
     this.maxBytes = Math.max(1024, options.maxBytes ?? 8 * 1024 * 1024)
+    this.checkpointInterval = Math.max(1, Math.floor(options.checkpointInterval ?? 32))
     mkdirSync(root, { recursive: true })
   }
 
@@ -45,7 +54,11 @@ export class RuntimeEventLog {
     try {
       const value = JSON.parse(readFileSync(file, 'utf8')) as Partial<RuntimeEventIndex>
       if (typeof value.lastSeq !== 'number' || !Array.isArray(value.segments)) return null
-      return { lastSeq: value.lastSeq, segments: value.segments.filter((item): item is string => typeof item === 'string') }
+      return {
+        lastSeq: value.lastSeq,
+        segments: value.segments.filter((item): item is string => typeof item === 'string'),
+        ...(typeof value.activeBytes === 'number' && value.activeBytes >= 0 ? { activeBytes: value.activeBytes } : {}),
+      }
     } catch {
       return null
     }
@@ -123,27 +136,41 @@ export class RuntimeEventLog {
   }
 
   append(input: RuntimeEventInput): RuntimeEvent {
-    mkdirSync(dirname(this.fileFor(input.sessionId)), { recursive: true })
     const lock = this.acquireLock(input.sessionId)
     let event: RuntimeEvent
     try {
       const activeFile = this.fileFor(input.sessionId)
-      const previous = this.readIndex(input.sessionId)
       const activeExists = existsSync(activeFile)
+      const activeBytes = activeExists ? statSync(activeFile).size : 0
+      const cached = this.states.get(input.sessionId)
+      const cacheValid = activeExists && cached?.activeBytes === activeBytes
+      const previous = cacheValid ? cached : this.readIndex(input.sessionId)
       const segments = [...new Set(previous?.segments ?? [])]
-      const diskSeq = previous && activeExists
-        ? this.lastSeq(activeFile)
+      const diskSeq = previous && activeExists && previous.activeBytes === activeBytes
+        ? previous.lastSeq
         : this.segmentFiles(input.sessionId).reduce((max, file) => Math.max(max, this.lastSeq(file)), 0)
       const seq = Math.max(previous?.lastSeq ?? 0, diskSeq) + 1
-      if (activeExists && statSync(activeFile).size >= this.maxBytes) {
+      const shouldRotate = activeExists && activeBytes >= this.maxBytes
+      if (shouldRotate) {
         segments.push(...this.discoverSegments(input.sessionId))
         const rotated = join(this.root, `${this.safeSessionId(input.sessionId)}.segment-${String(seq - 1).padStart(12, '0')}-${Date.now()}.jsonl`)
         renameSync(activeFile, rotated)
         segments.push(rotated.split(/[\\/]/).pop()!)
       }
       event = { ...input, eventId: createRuntimeId('event'), seq, ts: Date.now() }
-      appendFileSync(activeFile, JSON.stringify(event) + '\n', 'utf8')
-      this.writeIndex(input.sessionId, { lastSeq: seq, segments: [...new Set(segments)] })
+      const line = JSON.stringify(event) + '\n'
+      appendFileSync(activeFile, line, 'utf8')
+      const state: RuntimeEventState = {
+        lastSeq: seq,
+        segments: [...new Set(segments)],
+        activeBytes: (shouldRotate ? 0 : activeBytes) + Buffer.byteLength(line, 'utf8'),
+        pending: (cacheValid ? cached.pending : 0) + 1,
+      }
+      this.states.set(input.sessionId, state)
+      if (shouldRotate || state.pending >= this.checkpointInterval || input.type === 'run_finished') {
+        this.writeIndex(input.sessionId, state)
+        state.pending = 0
+      }
     } finally {
       try {
         unlinkSync(lock)

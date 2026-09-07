@@ -5,9 +5,15 @@ import type { Tool, ToolContext, ToolResult } from './types.ts'
 const MAX_LINES = 200
 const MAX_PER_FILE = 20
 const SKIP_DIRS = new Set(['node_modules', '.git', 'dist', 'build', 'target', '.next', '.nuxt'])
-const BINARY_EXT = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.ico', '.zip', '.exe', '.dll', '.so', '.dylib', '.bin', '.woff', '.woff2', '.ttf'])
+const BINARY_EXT = new Set([
+  '.png', '.jpg', '.jpeg', '.gif', '.webp', '.ico', '.pdf',
+  '.zip', '.7z', '.rar', '.gz', '.tar', '.jar', '.docx', '.xlsx', '.pptx',
+  '.exe', '.dll', '.so', '.dylib', '.bin', '.wasm', '.class',
+  '.mp3', '.mp4', '.mov', '.avi', '.webm',
+  '.woff', '.woff2', '.ttf',
+])
 
-async function collectFiles(dir: string, out: string[]): Promise<void> {
+async function* walkTextFiles(dir: string): AsyncGenerator<string> {
   let entries
   try {
     entries = await readdir(dir, { withFileTypes: true })
@@ -18,9 +24,9 @@ async function collectFiles(dir: string, out: string[]): Promise<void> {
     if (e.name.startsWith('.') || SKIP_DIRS.has(e.name)) continue
     const p = join(dir, e.name)
     if (e.isDirectory()) {
-      await collectFiles(p, out)
+      yield* walkTextFiles(p)
     } else if (e.isFile() && !BINARY_EXT.has(extname(e.name).toLowerCase())) {
-      out.push(p)
+      yield p
     }
   }
 }
@@ -49,12 +55,9 @@ export const grepCodeTool: Tool = {
       return { success: false, output: '', error: `非法正则: ${(e as Error).message}` }
     }
 
-    const files: string[] = []
-    await collectFiles(base, files)
-
     const lines: string[] = []
     let truncated = false
-    for (const file of files) {
+    for await (const file of walkTextFiles(base)) {
       if (lines.length >= MAX_LINES) {
         truncated = true
         break
@@ -66,10 +69,14 @@ export const grepCodeTool: Tool = {
         continue
       }
       let hits = 0
-      const fileLines = content.split('\n')
-      for (let i = 0; i < fileLines.length; i++) {
-        if (re.test(fileLines[i])) {
-          lines.push(`${relative(base, file)}:${i + 1}: ${fileLines[i].slice(0, 200)}`)
+      let lineStart = 0
+      let lineNumber = 1
+      while (lineStart <= content.length) {
+        const newline = content.indexOf('\n', lineStart)
+        const lineEnd = newline < 0 ? content.length : newline
+        const line = content.slice(lineStart, lineEnd)
+        if (re.test(line)) {
+          lines.push(`${relative(base, file)}:${lineNumber}: ${line.slice(0, 200)}`)
           hits++
           if (hits >= MAX_PER_FILE) break
           if (lines.length >= MAX_LINES) {
@@ -77,6 +84,9 @@ export const grepCodeTool: Tool = {
             break
           }
         }
+        if (newline < 0) break
+        lineStart = newline + 1
+        lineNumber++
       }
     }
 

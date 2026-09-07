@@ -93,9 +93,7 @@ export class MemberHost {
   private persist(): void {
     const msgs = this.history.all()
     if (msgs.length === 0) return
-    for (const m of msgs) {
-      appendFileSync(this.historyFile, JSON.stringify(m) + '\n', 'utf8')
-    }
+    appendFileSync(this.historyFile, msgs.map((message) => JSON.stringify(message)).join('\n') + '\n', 'utf8')
     // 防止重复：落盘后重建 history（下次 resume 不会重复）
     this.history = new History()
   }
@@ -196,10 +194,11 @@ export class MemberHost {
     })
     this.activeAgent = agent
 
-    let output = ''
+    const outputParts: string[] = []
     for await (const ev of agent.events) {
-      if (ev.type === 'text') output += ev.text
+      if (ev.type === 'text') outputParts.push(ev.text)
     }
+    const output = outputParts.join('')
     const result = await agent.done
     this.persist()
     this.member.status = 'idle'

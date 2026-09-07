@@ -6,6 +6,7 @@ import { createTools, ToolRegistry } from '../src/tools/index.ts'
 import { RuleEngine } from '../src/permission/index.ts'
 import type { ChatMessage, Provider, StreamEvent } from '../src/provider/types.ts'
 import type { ProviderConfig } from '../src/config/types.ts'
+import { createStreamBuffer } from '../src/tui/stream-buffer.ts'
 
 class FakeProvider implements Provider {
   readonly protocol = 'anthropic' as const
@@ -37,6 +38,18 @@ if (!snapshot.includes('MeiCode 就绪')) {
   process.exit(1)
 }
 console.log('  ✓ renderToString 快照含就绪提示')
+
+const batches: { text: string; thinking: string }[] = []
+const streamBuffer = createStreamBuffer((chunk) => batches.push(chunk), 10)
+streamBuffer.appendText('你')
+streamBuffer.appendText('好')
+streamBuffer.appendThinking('思')
+await new Promise((resolve) => setTimeout(resolve, 20))
+if (batches.length !== 1 || batches[0].text !== '你好' || batches[0].thinking !== '思') {
+  throw new Error(`流式缓冲合并失败: ${JSON.stringify(batches)}`)
+}
+streamBuffer.dispose()
+console.log('  ✓ 流式片段按帧合并刷新')
 
 if (process.stdin.isTTY) {
   const app = render(<App provider={new FakeProvider()} history={new History()} registry={makeRegistry()} engine={makeEngine()} />)

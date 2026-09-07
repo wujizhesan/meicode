@@ -111,10 +111,10 @@ export class OpenAIProvider implements Provider {
         const toolCalls = delta?.tool_calls
         if (toolCalls) {
           for (const part of toolCalls) {
-            const acc = toolAcc.get(part.index) ?? { args: '' }
+            const acc = toolAcc.get(part.index) ?? { args: [] }
             if (part.id) acc.id = part.id
             if (part.function?.name) acc.name = part.function.name
-            if (part.function?.arguments) acc.args += part.function.arguments
+            if (part.function?.arguments) acc.args.push(part.function.arguments)
             toolAcc.set(part.index, acc)
           }
           return
@@ -133,7 +133,8 @@ export class OpenAIProvider implements Provider {
       for await (const value of readResponseStream(res.body, opts.signal)) {
         parser.feed(decoder.decode(value, { stream: true }))
         // 每收到一个 chunk 立即把新事件交给消费方，保证真流式
-        while (queue.length > 0) yield queue.shift()!
+        for (const event of queue) yield event
+        queue.length = 0
       }
     } catch (e) {
       log('error', `openai 流读取失败: ${(e as Error).message}`)
@@ -145,7 +146,7 @@ export class OpenAIProvider implements Provider {
       flushTools()
       push({ type: 'done' })
     }
-    while (queue.length > 0) yield queue.shift()!
+    for (const event of queue) yield event
   }
 }
 

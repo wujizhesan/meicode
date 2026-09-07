@@ -1,7 +1,5 @@
 import { readFileSync, writeFileSync } from 'node:fs'
 import { resolve } from 'node:path'
-import { PNG } from 'pngjs'
-import pixelmatch from 'pixelmatch'
 import { guardPath } from './types.ts'
 import type { Tool, ToolContext, ToolResult } from './types.ts'
 
@@ -23,14 +21,15 @@ export const shotDiffTool: Tool = {
   },
 
   async execute(args: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult> {
+    const [{ PNG }, { default: pixelmatch }] = await Promise.all([import('pngjs'), import('pixelmatch')])
     const basePath = resolve(ctx.cwd, String(args.base ?? ''))
     const targetPath = resolve(ctx.cwd, String(args.target ?? ''))
     const blocked = guardPath(ctx, basePath, false) ?? guardPath(ctx, targetPath, false) // 纯读截图
     if (blocked) return { success: false, output: '', error: blocked }
     const threshold = typeof args.threshold === 'number' ? Math.max(0, Math.min(1, args.threshold)) : 0.1
 
-    let base: PNG
-    let target: PNG
+    let base: InstanceType<typeof PNG>
+    let target: InstanceType<typeof PNG>
     try {
       base = PNG.sync.read(readFileSync(basePath))
       target = PNG.sync.read(readFileSync(targetPath))

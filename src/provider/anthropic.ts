@@ -105,14 +105,14 @@ export class AnthropicProvider implements Provider {
             cacheMissTokens: data.message.usage.cache_creation_input_tokens,
           })
         } else if (data.type === 'content_block_start' && data.content_block?.type === 'tool_use') {
-          toolAcc.set(data.index ?? 0, { id: data.content_block.id, name: data.content_block.name, args: '' })
+          toolAcc.set(data.index ?? 0, { id: data.content_block.id, name: data.content_block.name, args: [] })
         } else if (data.type === 'content_block_delta') {
           const delta = data.delta
           if (delta?.type === 'text_delta') push({ type: 'text', text: delta.text ?? '' })
           else if (delta?.type === 'thinking_delta') push({ type: 'thinking', text: delta.thinking ?? '' })
           else if (delta?.type === 'input_json_delta') {
-            const acc = toolAcc.get(data.index ?? 0) ?? { args: '' }
-            acc.args += delta.partial_json ?? ''
+            const acc = toolAcc.get(data.index ?? 0) ?? { args: [] }
+            if (delta.partial_json) acc.args.push(delta.partial_json)
             toolAcc.set(data.index ?? 0, acc)
           }
         } else if (data.type === 'message_delta' && data.usage) {
@@ -137,7 +137,8 @@ export class AnthropicProvider implements Provider {
       const decoder = new TextDecoder()
       for await (const value of readResponseStream(res.body, opts.signal)) {
         parser.feed(decoder.decode(value, { stream: true }))
-        while (queue.length > 0) yield queue.shift()!
+        for (const event of queue) yield event
+        queue.length = 0
       }
     } catch (e) {
       log('error', `anthropic 流读取失败: ${(e as Error).message}`)
@@ -149,7 +150,7 @@ export class AnthropicProvider implements Provider {
       flushTools()
       push({ type: 'done' })
     }
-    while (queue.length > 0) yield queue.shift()!
+    for (const event of queue) yield event
   }
 }
 

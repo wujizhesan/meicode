@@ -56,10 +56,11 @@ export async function runIsolated(
     unknownToolLimit: 2,
     toolsOverride: opts.toolsOverride,
   })
-  let output = ''
+  const outputParts: string[] = []
   for await (const ev of agent.events) {
-    if (ev.type === 'text') output += ev.text
+    if (ev.type === 'text') outputParts.push(ev.text)
   }
+  const output = outputParts.join('')
   await agent.done
 
   // 补充子会话的工具结果（npm test 等输出在 tool 消息里）
@@ -76,10 +77,11 @@ export async function runIsolated(
     { role: 'system', content: '把下面的执行输出压缩成 200 字以内的中文摘要，保留关键结论与数字。只输出摘要正文。' },
     { role: 'user', content: combined.slice(-8000) },
   ]
-  let summary = ''
+  const summaryParts: string[] = []
   for await (const ev of opts.provider.streamChat(summaryMsgs, { thinking: false })) {
-    if (ev.type === 'text') summary += ev.text
+    if (ev.type === 'text') summaryParts.push(ev.text)
   }
+  const summary = summaryParts.join('')
   return summary.trim() || output.slice(0, 500)
 }
 

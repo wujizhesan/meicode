@@ -1,4 +1,4 @@
-import { mkdirSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { RuntimeEventLog, createRuntimeId } from '../src/runtime/index.ts'
 
@@ -17,6 +17,9 @@ if (events.length !== 2 || events[0].type !== 'run_started' || events[1].type !=
   throw new Error('事件读取顺序错误')
 }
 if (!first.eventId.startsWith('event_')) throw new Error('事件 ID 前缀错误')
+const activeFile = join(tmp, `${id}.jsonl`)
+const activeIndex = JSON.parse(readFileSync(join(tmp, `${id}.index.json`), 'utf8')) as { activeBytes?: number }
+if (activeIndex.activeBytes !== statSync(activeFile).size) throw new Error('事件索引未记录活动文件大小')
 
 const pending = log.waitForEvent(id, 1000)
 setTimeout(() => log.append({ sessionId: id, type: 'tool_call', payload: { name: 'wait_test' } }), 10)
@@ -40,6 +43,14 @@ if (reopened.append({ sessionId: rotatedId, type: 'run_finished' }).seq !== 7) t
 writeFileSync(join(tmp, `${rotatedId}.index.json`), '{broken', 'utf8')
 const recoveredIndex = new RuntimeEventLog(tmp, { maxBytes: 1024 })
 if (recoveredIndex.append({ sessionId: rotatedId, type: 'report_ready' }).seq !== 8) throw new Error('索引损坏后未恢复序号')
+
+const checkpointId = createRuntimeId('session')
+const checkpointed = new RuntimeEventLog(tmp, { checkpointInterval: 32 })
+for (let i = 0; i < 5; i++) checkpointed.append({ sessionId: checkpointId, type: 'tool_call', payload: { i } })
+const checkpointReopened = new RuntimeEventLog(tmp, { checkpointInterval: 32 })
+if (checkpointReopened.append({ sessionId: checkpointId, type: 'run_finished' }).seq !== 6) {
+  throw new Error('批量检查点后重启未从事件正文恢复序号')
+}
 
 const escapedFile = join(tmp, 'evil.jsonl')
 writeFileSync(escapedFile, JSON.stringify({ sessionId: rotatedId, type: 'tool_result', eventId: 'event_evil', seq: 999, ts: Date.now() }) + '\n', 'utf8')

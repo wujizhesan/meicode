@@ -98,6 +98,18 @@ async function main() {
     if (result.rounds !== 1) throw new Error(`rounds=${result.rounds}`)
     if (history.all().length !== 2) throw new Error(`历史段数 ${history.all().length}`)
   })
+  await check('事件队列: 高频文本流保持完整顺序', async () => {
+    const chunks = Array.from({ length: 3000 }, (_, index) => String(index % 10))
+    const p = new FakeAgentProvider(() => ({
+      events: [...chunks.map((text) => ({ type: 'text' as const, text })), { type: 'done' as const }],
+    }))
+    const history = new History()
+    history.push({ role: 'user', content: '高频流' })
+    const { events, result } = await consume(runAgent(baseOpts(p, history)))
+    const output = events.filter((event) => event.type === 'text').map((event) => event.text).join('')
+    if (output !== chunks.join('')) throw new Error(`事件流丢失或乱序: ${output.length}/${chunks.length}`)
+    if (result.finalText !== output) throw new Error('最终文本与事件流不一致')
+  })
   await check('teamBusy: 纯文本轮+团队忙不判 complete(防"[等待]"当最终输出)', async () => {
     // 第一轮: 纯文本+团队忙 → 不 complete,注入提示继续;第二轮: 纯文本+团队闲 → complete
     let busy = true
@@ -320,6 +332,59 @@ async function main() {
     if (wi < re) throw new Error(`写应在读完成之后: ${JSON.stringify(order)}`)
   })
 
+  await check('分批: 混合调用保持写读屏障与原始顺序', async () => {
+    const order: string[] = []
+    const localRegistry = new ToolRegistry()
+    localRegistry.register({
+      name: 'read_file',
+      description: '测试读取',
+      parameters: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] },
+      async execute(args) {
+        order.push(`read-${args.path}-start`)
+        await sleep(30)
+        order.push(`read-${args.path}-end`)
+        return { success: true, output: String(args.path) }
+      },
+    })
+    localRegistry.register({
+      name: 'write_file',
+      description: '测试写入',
+      parameters: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] },
+      async execute(args) {
+        order.push(`write-${args.path}`)
+        return { success: true, output: String(args.path) }
+      },
+    })
+    let round = 0
+    const p = new FakeAgentProvider(() => {
+      round++
+      if (round > 1) return { events: [{ type: 'text', text: '完成' }, { type: 'done' }] }
+      return {
+        events: [
+          { type: 'tool_call', id: 'w1', name: 'write_file', arguments: { path: 'before' } },
+          { type: 'tool_call', id: 'r1', name: 'read_file', arguments: { path: 'a' } },
+          { type: 'tool_call', id: 'r2', name: 'read_file', arguments: { path: 'b' } },
+          { type: 'tool_call', id: 'w2', name: 'write_file', arguments: { path: 'after' } },
+          { type: 'done' },
+        ],
+      }
+    })
+    const history = new History()
+    history.push({ role: 'user', content: '顺序测试' })
+    await consume(runAgent({ ...baseOpts(p, history), registry: localRegistry }))
+
+    const firstWrite = order.indexOf('write-before')
+    const firstRead = order.indexOf('read-a-start')
+    const secondRead = order.indexOf('read-b-start')
+    const lastRead = Math.max(order.indexOf('read-a-end'), order.indexOf('read-b-end'))
+    const lastWrite = order.indexOf('write-after')
+    if (!(firstWrite < firstRead && firstWrite < secondRead)) throw new Error(`前置写入被重排: ${JSON.stringify(order)}`)
+    if (!(firstRead < order.indexOf('read-b-end') && secondRead < order.indexOf('read-a-end'))) {
+      throw new Error(`相邻读取未并发: ${JSON.stringify(order)}`)
+    }
+    if (lastWrite < lastRead) throw new Error(`后置写入越过读取屏障: ${JSON.stringify(order)}`)
+  })
+
   // ---------- Plan Mode ----------
   await check('plan mode: 请求 tools 仅含 3 个读类工具', async () => {
     const p = new FakeAgentProvider(() => ({ events: [{ type: 'text', text: '计划' }, { type: 'done' }] }))
@@ -351,6 +416,32 @@ async function main() {
     history.push({ role: 'user', content: 'hi' })
     await consume(runAgent(baseOpts(p, history)))
     if (p.capturedMessages[0]?.role !== 'system') throw new Error('首条非 system')
+  })
+
+  await check('上下文预算: 每轮只生成一次快照', async () => {
+    const p = new FakeAgentProvider(() => ({ events: [{ type: 'text', text: 'ok' }, { type: 'done' }] }))
+    const history = new History()
+    history.push({ role: 'user', content: 'hi' })
+    let snapshots = 0
+    await consume(runAgent({
+      ...baseOpts(p, history),
+      ctx: {
+        ...ctx,
+        contextBudget: () => {
+          snapshots++
+          return {
+            window: 1000,
+            estimatedTokens: 10,
+            remainingTokens: 990,
+            autoMargin: 100,
+            manualMargin: 10,
+            historyMessages: history.length,
+            breakerOpen: false,
+          }
+        },
+      },
+    }))
+    if (snapshots !== 1) throw new Error(`快照生成次数 ${snapshots}`)
   })
 
   // ---------- P4: 前缀稳定 / 环境分流 / 轮次注入 / 双重强化 ----------

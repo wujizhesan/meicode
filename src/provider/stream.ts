@@ -6,7 +6,7 @@ const DEFAULT_IDLE_TIMEOUT_MS = 30_000
 export interface ToolCallAccumulator {
   id?: string
   name?: string
-  args: string
+  args: string[]
 }
 
 export interface LinkedAbortController {
@@ -40,22 +40,23 @@ export async function getResponseErrorDetail(response: Response): Promise<string
 
 export function drainToolCalls(accumulators: Map<number, ToolCallAccumulator>): StreamEvent[] {
   const events: StreamEvent[] = []
-  for (const accumulator of accumulators.values()) {
+  for (const [, accumulator] of [...accumulators.entries()].sort(([a], [b]) => a - b)) {
     if (!accumulator.id || !accumulator.name) {
       events.push({ type: 'error', message: '工具调用不完整（缺少 id 或 name）' })
       continue
     }
+    const args = accumulator.args.join('')
     try {
       events.push({
         type: 'tool_call',
         id: accumulator.id,
         name: accumulator.name,
-        arguments: JSON.parse(accumulator.args || '{}') as Record<string, unknown>,
+        arguments: JSON.parse(args || '{}') as Record<string, unknown>,
       })
     } catch {
       events.push({
         type: 'error',
-        message: `工具参数解析失败 (${accumulator.name}): ${accumulator.args.slice(0, 100)}`,
+        message: `工具参数解析失败 (${accumulator.name}): ${args.slice(0, 100)}`,
       })
     }
   }

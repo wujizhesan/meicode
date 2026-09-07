@@ -1,4 +1,3 @@
-import { chromium } from 'playwright-core'
 import type { Browser, Page } from 'playwright-core'
 import type { Tool, ToolContext, ToolResult } from './types.ts'
 
@@ -34,6 +33,7 @@ export const browserTool: Tool = {
     if (action === 'launch') {
       if (browser) return { success: true, output: '浏览器已在运行' }
       try {
+        const { chromium } = await import('playwright-core')
         browser = await chromium.launch({
           executablePath: EDGE_PATH,
           headless: args.headless !== false,

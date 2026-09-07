@@ -6,13 +6,14 @@ export class TokenEstimator {
   private anchorCount = 0
   private hasAnchor = false
 
-  estimate(messages: ChatMessage[]): number {
+  estimate(messages: readonly ChatMessage[]): number {
     if (!this.hasAnchor) {
       return messages.reduce((sum, m) => sum + Math.ceil(m.content.length / 4), 0)
     }
-    const delta = messages
-      .slice(this.anchorCount)
-      .reduce((sum, m) => sum + Math.ceil(m.content.length / 4), 0)
+    let delta = 0
+    for (let i = this.anchorCount; i < messages.length; i++) {
+      delta += Math.ceil(messages[i].content.length / 4)
+    }
     return this.anchorTokens + delta
   }
 

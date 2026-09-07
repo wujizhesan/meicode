@@ -1,28 +1,28 @@
-import { existsSync, readFileSync, statSync } from 'node:fs'
-import { join, dirname, resolve } from 'node:path'
+import { existsSync, readFileSync } from 'node:fs'
+import { resolve } from 'node:path'
 // 用 typescript5(独立依赖,API 稳定)——项目编译用 TS7,代码智能用 TS5
-import ts from 'typescript5'
+import type ts from 'typescript5'
 import type { Tool, ToolContext, ToolResult } from './types.ts'
 
 // 代码智能工具(TS LanguageService 直接集成,零外部进程):
 // defs=符号定义位置 / refs=符号引用 / diagnostics=文件诊断(错误/警告)
 // 对 TS/JS 项目立即可用——改代码时快速定位、查编译错误
 
-function createService(cwd: string): ts.LanguageService {
+function createService(cwd: string, typescript: typeof ts): ts.LanguageService {
   const files = new Map<string, { version: number; text: string }>()
-  const tsconfig = ts.findConfigFile(cwd, ts.sys.fileExists)
+  const tsconfig = typescript.findConfigFile(cwd, typescript.sys.fileExists)
   const options: ts.CompilerOptions = {}
   const host: ts.LanguageServiceHost = {
     getScriptFileNames: () => {
       if (tsconfig) {
-        const parsed = ts.getParsedCommandLineOfConfigFile(tsconfig, {}, ts.sys as never)
+        const parsed = typescript.getParsedCommandLineOfConfigFile(tsconfig, {}, typescript.sys as never)
         if (parsed) return [...parsed.fileNames]
       }
       // 无 tsconfig:扫描 cwd 下 TS/JS
       const out: string[] = []
       const walk = (dir: string, depth: number) => {
         if (depth > 4) return
-        for (const f of ts.sys.readDirectory(dir, ['.ts', '.tsx', '.js', '.jsx'])) {
+        for (const f of typescript.sys.readDirectory(dir, ['.ts', '.tsx', '.js', '.jsx'])) {
           if (f.includes('node_modules') || f.includes('.mewcode')) continue
           out.push(f)
         }
@@ -41,18 +41,18 @@ function createService(cwd: string): ts.LanguageService {
           return undefined
         }
       }
-      return ts.ScriptSnapshot.fromString(text)
+      return typescript.ScriptSnapshot.fromString(text)
     },
     getCurrentDirectory: () => cwd,
     getCompilationSettings: () => options,
-    getDefaultLibFileName: (o) => ts.getDefaultLibFilePath(o),
-    fileExists: ts.sys.fileExists,
-    readFile: ts.sys.readFile,
-    readDirectory: ts.sys.readDirectory,
-    directoryExists: ts.sys.directoryExists,
-    getDirectories: ts.sys.getDirectories,
+    getDefaultLibFileName: (o) => typescript.getDefaultLibFilePath(o),
+    fileExists: typescript.sys.fileExists,
+    readFile: typescript.sys.readFile,
+    readDirectory: typescript.sys.readDirectory,
+    directoryExists: typescript.sys.directoryExists,
+    getDirectories: typescript.sys.getDirectories,
   }
-  return ts.createLanguageService(host, ts.createDocumentRegistry())
+  return typescript.createLanguageService(host, typescript.createDocumentRegistry())
 }
 
 export const codeIntelTool: Tool = {
@@ -79,7 +79,8 @@ export const codeIntelTool: Tool = {
     if (file && !existsSync(file)) return { success: false, output: '', error: `文件不存在: ${file}` }
 
     try {
-      const svc = createService(ctx.cwd)
+      const { default: typescript } = await import('typescript5')
+      const svc = createService(ctx.cwd, typescript)
 
       if (action === 'diagnostics') {
         if (!file) return { success: false, output: '', error: 'diagnostics 需要 file' }
@@ -90,7 +91,7 @@ export const codeIntelTool: Tool = {
         const lines = all.slice(0, 50).map((d) => {
           const pos = d.start ?? 0
           const lc = d.file?.getLineAndCharacterOfPosition(pos)
-          const msg = ts.flattenDiagnosticMessageText(d.messageText, '\n')
+          const msg = typescript.flattenDiagnosticMessageText(d.messageText, '\n')
           return `${d.file?.fileName.split(/[\\/]/).pop()}:${(lc?.line ?? 0) + 1}:${(lc?.character ?? 0) + 1} [${d.category === 1 ? 'error' : 'warning'}] ${msg.slice(0, 150)}`
         })
         return { success: true, output: `${all.length} 个诊断:\n${lines.join('\n')}` }
@@ -119,7 +120,7 @@ export const codeIntelTool: Tool = {
         const loc = svc.getDefinitionAtPosition(file, pos)
         if (!loc || loc.length === 0) return { success: false, output: '', error: '未找到定义(符号可能是内置/外部)' }
         const show = loc.slice(0, 20).map((d) => {
-          const src = d.fileName ? ts.createSourceFile(d.fileName, existsSync(d.fileName) ? readFileSync(d.fileName, "utf8") : "", ts.ScriptTarget.Latest, false) : null; const lc = src?.getLineAndCharacterOfPosition(d.textSpan.start)
+          const src = d.fileName ? typescript.createSourceFile(d.fileName, existsSync(d.fileName) ? readFileSync(d.fileName, "utf8") : "", typescript.ScriptTarget.Latest, false) : null; const lc = src?.getLineAndCharacterOfPosition(d.textSpan.start)
           return `${d.fileName.split(/[\\/]/).pop()}:${(lc?.line ?? 0) + 1}`
         })
         if (action === 'defs') {
@@ -128,7 +129,7 @@ export const codeIntelTool: Tool = {
         const refs = svc.findReferences(file, pos) ?? []
         const lines = refs.slice(0, 30).map((r) => {
           const items = r.references.slice(0, 5).map((ref) => {
-            const lc = ref.fileName && existsSync(ref.fileName) ? ts.createSourceFile(ref.fileName, readFileSync(ref.fileName, 'utf8'), ts.ScriptTarget.Latest, false) : null
+            const lc = ref.fileName && existsSync(ref.fileName) ? typescript.createSourceFile(ref.fileName, readFileSync(ref.fileName, 'utf8'), typescript.ScriptTarget.Latest, false) : null
             return `${ref.fileName.split(/[\\/]/).pop()}`
           })
           return `${r.definition.fileName.split(/[\\/]/).pop()}: ${items.join(', ')}`

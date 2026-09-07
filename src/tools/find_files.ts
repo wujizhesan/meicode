@@ -10,7 +10,7 @@ async function* walkFiles(dir: string, base: string): AsyncGenerator<string> {
   for (const entry of entries) {
     const fullPath = join(dir, entry.name)
     const relPath = relative(base, fullPath).replaceAll('\\', '/')
-    if (entry.name === 'node_modules' || entry.name === '.git' || relPath.split('/').includes('node_modules') || relPath.split('/').includes('.git')) continue
+    if (entry.name === 'node_modules' || entry.name === '.git') continue
     if (entry.isDirectory()) {
       yield* walkFiles(fullPath, base)
     } else if (entry.isFile()) {
@@ -50,7 +50,7 @@ export const findFilesTool: Tool = {
     results.sort()
     const truncated = results.length >= MAX_RESULTS
     const listed = truncated ? results.slice(0, MAX_RESULTS - 1) : results
-    const out = listed.length === 0 ? '未找到匹配文件' : listed.map((p) => relative(base, join(base, p))).join('\n')
+    const out = listed.length === 0 ? '未找到匹配文件' : listed.join('\n')
     return { success: true, output: out + (truncated ? `\n…[仅显示前 ${MAX_RESULTS - 1} 条]` : ''), truncated }
   },
 }

@@ -87,6 +87,8 @@ async function main() {
     const latest = store.recoverLatest()
     if (!latest || latest.id !== id) throw new Error('恢复失败')
     if (latest.messages.length !== 2) throw new Error(`消息数 ${latest.messages.length}`)
+    const listed = store.listSessions(10).find((session) => session.id === id)
+    if (listed?.count !== 2) throw new Error(`会话列表消息数 ${listed?.count}`)
   })
 
   await check('会话: 坏行跳过', async () => {

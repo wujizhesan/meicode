@@ -30,6 +30,7 @@ export function runAgent(opts: AgentOptions): AgentHandle {
 
   // ---------- 事件流 ----------
   const eventQueue: AgentEvent[] = []
+  let eventHead = 0
   let eventWake: (() => void) | null = null
   let finished = false
 
@@ -46,8 +47,13 @@ export function runAgent(opts: AgentOptions): AgentHandle {
   const events: AsyncIterable<AgentEvent> = {
     async *[Symbol.asyncIterator]() {
       while (true) {
-        if (eventQueue.length > 0) {
-          yield eventQueue.shift()!
+        if (eventHead < eventQueue.length) {
+          const event = eventQueue[eventHead++]!
+          if (eventHead >= 1024 && eventHead * 2 >= eventQueue.length) {
+            eventQueue.splice(0, eventHead)
+            eventHead = 0
+          }
+          yield event
         } else if (finished) {
           return
         } else {
@@ -100,7 +106,7 @@ export function runAgent(opts: AgentOptions): AgentHandle {
       const hookInjections = ctx.hooks?.collectInjections() ?? []
 
       const roundCalls: Extract<StreamEvent, { type: 'tool_call' }>[] = []
-      let roundText = ''
+      const roundTextParts: string[] = []
       let roundError: string | null = null
 
       // P7：请求前上下文检查（轻量预防 + 重量兜底）
@@ -128,30 +134,31 @@ export function runAgent(opts: AgentOptions): AgentHandle {
         ...hookInjections.map((c) => ({ role: 'system' as const, content: c })),
         ...endgameHint,
         // P14：请求前 sanitize——任何路径产生的不完整 assistant(tool_calls) 都被过滤（防 DeepSeek 400）
-        ...sanitizeMessages(history.all()),
+        ...sanitizeMessages(history.view()),
       ]
       // P12：请求前注入回流结果——追加在末尾（请求时历史是稳定快照，永不插 assistant/tool 中间）
       for (const c of opts.injectSystem?.() ?? []) {
         msgs.push({ role: 'system', content: c })
       }
 
+      const contextBudget = ctx.contextBudget?.()
       emitRuntimeEvent(ctx, {
         type: 'context_snapshot',
         agentId: ctx.agentId,
         turn: round,
-        payload: { ...(ctx.contextBudget?.() ?? {}) },
+        payload: { ...(contextBudget ?? {}) },
       })
       emitRuntimeEvent(ctx, {
         type: 'model_request',
         agentId: ctx.agentId,
         turn: round,
-        payload: { messageCount: msgs.length, toolCount: tools.length, contextBudget: { ...(ctx.contextBudget?.() ?? {}) } },
+        payload: { messageCount: msgs.length, toolCount: tools.length, contextBudget: { ...(contextBudget ?? {}) } },
       })
 
       for await (const ev of provider.streamChat(msgs, { thinking: false, tools, signal: controller.signal })) {
         if (controller.signal.aborted) break
         if (ev.type === 'text') {
-          roundText += ev.text
+          roundTextParts.push(ev.text)
           emit({ type: 'text', text: ev.text })
         } else if (ev.type === 'thinking') {
           emit({ type: 'thinking', text: ev.text })
@@ -179,6 +186,8 @@ export function runAgent(opts: AgentOptions): AgentHandle {
           roundError = ev.message
         }
       }
+
+      const roundText = roundTextParts.join('')
 
       if (controller.signal.aborted) {
         reason = 'cancelled'
@@ -357,25 +366,33 @@ async function executeBatch(
   ctx: ToolContext,
   onResult: (call: Extract<StreamEvent, { type: 'tool_call' }>, result: ToolResult) => void,
 ): Promise<{ call: Extract<StreamEvent, { type: 'tool_call' }>; result: ToolResult }[]> {
-  const reads = calls.filter((c) => READ_ONLY_TOOLS.has(c.name))
-  const others = calls.filter((c) => !READ_ONLY_TOOLS.has(c.name))
+  const byId = new Map<string, ToolResult>()
+  let pendingReads: Extract<StreamEvent, { type: 'tool_call' }>[] = []
 
-  const readResults = await Promise.all(
-    reads.map(async (call) => {
-      const result = await executeOne(call, registry, ctx)
-      onResult(call, result)
-      return { call, result }
-    }),
-  )
-  const otherResults: { call: Extract<StreamEvent, { type: 'tool_call' }>; result: ToolResult }[] = []
-  for (const call of others) {
-    const result = await executeOne(call, registry, ctx)
-    onResult(call, result)
-    otherResults.push({ call, result })
+  const flushReads = async (): Promise<void> => {
+    const batch = pendingReads
+    pendingReads = []
+    await Promise.all(
+      batch.map(async (call) => {
+        const result = await executeOne(call, registry, ctx)
+        byId.set(call.id, result)
+        onResult(call, result)
+      }),
+    )
   }
 
-  const byId = new Map<string, ToolResult>()
-  for (const r of [...readResults, ...otherResults]) byId.set(r.call.id, r.result)
+  for (const call of calls) {
+    if (READ_ONLY_TOOLS.has(call.name)) {
+      pendingReads.push(call)
+      continue
+    }
+    await flushReads()
+    const result = await executeOne(call, registry, ctx)
+    byId.set(call.id, result)
+    onResult(call, result)
+  }
+  await flushReads()
+
   return calls.map((call) => ({ call, result: byId.get(call.id)! }))
 }
 

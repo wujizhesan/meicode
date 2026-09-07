@@ -6,10 +6,25 @@ const HOUR = 3600 * 1000
 const DAY = 24 * HOUR
 const SESSION_ID_RE = /^[A-Za-z0-9_-]{1,128}$/
 
+function countNonEmptyLines(text: string): number {
+  let count = 0
+  let hasContent = false
+  for (let i = 0; i < text.length; i++) {
+    const char = text.charCodeAt(i)
+    if (char === 10) {
+      if (hasContent) count++
+      hasContent = false
+    } else if (char !== 13 && char !== 32 && char !== 9) {
+      hasContent = true
+    }
+  }
+  return count + (hasContent ? 1 : 0)
+}
+
 // 防御校验：assistant(tool_calls) 后面必须紧跟配对的 tool 消息（否则 DeepSeek/OpenAI 400）
 // 两重检查：① 每个 tool_call id 有配对 tool；② 紧邻性——配对完成前不允许插入任何其他消息
 // （插 system/user/新 assistant 都违反紧邻；缺失/交错 → 连带删除该 assistant 及其已入队 tool）
-export function sanitizeMessages(messages: ChatMessage[]): ChatMessage[] {
+export function sanitizeMessages(messages: readonly ChatMessage[]): ChatMessage[] {
   const out: ChatMessage[] = []
   let pendingIdx = -1 // 欠 tool 的 assistant 在 out 中的位置（-1 = 无欠债）
   const pendingIds = new Set<string>()
@@ -80,9 +95,7 @@ export class SessionStore {
     if (messages.length === 0) return
     const file = this.fileFor(id)
     if (!file) throw new Error('非法会话 ID')
-    for (const m of messages) {
-      appendFileSync(file, JSON.stringify(m) + '\n', 'utf8')
-    }
+    appendFileSync(file, messages.map((message) => JSON.stringify(message)).join('\n') + '\n', 'utf8')
   }
 
   // 恢复：坏行跳过、工具调用无结果截断
@@ -145,14 +158,14 @@ export class SessionStore {
         const id = f.replace(/\.jsonl$/, '')
         const file = this.fileFor(id)
         if (!file) return { id, count: 0, mtime: 0 }
-        const lines = readFileSync(file, 'utf8').split('\n').filter(Boolean)
+        const count = countNonEmptyLines(readFileSync(file, 'utf8'))
         let mtime = 0
         try {
           mtime = statSync(file).mtimeMs
         } catch {
           // 读取失败按 0
         }
-        return { id, count: lines.length, mtime }
+        return { id, count, mtime }
       })
   }
 

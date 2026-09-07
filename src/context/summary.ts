@@ -22,21 +22,20 @@ export const BOUNDARY_MESSAGE =
 
 // 从尾部往回保留 keepTokens（字符/4 估算）且至少 minCount 条
 export function tailKeep(
-  messages: ChatMessage[],
+  messages: readonly ChatMessage[],
   keepTokens = 10000,
   minCount = 5,
 ): { keep: ChatMessage[]; drop: ChatMessage[] } {
   let tokens = 0
   let count = 0
-  const keep: ChatMessage[] = []
-  for (let i = messages.length - 1; i >= 0; i--) {
-    tokens += Math.ceil(messages[i].content.length / 4)
+  let start = messages.length
+  while (start > 0) {
+    start--
+    tokens += Math.ceil(messages[start].content.length / 4)
     count++
-    keep.unshift(messages[i])
     if (tokens >= keepTokens && count >= minCount) break
   }
-  const drop = messages.slice(0, messages.length - keep.length)
-  return { keep, drop }
+  return { keep: messages.slice(start), drop: messages.slice(0, start) }
 }
 
 // 独立调用 LLM 生成摘要（不进 history，无 tools）
@@ -46,11 +45,12 @@ export async function summarize(
   ctx: ToolContext,
 ): Promise<string> {
   const msgs: ChatMessage[] = [{ role: 'system', content: SUMMARY_SYSTEM }, ...earlyMessages]
-  let text = ''
+  const textParts: string[] = []
   for await (const ev of provider.streamChat(msgs, { thinking: false })) {
-    if (ev.type === 'text') text += ev.text
+    if (ev.type === 'text') textParts.push(ev.text)
     else if (ev.type === 'error') throw new Error(`摘要请求失败: ${ev.message}`)
   }
+  const text = textParts.join('')
   if (!text.trim()) throw new Error('摘要返回为空')
   return text.trim()
 }

@@ -127,6 +127,19 @@ async function main() {
     const message = await pending
     if (!message || message.body !== 'wake') throw new Error('邮件事件等待未唤醒')
   })
+  await check('邮箱: 多等待者共享监听并独立唤醒', async () => {
+    const mail = new TeamMail(join(TEAM_ROOT, 'multi-wait-mail'))
+    mail.register('alice')
+    mail.register('bob')
+    const alice = mail.waitForMessage('alice', (message) => message.body === 'for-alice', 1000)
+    const bob = mail.waitForMessage('bob', (message) => message.body === 'for-bob', 1000)
+    mail.send('lead', 'alice', 'for-alice')
+    mail.send('lead', 'bob', 'for-bob')
+    const [aliceMessage, bobMessage] = await Promise.all([alice, bob])
+    if (aliceMessage?.body !== 'for-alice' || bobMessage?.body !== 'for-bob') {
+      throw new Error('多个邮件等待者未独立唤醒')
+    }
+  })
   await check('邮件等待支持取消', async () => {
     const mail = new TeamMail(join(TEAM_ROOT, 'abort-mail'))
     mail.register('alice')

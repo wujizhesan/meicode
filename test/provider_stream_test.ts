@@ -51,9 +51,9 @@ await check('getResponseErrorDetail: 限制响应体长度', async () => {
 
 await check('drainToolCalls: 保序解析并清空累加器', () => {
   const calls = new Map<number, ToolCallAccumulator>([
-    [0, { id: 'a', name: 'read', args: '{"path":"a.ts"}' }],
-    [1, { id: 'b', name: 'broken', args: '{' }],
-    [2, { args: '{}' }],
+    [2, { args: ['{}'] }],
+    [0, { id: 'a', name: 'read', args: ['{"path":', '"a.ts"}'] }],
+    [1, { id: 'b', name: 'broken', args: ['{'] }],
   ])
   const events = drainToolCalls(calls)
   assert(events[0]?.type === 'tool_call' && events[0].arguments.path === 'a.ts', '合法调用解析失败')

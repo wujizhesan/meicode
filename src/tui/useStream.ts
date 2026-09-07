@@ -16,6 +16,7 @@ import type { TeamManager } from '../team/index.ts'
 import { resolveMode } from './mode.ts'
 import type { RuntimeEventLog } from '../runtime/index.ts'
 import { createRuntimeId } from '../runtime/index.ts'
+import { createStreamBuffer } from './stream-buffer.ts'
 
 export interface MemoryContext {
   sessionStore?: SessionStore
@@ -283,11 +284,20 @@ export function useStreamingChat(
       appendIdx = all.length
     }
 
+    const streamBuffer = createStreamBuffer(({ text: textChunk, thinking: thinkingChunk }) => {
+      updateLast((message) => ({
+        ...message,
+        text: message.text + textChunk,
+        thinking: (message.thinking ?? '') + thinkingChunk,
+      }))
+    })
+
     try {
       let lastRound = 0
       for await (const ev of agent.events) {
         // 每轮开始：先封存上一轮工具汇总，再 push assistant 占位
         if (ev.type === 'progress' && ev.round !== lastRound) {
+          streamBuffer.flush()
           appendIncremental() // 上一轮已完整(assistant+tool 结果)——先落盘
           flushRoundToolsRef.current?.()
           lastRound = ev.round
@@ -297,10 +307,9 @@ export function useStreamingChat(
         if (ev.type === 'text') {
           const piece = ev.text
           if (agentMode === 'plan') planTextRef.current += piece
-          updateLast((m) => ({ ...m, text: m.text + piece }))
+          streamBuffer.appendText(piece)
         } else if (ev.type === 'thinking') {
-          const piece = ev.text
-          updateLast((m) => ({ ...m, thinking: (m.thinking ?? '') + piece }))
+          streamBuffer.appendThinking(ev.text)
         } else if (ev.type === 'tool_call') {
           // 累积到本轮（折叠展示），不逐行刷屏
           roundToolsRef.current.push({ id: ev.id, name: ev.name, status: 'running' })
@@ -314,6 +323,7 @@ export function useStreamingChat(
           if (ev.cacheHitTokens !== undefined) setCacheHit((v) => v + ev.cacheHitTokens!)
           if (ev.cacheMissTokens !== undefined) setCacheMiss((v) => v + ev.cacheMissTokens!)
         } else if (ev.type === 'done') {
+          streamBuffer.flush()
           appendIncremental() // 最后一轮落盘
           flushRoundToolsRef.current?.()
           setLastReason(ev.reason)
@@ -330,6 +340,7 @@ export function useStreamingChat(
         }
       }
     } finally {
+      streamBuffer.flush()
       // P10：isolated Skill 检测——本轮激活了 isolated 模式 Skill（load_skill 或斜杠命令路径）→ 独立会话 + 摘要回流
       const la = skillManager?.lastActivated
       if (la && la.mode === 'isolated' && skillManager?.isActive(la.name)) {
@@ -380,6 +391,7 @@ export function useStreamingChat(
           // 存档失败静默
         }
       }
+      streamBuffer.dispose()
     }
   }
 

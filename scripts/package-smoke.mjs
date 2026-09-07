@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 
@@ -27,6 +27,14 @@ try {
   writeFileSync(join(installRoot, 'package.json'), JSON.stringify(consumerPackage, null, 2))
   runNpm(['install', '--omit=dev', '--ignore-scripts', '--no-audit', '--no-fund', tarball], { cwd: installRoot, stdio: 'inherit', env: cleanNpmEnv })
   const entry = join(installRoot, 'node_modules', 'meicode', 'bin', 'meicode.mjs')
+  const chunksDir = join(installRoot, 'node_modules', 'meicode', 'dist', 'chunks')
+  const chunks = readdirSync(chunksDir)
+  const runtimeChunks = ['App-', 'acp-', 'a2a-'].map((prefix) => {
+    const name = chunks.find((chunk) => chunk.startsWith(prefix) && chunk.endsWith('.mjs'))
+    if (!name) throw new Error(`发行包缺少动态分块: ${prefix}*.mjs`)
+    return join(chunksDir, name)
+  })
+  execFileSync(process.execPath, ['--input-type=module', '--eval', "import('node:url').then(({ pathToFileURL }) => Promise.all(process.argv.slice(1).map((path) => import(pathToFileURL(path)))))", ...runtimeChunks], { stdio: 'ignore' })
   const expectedVersion = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8')).version
   const version = execFileSync(process.execPath, [entry, '--version'], { encoding: 'utf8' }).trim()
   if (version !== expectedVersion) throw new Error(`版本检查失败: ${version} !== ${expectedVersion}`)

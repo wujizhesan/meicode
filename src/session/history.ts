@@ -11,6 +11,10 @@ export class History {
     return this.items.map((m) => ({ ...m }))
   }
 
+  view(): readonly ChatMessage[] {
+    return this.items
+  }
+
   clear(): void {
     this.items = []
   }

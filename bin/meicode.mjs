@@ -17,4 +17,9 @@ if (args.includes('--help') || args.includes('-h')) {
   console.log('选项: --init  --doctor  --help  --version')
   process.exit(0)
 }
-await import(pathToFileURL(join(root, '..', 'dist', 'cli.mjs')).href)
+if (args.includes('--init') || args.includes('--doctor')) {
+  const { main } = await import(pathToFileURL(join(root, '..', 'dist', 'cli-fast.mjs')).href)
+  main(args)
+} else {
+  await import(pathToFileURL(join(root, '..', 'dist', 'cli.mjs')).href)
+}

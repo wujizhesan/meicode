@@ -256,14 +256,15 @@ export class SubAgentManager {
       })
       this.activeAgents.set(id, agent)
 
-      let output = ''
+      const outputParts: string[] = []
       try {
         for await (const ev of agent.events) {
-          if (ev.type === 'text') output += ev.text
+          if (ev.type === 'text') outputParts.push(ev.text)
         }
       } finally {
         this.activeAgents.delete(id)
       }
+      const output = outputParts.join('')
       const result = await agent.done
       const toolOut = sub
         .all()

@@ -55,14 +55,15 @@ export class ContextManager {
   }
 
   snapshot(): ContextBudgetSnapshot {
-    const estimatedTokens = this.estimator.estimate(this.history.all())
+    const messages = this.history.view()
+    const estimatedTokens = this.estimator.estimate(messages)
     return {
       window: this.window,
       estimatedTokens,
       remainingTokens: Math.max(0, this.window - estimatedTokens),
       autoMargin: this.autoMargin,
       manualMargin: this.manualMargin,
-      historyMessages: this.history.all().length,
+      historyMessages: messages.length,
       ...(this.lastInputTokens === undefined ? {} : { lastInputTokens: this.lastInputTokens }),
       breakerOpen: this.breakerOpen,
     }
@@ -70,24 +71,27 @@ export class ContextManager {
 
   async beforeRequest(mode: 'auto' | 'manual'): Promise<void> {
     // ① 轻量预防：扫描未存盘的大 tool 消息 → 存盘
-    const msgs = this.history.all()
+    let msgs = this.history.view()
+    let didSpill = false
     for (let i = 0; i < msgs.length; i++) {
       const m = msgs[i]
       if (m.role === 'tool' && needsSpill(m.content) && !m.content.includes('[已存盘]')) {
         const [spilled] = await spillBatch([{ content: m.content }], this.cwd)
         this.history.replaceRange(i, i + 1, [{ ...m, content: spilled.content }])
+        didSpill = true
       }
     }
+    if (didSpill) msgs = this.history.view()
 
     // ② 重量兜底：估算超限 → 摘要
     const margin = mode === 'manual' ? this.manualMargin : this.autoMargin
     if (this.breakerOpen && mode === 'auto') return
-    const total = this.estimator.estimate(this.history.all())
+    const total = this.estimator.estimate(msgs)
     if (total <= this.window - margin) return
 
     // 保留尾部：约 1 万 token 或 ≥5 条；小窗口下按窗口 10% 收缩（防 keep 大于窗口）
     const keepTokens = Math.min(10000, Math.floor(this.window * 0.1))
-    const { keep, drop } = tailKeep(this.history.all(), keepTokens)
+    const { keep, drop } = tailKeep(msgs, keepTokens)
     if (drop.length === 0) return
 
     try {

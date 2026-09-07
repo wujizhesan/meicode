@@ -3,6 +3,7 @@ import { mkdirSync, rmSync, writeFileSync, readFileSync, existsSync } from 'node
 import { join } from 'node:path'
 import { createTools, ToolRegistry } from '../src/tools/index.ts'
 import type { ToolContext } from '../src/tools/index.ts'
+import { MAX_RESULT_BYTES, truncateOutput } from '../src/tools/types.ts'
 
 let passed = 0
 let failed = 0
@@ -49,6 +50,14 @@ async function main() {
     } catch (e) {
       if (!(e as Error).message.includes('重名')) throw e
     }
+  })
+
+  await check('truncateOutput: UTF-8 边界完整且不超过上限', () => {
+    const result = truncateOutput('中😀'.repeat(3000))
+    if (!result.truncated) throw new Error('超长输出未截断')
+    if (Buffer.byteLength(result.output, 'utf8') > MAX_RESULT_BYTES) throw new Error('截断结果超过字节上限')
+    if (result.output.includes('\ufffd')) throw new Error('截断破坏了 UTF-8 字符边界')
+    if (!result.output.endsWith('…[结果已截断]')) throw new Error('缺少截断标记')
   })
 
   // ---------- write_file ----------

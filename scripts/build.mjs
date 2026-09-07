@@ -8,17 +8,31 @@ const dist = join(root, 'dist')
 rmSync(dist, { recursive: true, force: true })
 mkdirSync(dist, { recursive: true })
 
-await build({
-  entryPoints: [join(root, 'src', 'cli.tsx')],
-  outfile: join(dist, 'cli.mjs'),
+const common = {
   bundle: true,
   packages: 'external',
   platform: 'node',
   format: 'esm',
   target: 'node20',
-  banner: { js: '#!/usr/bin/env node' },
   sourcemap: true,
-})
+}
+
+await Promise.all([
+  build({
+    ...common,
+    entryPoints: { cli: join(root, 'src', 'cli.tsx') },
+    outdir: dist,
+    outExtension: { '.js': '.mjs' },
+    chunkNames: 'chunks/[name]-[hash]',
+    splitting: true,
+    banner: { js: '#!/usr/bin/env node' },
+  }),
+  build({
+    ...common,
+    entryPoints: [join(root, 'src', 'cli-fast.ts')],
+    outfile: join(dist, 'cli-fast.mjs'),
+  }),
+])
 
 cpSync(join(root, 'src', 'agents'), join(dist, 'agents'), { recursive: true })
 cpSync(join(root, 'src', 'skills'), join(dist, 'skills'), { recursive: true })

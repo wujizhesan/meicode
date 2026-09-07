@@ -137,15 +137,12 @@ export function guardCommand(ctx: ToolContext, command: string): string | null {
 
 export function truncateOutput(text: string): { output: string; truncated: boolean } {
   if (Buffer.byteLength(text, 'utf8') <= MAX_RESULT_BYTES) return { output: text, truncated: false }
-  // 按码点截断（Array.from），UTF-16 slice 会切裂 surrogate pair/中文边界
-  const chars = Array.from(text)
-  let end = chars.length
-  while (end > 0) {
-    const cut = chars.slice(0, end).join('')
-    if (Buffer.byteLength(cut, 'utf8') <= MAX_RESULT_BYTES) {
-      return { output: cut + '\n…[结果已截断]', truncated: true }
-    }
-    end = Math.floor(end * 0.9)
-  }
-  return { output: '…[结果已截断]', truncated: true }
+
+  const suffix = '\n…[结果已截断]'
+  const contentLimit = MAX_RESULT_BYTES - Buffer.byteLength(suffix, 'utf8')
+  const encoded = Buffer.from(text, 'utf8')
+  let end = contentLimit
+  while (end > 0 && (encoded[end] & 0xc0) === 0x80) end--
+
+  return { output: encoded.subarray(0, end).toString('utf8') + suffix, truncated: true }
 }

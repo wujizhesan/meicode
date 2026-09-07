@@ -10,6 +10,7 @@ const SUMMARY_LEN = 80
 export class TeamMail {
   private mailDir: string
   private waiters = new Map<string, Set<() => void>>()
+  private watcher: FSWatcher | undefined
 
   constructor(mailDir: string) {
     this.mailDir = mailDir
@@ -81,18 +82,23 @@ export class TeamMail {
   waitForMessage(name: string, predicate: (message: MailMessage) => boolean, timeoutMs = 0, signal?: AbortSignal): Promise<MailMessage | null> {
     if (!TeamMail.validName(name)) return Promise.resolve(null)
     return new Promise((resolve) => {
-      let watcher: FSWatcher | undefined
       let timer: ReturnType<typeof setTimeout> | undefined
       let abortHandler: (() => void) | undefined
+      let settled = false
       const check = (): void => {
         const message = this.read(name).find(predicate)
         if (message) finish(message)
       }
       const finish = (message: MailMessage | null): void => {
+        if (settled) return
+        settled = true
         const listeners = this.waiters.get(name)
         listeners?.delete(check)
         if (listeners?.size === 0) this.waiters.delete(name)
-        watcher?.close()
+        if (this.waiters.size === 0) {
+          this.watcher?.close()
+          this.watcher = undefined
+        }
         if (timer) clearTimeout(timer)
         if (abortHandler) signal?.removeEventListener('abort', abortHandler)
         resolve(message)
@@ -100,10 +106,7 @@ export class TeamMail {
       const listeners = this.waiters.get(name) ?? new Set<() => void>()
       listeners.add(check)
       this.waiters.set(name, listeners)
-      try {
-        watcher = watch(this.mailDir, { persistent: false }, () => check())
-      } catch {
-      }
+      this.ensureWatcher()
       if (timeoutMs > 0) {
         timer = setTimeout(() => finish(null), timeoutMs)
       }
@@ -117,6 +120,14 @@ export class TeamMail {
       }
       check()
     })
+  }
+
+  private ensureWatcher(): void {
+    if (this.watcher) return
+    try {
+      this.watcher = watch(this.mailDir, { persistent: false }, () => this.notify('*'))
+    } catch {
+    }
   }
 
   private notify(name: string): void {
