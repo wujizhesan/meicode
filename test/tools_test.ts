@@ -84,6 +84,18 @@ async function main() {
     const r = await tools[0].execute({ path: join(TMP, 'a.txt') }, ctx)
     if (!r.success || r.output !== 'hello 世界') throw new Error('绝对路径失败')
   })
+  await check('read_file: 大文件仅返回受限前缀', async () => {
+    writeFileSync(join(TMP, 'read-large.txt'), 'x'.repeat(1024 * 1024), 'utf8')
+    const r = await tools[0].execute({ path: 'read-large.txt' }, ctx)
+    if (!r.success || !r.truncated || !r.output.endsWith('…[结果已截断]')) throw new Error(`大文件截断异常: ${JSON.stringify(r)}`)
+    if (Buffer.byteLength(r.output, 'utf8') > MAX_RESULT_BYTES) throw new Error('大文件结果超过字节上限')
+  })
+  await check('read_file: UTF-8 截断边界完整', async () => {
+    writeFileSync(join(TMP, 'read-utf8.txt'), '中😀'.repeat(3000), 'utf8')
+    const r = await tools[0].execute({ path: 'read-utf8.txt' }, ctx)
+    if (!r.success || !r.truncated || r.output.includes('�')) throw new Error(`UTF-8 截断异常: ${JSON.stringify(r)}`)
+    if (Buffer.byteLength(r.output, 'utf8') > MAX_RESULT_BYTES) throw new Error('UTF-8 结果超过字节上限')
+  })
 
   // ---------- edit_file ----------
   writeFileSync(join(TMP, 'edit.txt'), 'line1\nTARGET line2\nline3\n', 'utf8')
@@ -100,9 +112,20 @@ async function main() {
   writeFileSync(join(TMP, 'edit2.txt'), 'DUP\nDUP\nend\n', 'utf8')
   await check('edit_file: 两处匹配报错带位置', async () => {
     const r = await tools[2].execute({ path: 'edit2.txt', old_text: 'DUP', new_text: 'x' }, ctx)
-    if (r.success || !r.error!.includes('匹配到 2 处') || !r.error!.includes('0 个字符')) {
+    if (r.success || !r.error!.includes('匹配到多处') || !r.error!.includes('0 个字符')) {
       throw new Error(`错误信息不符: ${r.error}`)
     }
+  })
+  await check('edit_file: new_text 按字面量替换', async () => {
+    writeFileSync(join(TMP, 'edit-literal.txt'), 'before TARGET after', 'utf8')
+    const r = await tools[2].execute({ path: 'edit-literal.txt', old_text: 'TARGET', new_text: '$& literal' }, ctx)
+    if (!r.success || readFileSync(join(TMP, 'edit-literal.txt'), 'utf8') !== 'before $& literal after') {
+      throw new Error(`edit_file 字面量替换异常: ${JSON.stringify(r)}`)
+    }
+  })
+  await check('edit_file: 拒绝空 old_text', async () => {
+    const r = await tools[2].execute({ path: 'edit.txt', old_text: '', new_text: 'x' }, ctx)
+    if (r.success || !r.error?.includes('缺少参数')) throw new Error(`edit_file 未拒绝空 old_text: ${JSON.stringify(r)}`)
   })
 
   // ---------- run_command ----------
@@ -153,7 +176,7 @@ async function main() {
   })
 
   // ---------- grep_code ----------
-  writeFileSync(join(TMP, 'grepme.txt'), 'alpha\nbeta import x\nomega import y\n', 'utf8')
+  writeFileSync(join(TMP, 'grepme.txt'), 'alpha\nbeta import x\nomega import y import z\n', 'utf8')
   await check('grep_code: 返回 文件:行号:行内容', async () => {
     const r = await tools[5].execute({ pattern: 'import' }, ctx)
     if (!r.success) throw new Error(r.error)
@@ -162,6 +185,10 @@ async function main() {
       throw new Error(`格式不符: ${r.output}`)
     }
   })
+  await check('grep_code: 正则模式保持逐行语义', async () => {
+    const r = await tools[5].execute({ pattern: '^omega' }, ctx)
+    if (!r.success || !r.output.includes(':3:') || !r.output.includes('omega import y')) throw new Error(`结果不符: ${r.output}`)
+  })
   await check('grep_code: 非法正则 → 结构化错误', async () => {
     const r = await tools[5].execute({ pattern: '[' }, ctx)
     if (r.success || !r.error!.includes('非法正则')) throw new Error(`应报非法正则: ${JSON.stringify(r)}`)
@@ -169,6 +196,17 @@ async function main() {
   await check('grep_code: 无匹配返回未找到', async () => {
     const r = await tools[5].execute({ pattern: 'zzz_nothing_zzz' }, ctx)
     if (!r.success || !r.output.includes('未找到')) throw new Error(`结果不符: ${r.output}`)
+  })
+
+  writeFileSync(join(TMP, 'grep_large_early.txt'), `${Array.from({ length: 20 }, (_, i) => `EARLY_MATCH_${i}`).join('\n')}\n${'filler line\n'.repeat(200000)}`, 'utf8')
+  await check('grep_code: 大文件达到单文件上限后返回 20 条', async () => {
+    const r = await tools[5].execute({ pattern: 'EARLY_MATCH_' }, ctx)
+    if (!r.success || r.output.split('\n').length !== 20) throw new Error(`结果不符: ${r.output.slice(0, 200)}`)
+  })
+  writeFileSync(join(TMP, 'grep_utf8_boundary.txt'), `${'x'.repeat(3 * 1024 * 1024 - 4)}ABC中BOUNDARY_MATCH\n`, 'utf8')
+  await check('grep_code: 长单行流式搜索保持 UTF-8 分块边界', async () => {
+    const r = await tools[5].execute({ pattern: 'ABC中BOUNDARY_MATCH' }, ctx)
+    if (!r.success || !r.output.includes('grep_utf8_boundary.txt:1:')) throw new Error(`结果不符: ${r.output.slice(0, 200)}`)
   })
 
   try {

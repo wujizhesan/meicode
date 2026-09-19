@@ -8,17 +8,74 @@ import { loadAgentRoles } from './loader.ts'
 import type { WorktreeManager } from '../worktree/index.ts'
 import type { AgentRole, SpawnRequest, SubAgentRecord } from './types.ts'
 import type { SubAgentStore } from './store.ts'
-import { collectRuntimeEvidence, createRuntimeId } from '../runtime/index.ts'
+import { createRuntimeId } from '../runtime/index.ts'
 import type { RuntimeEventInput } from '../runtime/index.ts'
 
 const SYSTEM_TOOLS = new Set(['read_file', 'write_file', 'edit_file', 'run_command', 'find_files', 'grep_code', 'load_skill', 'spawn_agent'])
 
-function summarizeLocally(text: string, limit = 500): string {
-  const normalized = text.replace(/\s+/g, ' ').trim()
-  if (normalized.length <= limit) return normalized
+const WHITESPACE = /\s/
+
+function normalizedPrefix(parts: readonly string[], limit: number): { text: string; complete: boolean } {
+  const chars: string[] = []
+  let pendingSpace = false
+  for (let partIndex = 0; partIndex < parts.length; partIndex++) {
+    if (partIndex > 0 && chars.length > 0) pendingSpace = true
+    const part = parts[partIndex]
+    for (let i = 0; i < part.length; i++) {
+      const char = part[i]
+      if (WHITESPACE.test(char)) {
+        pendingSpace = chars.length > 0
+        continue
+      }
+      if (pendingSpace) {
+        if (chars.length >= limit) return { text: chars.join(''), complete: false }
+        chars.push(' ')
+        pendingSpace = false
+      }
+      if (chars.length >= limit) return { text: chars.join(''), complete: false }
+      chars.push(char)
+    }
+  }
+  return { text: chars.join(''), complete: true }
+}
+
+function normalizedSuffix(parts: readonly string[], limit: number): string {
+  const reversed: string[] = []
+  let length = 0
+  let pendingSpace = false
+  for (let partIndex = parts.length - 1; partIndex >= 0; partIndex--) {
+    if (partIndex < parts.length - 1 && length > 0) pendingSpace = true
+    const part = parts[partIndex]
+    for (let i = part.length - 1; i >= 0; i--) {
+      let char = part[i]
+      const code = char.charCodeAt(0)
+      if (code >= 0xdc00 && code <= 0xdfff && i > 0) {
+        const previousCode = part.charCodeAt(i - 1)
+        if (previousCode >= 0xd800 && previousCode <= 0xdbff) char = `${part[--i]}${char}`
+      }
+      if (WHITESPACE.test(char)) {
+        pendingSpace = length > 0
+        continue
+      }
+      if (pendingSpace) {
+        reversed.push(' ')
+        length++
+        pendingSpace = false
+      }
+      reversed.push(char)
+      length += char.length
+      if (length >= limit) return reversed.reverse().join('').slice(-limit)
+    }
+  }
+  return reversed.reverse().join('').slice(-limit)
+}
+
+export function summarizeLocally(parts: readonly string[], limit = 500): string {
+  const prefix = normalizedPrefix(parts, limit + 1)
+  if (prefix.complete && prefix.text.length <= limit) return prefix.text
   const head = Math.floor(limit * 0.72)
   const tail = limit - head - 5
-  return `${normalized.slice(0, head)} ... ${normalized.slice(-tail)}`
+  return `${prefix.text.slice(0, head)} ... ${normalizedSuffix(parts, tail)}`
 }
 
 function emitRuntimeEvent(ctx: ToolContext, input: Omit<RuntimeEventInput, 'sessionId'>): void {
@@ -266,14 +323,16 @@ export class SubAgentManager {
       }
       const output = outputParts.join('')
       const result = await agent.done
-      const toolOut = sub
-        .all()
-        .filter((m) => m.role === 'tool')
-        .map((m) => m.content)
-        .join('\n')
-      const combined = [output, toolOut].filter(Boolean).join('\n\n---\n\n')
-
-      const summary = summarizeLocally(combined || output || '子任务已完成')
+      const summaryParts: string[] = output ? [output] : []
+      let hasToolOutput = false
+      for (const message of sub.view()) {
+        if (message.role !== 'tool') continue
+        if (!hasToolOutput && output) summaryParts.push('---')
+        summaryParts.push(message.content)
+        hasToolOutput = true
+      }
+      if (summaryParts.length === 0) summaryParts.push('子任务已完成')
+      const summary = summarizeLocally(summaryParts)
 
       record.status = result.reason === 'error' || result.reason === 'tool_failures'
         ? 'error'
@@ -284,7 +343,7 @@ export class SubAgentManager {
       record.tokens = result.totalTokens
       record.reportId = createRuntimeId('report')
       record.result = summary
-      record.evidence = collectRuntimeEvidence(opts.ctx.runtimeEvents?.read(opts.ctx.sessionId ?? id) ?? [], id, record.startedAt)
+      record.evidence = result.evidence
       if (record.status === 'error') record.error = result.reason
       this.persistRecord(record)
       emitRuntimeEvent(opts.ctx, {

@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { appendFileSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { RuntimeEventLog, createRuntimeId } from '../src/runtime/index.ts'
 
@@ -32,6 +32,33 @@ setTimeout(() => externalLog.append({ sessionId: id, type: 'message_sent', paylo
 const externalReceived = await externalPending
 if (!externalReceived || externalReceived.type !== 'message_sent') throw new Error('跨实例事件等待未唤醒')
 
+const interleavedId = createRuntimeId('session')
+const interleavedA = new RuntimeEventLog(tmp)
+const interleavedB = new RuntimeEventLog(tmp)
+if (interleavedA.append({ sessionId: interleavedId, type: 'run_started' }).seq !== 1) throw new Error('跨实例首个事件序号错误')
+if (interleavedB.append({ sessionId: interleavedId, type: 'tool_call' }).seq !== 2) throw new Error('跨实例第二个事件序号错误')
+if (interleavedA.append({ sessionId: interleavedId, type: 'run_finished' }).seq !== 3) throw new Error('缓存实例未识别外部追加')
+
+const rotatingWaitId = createRuntimeId('session')
+const rotatingWaitLog = new RuntimeEventLog(tmp, { maxBytes: 1024 })
+rotatingWaitLog.append({ sessionId: rotatingWaitId, type: 'tool_result', payload: { text: 'x'.repeat(1200) } })
+const rotatingPending = rotatingWaitLog.waitForEvent(rotatingWaitId, 1000)
+setTimeout(() => new RuntimeEventLog(tmp, { maxBytes: 1024 }).append({ sessionId: rotatingWaitId, type: 'message_sent', payload: { source: 'after-rotation' } }), 10)
+const rotatingReceived = await rotatingPending
+if (!rotatingReceived || rotatingReceived.payload?.source !== 'after-rotation') throw new Error('事件日志轮转后外部等待未唤醒')
+
+const partialId = createRuntimeId('session')
+const partialPending = new RuntimeEventLog(tmp).waitForEvent(partialId, 1000)
+const partialFile = join(tmp, `${partialId}.jsonl`)
+const partialBytes = Buffer.from(JSON.stringify({ sessionId: partialId, type: 'message_sent', eventId: 'event_partial', seq: 1, ts: Date.now(), payload: { text: '分段测试' } }) + '\n')
+const splitAt = partialBytes.indexOf(Buffer.from('段')) + 1
+setTimeout(() => {
+  appendFileSync(partialFile, partialBytes.subarray(0, splitAt))
+  setTimeout(() => appendFileSync(partialFile, partialBytes.subarray(splitAt)), 10)
+}, 10)
+const partialReceived = await partialPending
+if (!partialReceived || partialReceived.payload?.text !== '分段测试') throw new Error('分段 UTF-8 事件未正确读取')
+
 const rotatedId = createRuntimeId('session')
 const rotatedLog = new RuntimeEventLog(tmp, { maxBytes: 1024 })
 for (let i = 0; i < 6; i++) rotatedLog.append({ sessionId: rotatedId, type: 'tool_result', payload: { text: 'x'.repeat(500) } })
@@ -52,6 +79,55 @@ if (checkpointReopened.append({ sessionId: checkpointId, type: 'run_finished' })
   throw new Error('批量检查点后重启未从事件正文恢复序号')
 }
 
+const tailRecoveryId = createRuntimeId('session')
+const tailRecoveryLog = new RuntimeEventLog(tmp)
+tailRecoveryLog.append({ sessionId: tailRecoveryId, type: 'tool_result', payload: { text: '长'.repeat(70000) } })
+appendFileSync(join(tmp, `${tailRecoveryId}.jsonl`), '{bad json}\n')
+const tailRecovered = new RuntimeEventLog(tmp).append({ sessionId: tailRecoveryId, type: 'run_finished' })
+if (tailRecovered.seq !== 2) throw new Error('超长事件或损坏尾行导致序号恢复错误')
+
+const batchId = createRuntimeId('session')
+const batchLog = new RuntimeEventLog(tmp)
+const batch = batchLog.appendBatch([
+  { sessionId: batchId, type: 'context_snapshot', turn: 1 },
+  { sessionId: batchId, type: 'model_request', turn: 1 },
+])
+if (batch.length !== 2 || batch[0].seq !== 1 || batch[1].seq !== 2) throw new Error('批量事件序号错误')
+if (batchLog.read(batchId).map((event) => event.type).join(',') !== 'context_snapshot,model_request') throw new Error('批量事件读取错误')
+
+const unterminatedId = createRuntimeId('session')
+const unterminatedEvent = { sessionId: unterminatedId, type: 'audit' as const, eventId: 'event_unterminated', seq: 1, ts: Date.now() }
+writeFileSync(join(tmp, `${unterminatedId}.jsonl`), `\n{bad json}\n${JSON.stringify(unterminatedEvent)}`, 'utf8')
+const unterminatedEvents = new RuntimeEventLog(tmp).read(unterminatedId)
+if (unterminatedEvents.length !== 1 || unterminatedEvents[0].eventId !== 'event_unterminated') {
+  throw new Error('事件读取未正确处理空行、坏行或无换行尾行')
+}
+
+const filteredId = createRuntimeId('session')
+const auditLine = JSON.stringify({ sessionId: filteredId, type: 'audit', eventId: 'event_audit', seq: 1, ts: Date.now() })
+const spacedAuditLine = JSON.stringify({ sessionId: filteredId, type: 'audit', eventId: 'event_spaced_audit', seq: 2, ts: Date.now() }).replace('"type":"audit"', '"type" : "audit"')
+const falseMarkerLine = JSON.stringify({ sessionId: filteredId, type: 'tool_result', eventId: 'event_false_marker', seq: 3, ts: Date.now(), payload: { text: '"type":"audit"' } })
+writeFileSync(join(tmp, `${filteredId}.jsonl`), `${auditLine}\n${spacedAuditLine}\n${falseMarkerLine}\n`, 'utf8')
+const filteredEvents = new RuntimeEventLog(tmp).read(filteredId, { type: 'audit' })
+if (filteredEvents.map((event) => event.eventId).join(',') !== 'event_audit,event_spaced_audit') {
+  throw new Error('事件类型预过滤发生漏读或误收')
+}
+
+const chunkedReadId = createRuntimeId('session')
+const chunkedText = '中'.repeat(400000)
+const chunkedReadFile = join(tmp, `${chunkedReadId}.jsonl`)
+writeFileSync(chunkedReadFile, JSON.stringify({ sessionId: chunkedReadId, type: 'audit', eventId: 'event_chunked', seq: 1, ts: Date.now(), payload: { text: chunkedText } }), 'utf8')
+const chunkedReadEvents = new RuntimeEventLog(tmp, { maxBytes: 1024 }).read(chunkedReadId)
+if (chunkedReadEvents.length !== 1 || chunkedReadEvents[0].payload?.text !== chunkedText) {
+  throw new Error('超大事件分块读取未保持 UTF-8 内容')
+}
+rmSync(chunkedReadFile, { force: true })
+
+const unorderedId = createRuntimeId('session')
+writeFileSync(join(tmp, `${unorderedId}.segment-000000000002-1.jsonl`), JSON.stringify({ sessionId: unorderedId, type: 'run_finished', eventId: 'event_second', seq: 2, ts: Date.now() }) + '\n', 'utf8')
+writeFileSync(join(tmp, `${unorderedId}.jsonl`), JSON.stringify({ sessionId: unorderedId, type: 'run_started', eventId: 'event_first', seq: 1, ts: Date.now() }) + '\n', 'utf8')
+if (new RuntimeEventLog(tmp).read(unorderedId).map((event) => event.seq).join(',') !== '1,2') throw new Error('乱序事件未正确回退排序')
+
 const escapedFile = join(tmp, 'evil.jsonl')
 writeFileSync(escapedFile, JSON.stringify({ sessionId: rotatedId, type: 'tool_result', eventId: 'event_evil', seq: 999, ts: Date.now() }) + '\n', 'utf8')
 writeFileSync(join(tmp, `${rotatedId}.index.json`), JSON.stringify({ lastSeq: 8, segments: ['../evil.jsonl'] }), 'utf8')
@@ -61,5 +137,12 @@ const collisionLog = new RuntimeEventLog(tmp)
 collisionLog.append({ sessionId: 'a/b', type: 'message_sent', payload: { source: 'slash' } })
 collisionLog.append({ sessionId: 'a_b', type: 'message_sent', payload: { source: 'underscore' } })
 if (collisionLog.read('a/b').length !== 1 || collisionLog.read('a_b').length !== 1) throw new Error('不同 session id 发生文件碰撞')
+
+const recreatedRoot = join(tmp, 'recreated-root')
+const recreatedLog = new RuntimeEventLog(recreatedRoot)
+recreatedLog.append({ sessionId: 'recreated', type: 'run_started' })
+rmSync(recreatedRoot, { recursive: true, force: true })
+const recreated = recreatedLog.append({ sessionId: 'recreated', type: 'run_finished' })
+if (recreated.seq !== 1 || recreatedLog.read('recreated').length !== 1) throw new Error('event root was not recreated after deletion')
 
 console.log('runtime_test passed')

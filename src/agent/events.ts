@@ -1,6 +1,7 @@
 import type { Provider } from '../provider/types.ts'
 import type { History } from '../session/history.ts'
 import type { JsonSchema, ToolContext, ToolRegistry } from '../tools/index.ts'
+import type { RuntimeEvidenceSummary } from '../runtime/evidence.ts'
 
 export type StopReason = 'complete' | 'max_iterations' | 'cancelled' | 'unknown_tool' | 'tool_failures' | 'tool_repeat' | 'error'
 
@@ -40,6 +41,7 @@ export interface AgentResult {
   rounds: number
   totalTokens: number
   finalText: string
+  evidence: RuntimeEvidenceSummary
   errorMessage?: string
 }
 

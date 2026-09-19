@@ -63,6 +63,7 @@ export function App({
   const [compactMsg, setCompactMsg] = useState<string | null>(null)
   const [completeCandidates, setCompleteCandidates] = useState<string[]>([])
   const [completeIdx, setCompleteIdx] = useState(0)
+  const [inputEditing, setInputEditing] = useState(false)
 
   // 权限询问队列：并发工具调用可能同时触发多个 ask，逐个确认（单槽位会覆盖丢失）
   const ask = (call: ToolCallInfo) =>
@@ -157,7 +158,7 @@ export function App({
       return parts.join('\n')
     },
     auditAction: (args) => {
-      const events = memory?.runtimeEvents?.read(memory.sessionId ?? '').filter((event) => event.type === 'audit') ?? []
+      const events = memory?.runtimeEvents?.read(memory.sessionId ?? '', { type: 'audit' }) ?? []
       if (events.length === 0) return '暂无审计事件'
       let filtered = events
       let filterLabel = ''
@@ -418,7 +419,7 @@ export function App({
 
   return (
     <Box flexDirection="column" paddingX={1}>
-      <ChatView messages={messages} mode={mode} />
+      <ChatView messages={messages} mode={mode} compact={inputEditing} />
       {error ? <Text color="red">⚠ {error}</Text> : null}
       {compactMsg ? <Text color="cyan">📦 {compactMsg}</Text> : null}
       {status ? (
@@ -456,6 +457,7 @@ export function App({
           onTabComplete={handleTabComplete}
           disabled={isRunning}
           menuOpen={completeCandidates.length > 0}
+          onEditingChange={setInputEditing}
           placeholder={isRunning ? '执行中…（Ctrl+C 取消）' : undefined}
         />
       )}

@@ -4,6 +4,7 @@ import type { Provider } from '../provider/types.ts'
 import type { Tool, ToolContext, ToolRegistry } from '../tools/index.ts'
 import type { WorktreeManager } from '../worktree/index.ts'
 import { loadAgentRoles, agentDirs } from '../subagent/loader.ts'
+import type { AgentRole } from '../subagent/types.ts'
 import { TeamGroupStore } from './group.ts'
 import { TeamMail } from './mail.ts'
 import { MemberHost } from './member.ts'
@@ -21,6 +22,17 @@ const TASK_LEASE_MS = 10 * 60 * 1000
 interface TaskExecutionClaim {
   host: MemberHost
   member?: TeamMember
+}
+
+function sameTeamMember(left: TeamMember, right: TeamMember): boolean {
+  return left.name === right.name
+    && left.agentId === right.agentId
+    && left.role === right.role
+    && left.workdir === right.workdir
+    && left.backend === right.backend
+    && left.needsApproval === right.needsApproval
+    && left.status === right.status
+    && left.updatedAt === right.updatedAt
 }
 
 function emitRuntimeEvent(ctx: ToolContext, input: Omit<RuntimeEventInput, 'sessionId'>): void {
@@ -115,7 +127,14 @@ export class TeamManager {
     group: TeamGroup,
     name: string,
     role: string,
-    opts: { needsApproval?: boolean; workdir?: string } = {},
+    opts: {
+      needsApproval?: boolean
+      workdir?: string
+      deferGroupSave?: boolean
+      roleDefinition?: AgentRole | null
+      agentId?: string
+      updatedAt?: number
+    } = {},
   ): Promise<MemberHost> {
     // 幂等：同名成员已驻留直接返回（不覆盖 host，避免双写同一 historyFile/worktree）
     const existing = this.members.get(name)
@@ -133,14 +152,20 @@ export class TeamManager {
     }
     const member: TeamMember = {
       name,
-      agentId: createRuntimeId('agent'),
+      agentId: opts.agentId ?? createRuntimeId('agent'),
       role,
       workdir,
       backend: 'coroutine',
       needsApproval: opts.needsApproval ?? false,
       status: 'idle',
+      ...(opts.updatedAt !== undefined ? { updatedAt: opts.updatedAt } : {}),
     }
-    this.store.addMember(group, member)
+    if (opts.deferGroupSave) {
+      group.members = group.members.filter((current) => current.name !== member.name)
+      group.members.push(member)
+    } else {
+      this.store.addMember(group, member)
+    }
     this.mail.register(name)
     // 专家角色（对齐 Qoder 专家团）：按 role 名从角色文件加载 SOP 正文与工具限制
     let rolePrompt = ''
@@ -149,7 +174,9 @@ export class TeamManager {
     let roleWritePaths: string[] = []
     let roleMaxRounds: number | undefined
     try {
-      const found = loadAgentRoles(agentDirs(process.cwd())).find((r) => r.name === role)
+      const found = 'roleDefinition' in opts
+        ? opts.roleDefinition
+        : loadAgentRoles(agentDirs(process.cwd())).find((r) => r.name === role)
       if (found) {
         rolePrompt = found.content
         roleToolsDeny = found.toolsDeny ?? []
@@ -195,24 +222,48 @@ export class TeamManager {
   }
 
   // 跨重启恢复:从 group.yaml 重建所有成员(workdir/history 复用,不重新 create worktree)
-  async restore(): Promise<string[]> {
+  async restore(roleDefinitions?: readonly AgentRole[]): Promise<string[]> {
     if (this.closed) return []
     const restored: string[] = []
+    let restoreRoles = roleDefinitions
+      ? new Map(roleDefinitions.map((role) => [role.name, role]))
+      : undefined
+    const findRestoreRole = (name: string): AgentRole | null => {
+      if (!restoreRoles) {
+        try {
+          restoreRoles = new Map(loadAgentRoles(agentDirs(process.cwd())).map((role) => [role.name, role]))
+        } catch {
+          restoreRoles = new Map()
+        }
+      }
+      return restoreRoles.get(name) ?? null
+    }
     for (const groupName of this.store.listGroups()) {
       const group = this.store.loadGroup(groupName)
       if (!group) continue
-      for (const m of group.members) {
+      const persistedMembers = [...group.members]
+      const refreshedMembers: TeamMember[] = []
+      for (const m of persistedMembers) {
         if (this.members.has(m.name)) continue
         try {
           await this.spawnMember(group, m.name, m.role, {
             needsApproval: m.needsApproval,
             workdir: m.workdir,
+            deferGroupSave: true,
+            roleDefinition: findRestoreRole(m.role),
+            agentId: m.agentId,
+            updatedAt: m.updatedAt,
           })
+          const refreshed = group.members.find((member) => member.name === m.name)
+          if (refreshed) refreshedMembers.push(refreshed)
           restored.push(`${groupName}/${m.name}`)
         } catch (e) {
           console.warn(`[团队] 恢复成员 ${m.name} 失败: ${(e as Error).message}`)
         }
       }
+      const membersChanged = persistedMembers.length !== group.members.length
+        || persistedMembers.some((member, index) => !sameTeamMember(member, group.members[index]))
+      if (membersChanged) this.store.addMembers(group, refreshedMembers)
       this.recoverStaleTasks(groupName)
       this.schedulePendingRetries(groupName)
       this.scheduleReadyTasks(groupName)
@@ -360,6 +411,8 @@ export class TeamManager {
   }
 
   recoverStaleTasks(groupName: string, now = Date.now()): TeamTask[] {
+    const snapshot = this.store.listTasks(groupName)
+    if (!snapshot.some((task) => task.status === 'in_progress' && task.leaseExpiresAt !== undefined && task.leaseExpiresAt <= now)) return []
     let recovered: TeamTask[] = []
     this.store.mutateTasks(groupName, (tasks) => {
       recovered = recoverExpiredTasks(tasks, now)

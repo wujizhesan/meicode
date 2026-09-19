@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import { parse } from 'yaml'
 import type { ProviderConfig } from './types.ts'
 import { loadModelCatalog, resolveCatalogEndpoint } from './model-catalog.ts'
@@ -13,7 +13,10 @@ const REQUIRED_FIELDS = ['name', 'protocol', 'model', 'base_url', 'api_key'] as 
 
 export function loadConfig(path?: string): ProviderConfig {
   const file = path ?? join(homedir(), '.mewcode', 'config.yaml')
+  return parseProvider(readRequiredYaml(file))
+}
 
+function readRequiredYaml(file: string): Record<string, unknown> {
   let raw: string
   try {
     raw = readFileSync(file, 'utf8')
@@ -21,17 +24,19 @@ export function loadConfig(path?: string): ProviderConfig {
     throw new Error(`配置文件不存在: ${file}`)
   }
 
-  let data: Record<string, unknown>
   try {
     const parsed = parse(raw)
     if (parsed === null || typeof parsed !== 'object') {
       throw new Error('配置内容为空或不是对象')
     }
-    data = parsed as Record<string, unknown>
+    return parsed as Record<string, unknown>
   } catch (e) {
     throw new Error(`YAML 解析失败: ${(e as Error).message}`)
   }
+}
 
+function parseProvider(raw: Record<string, unknown>): ProviderConfig {
+  const data = { ...raw }
   // 模型目录模式: config 写 provider: <id> 一行,protocol/model/base_url 从目录取
   // (api_key 仍必填;provider 模式下可省略 protocol/model/base_url)
   const catalog = loadModelCatalog()
@@ -81,9 +86,13 @@ export interface LoadedConfig {
 
 // 加载主配置 + 合并用户级/项目级 MCP Server 列表
 export function loadConfigWithMcp(path?: string): LoadedConfig {
-  const provider = loadConfig(path)
-  const userCfg = readOptionalYaml(join(homedir(), '.mewcode', 'config.yaml'))
-  const projectCfg = readOptionalYaml(join(process.cwd(), '.mewcode', 'config.yaml'))
+  const userFile = join(homedir(), '.mewcode', 'config.yaml')
+  const projectFile = join(process.cwd(), '.mewcode', 'config.yaml')
+  const providerFile = path ?? userFile
+  const providerRaw = readRequiredYaml(providerFile)
+  const provider = parseProvider(providerRaw)
+  const userCfg = samePath(providerFile, userFile) ? providerRaw : readOptionalYaml(userFile)
+  const projectCfg = samePath(providerFile, projectFile) ? providerRaw : readOptionalYaml(projectFile)
   const userRaw = (userCfg as Record<string, unknown> | null) ?? {}
   const projectRaw = (projectCfg as Record<string, unknown> | null) ?? {}
   const { servers, skipped } = parseMcpServers(
@@ -95,6 +104,12 @@ export function loadConfigWithMcp(path?: string): LoadedConfig {
     projectRaw.a2aAgents ?? projectRaw.a2a_agents,
   )
   return { provider, mcpServers: servers, mcpSkipped: skipped, a2aAgents: a2a.agents, a2aSkipped: a2a.skipped }
+}
+
+function samePath(left: string, right: string): boolean {
+  const a = resolve(left)
+  const b = resolve(right)
+  return process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b
 }
 
 function readOptionalYaml(file: string): unknown {

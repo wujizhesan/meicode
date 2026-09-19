@@ -1,5 +1,5 @@
 // 团队系统测试：小组/邮箱锁/任务/成员/coordinator/协议
-import { mkdirSync, rmSync, writeFileSync, existsSync, readFileSync } from 'node:fs'
+import { mkdirSync, rmSync, writeFileSync, appendFileSync, existsSync, readFileSync, statSync, utimesSync } from 'node:fs'
 import { join } from 'node:path'
 import { spawn } from 'node:child_process'
 import { TeamManager, TeamGroupStore, TeamMail } from '../src/team/index.ts'
@@ -54,7 +54,14 @@ async function main() {
     store.addMember(g, { name: 'alice', role: 'worker', workdir: REPO, backend: 'coroutine', needsApproval: false, status: 'idle' })
     const loaded = store.loadGroup('dev')
     if (!loaded || loaded.lead !== 'lead1' || loaded.members.length !== 1) throw new Error('加载失败')
+    loaded.members[0].status = 'offline'
+    if (store.loadGroup('dev')?.members[0].status === 'offline') throw new Error('小组缓存被调用方污染')
     if (!existsSync(join(TEAM_ROOT, 'dev', 'tasks.json'))) throw new Error('tasks.json 缺失')
+    const listed = store.listGroups()
+    listed.push('polluted')
+    if (store.listGroups().includes('polluted')) throw new Error('团队列表缓存被调用方污染')
+    new TeamGroupStore(TEAM_ROOT).createGroup('peer', 'lead2')
+    if (!store.listGroups().includes('peer')) throw new Error('团队列表缓存未识别跨实例创建')
     if (store.loadGroup('../outside') !== null) throw new Error('非法团队名称未拒绝')
     let rejected = false
     try {
@@ -69,6 +76,10 @@ async function main() {
     store.saveTasks('dev', [{ id: 't1', title: '任务A', status: 'todo', depends_on: ['t2'] }])
     const tasks = store.listTasks('dev')
     if (tasks.length !== 1 || tasks[0].depends_on?.[0] !== 't2') throw new Error('任务持久化失败')
+    tasks[0].status = 'failed'
+    tasks[0].depends_on?.push('polluted')
+    const cachedTasks = store.listTasks('dev')
+    if (cachedTasks[0].status === 'failed' || cachedTasks[0].depends_on?.includes('polluted')) throw new Error('任务缓存被调用方污染')
     const updated = store.updateTask('dev', 't1', { status: 'done', result: 'ok' })
     if (!updated || updated.status !== 'done') throw new Error('任务更新失败')
     store.saveTasks('dev', [{ id: 'claim-1', title: '领取竞争', status: 'todo' }])
@@ -83,9 +94,28 @@ async function main() {
     staleB.addMember(snapshotB, { name: 'carol', agentId: 'agent-carol', role: 'worker', workdir: REPO, backend: 'coroutine', needsApproval: false, status: 'idle' })
     const membersAfterRace = store.loadGroup('dev')?.members ?? []
     if (!membersAfterRace.some((member) => member.name === 'bob') || !membersAfterRace.some((member) => member.name === 'carol')) throw new Error('成员原子注册覆盖了并发成员')
+    const batchSnapshot = store.loadGroup('dev')
+    const peerSnapshot = store.loadGroup('dev')
+    if (!batchSnapshot || !peerSnapshot) throw new Error('批量成员快照读取失败')
+    staleB.addMember(peerSnapshot, { name: 'dave', role: 'worker', workdir: REPO, backend: 'coroutine', needsApproval: false, status: 'idle' })
+    staleA.addMembers(batchSnapshot, [
+      { name: 'bob', agentId: 'agent-bob-2', role: 'worker', workdir: REPO, backend: 'coroutine', needsApproval: false, status: 'idle' },
+      { name: 'carol', agentId: 'agent-carol-2', role: 'worker', workdir: REPO, backend: 'coroutine', needsApproval: false, status: 'idle' },
+    ])
+    const membersAfterBatch = store.loadGroup('dev')?.members ?? []
+    if (!membersAfterBatch.some((member) => member.name === 'dave') || membersAfterBatch.find((member) => member.name === 'bob')?.agentId !== 'agent-bob-2') {
+      throw new Error('批量成员注册覆盖并发成员或未刷新成员')
+    }
     const manager = new TeamManager(TEAM_ROOT, REPO, { provider: new FakeTeamProvider(), registry: { toOpenAITools: () => [] } as never, ctx })
     const appended = manager.addTask('dev', 'atomic append')
     if (!store.listTasks('dev').some((task) => task.id === appended.id)) throw new Error('任务原子追加失败')
+    const tasksFile = join(TEAM_ROOT, 'dev', 'tasks.json')
+    const tasksBefore = statSync(tasksFile)
+    if (manager.recoverStaleTasks('dev', 20).length !== 0) throw new Error('错误恢复了未过期任务')
+    const tasksAfter = statSync(tasksFile)
+    if (tasksBefore.ino !== tasksAfter.ino || tasksBefore.mtimeMs !== tasksAfter.mtimeMs || tasksBefore.ctimeMs !== tasksAfter.ctimeMs) {
+      throw new Error('无过期任务时仍然改写任务文件')
+    }
     store.saveTasks('dev', [
       { id: 'stale', title: 'stale', status: 'in_progress', attempt: 1, maxAttempts: 2, leaseId: 'old', leaseExpiresAt: 10 },
       { id: 'fresh', title: 'fresh', status: 'todo' },
@@ -101,13 +131,37 @@ async function main() {
     const mail = new TeamMail(join(TEAM_ROOT, 'mail'))
     mail.register('alice')
     mail.register('bob')
+    const registryFile = join(TEAM_ROOT, 'mail', 'registry.json')
+    const registryBefore = statSync(registryFile)
+    mail.register('alice')
+    const registryAfter = statSync(registryFile)
+    if (registryBefore.ino !== registryAfter.ino || registryBefore.mtimeMs !== registryAfter.mtimeMs || registryBefore.ctimeMs !== registryAfter.ctimeMs) {
+      throw new Error('重复邮箱注册仍然改写注册表')
+    }
+    new TeamMail(join(TEAM_ROOT, 'mail')).register('carol')
+    const externalBefore = statSync(registryFile)
+    mail.register('carol')
+    const externalAfter = statSync(registryFile)
+    if (externalBefore.ino !== externalAfter.ino || externalBefore.mtimeMs !== externalAfter.mtimeMs || externalBefore.ctimeMs !== externalAfter.ctimeMs) {
+      throw new Error('邮箱注册表缓存未识别跨实例修改')
+    }
     mail.send('bob', 'alice', '第一条消息内容较长用于摘要截断验证')
     const msgs = mail.read('alice')
     if (msgs.length !== 1 || msgs[0].from !== 'bob') throw new Error('读取失败')
+    msgs[0].body = '本地修改'
+    if (mail.read('alice')[0].body === '本地修改') throw new Error('邮箱缓存泄露了调用方修改')
+    mail.send('bob', 'alice', '第二条消息')
+    if (mail.read('alice').length !== 2) throw new Error('邮箱缓存未识别追加消息')
     if (!msgs[0].ts || msgs[0].read !== false) throw new Error('时间戳/已读默认值缺失')
     if (!msgs[0].summary || msgs[0].summary.length > 80) throw new Error('摘要截断失败')
     mail.read('alice', true)
     if (!mail.read('alice')[0].read) throw new Error('已读标记失败')
+    const settled = readFileSync(join(TEAM_ROOT, 'mail', 'alice.mail'), 'utf8')
+    mail.read('alice', true)
+    if (readFileSync(join(TEAM_ROOT, 'mail', 'alice.mail'), 'utf8') !== settled) throw new Error('重复已读改变了邮箱内容')
+    mail.send('bob', 'alice', '已读后追加')
+    const appended = mail.read('alice')
+    if (appended.length !== 3 || appended[2].body !== '已读后追加' || appended[2].read) throw new Error('已读缓存未识别后续追加')
     if (mail.read('../outside').length !== 0) throw new Error('非法邮箱名称未拒绝')
   })
   await check('邮箱: 广播', () => {
@@ -119,6 +173,43 @@ async function main() {
     const broadcast = mail.read('alice').find((m) => m.body === '全员通知')
     if (!broadcast?.read) throw new Error('广播已读状态未落盘')
   })
+  await check('邮箱: 目录删除后自动重建', () => {
+    const dir = join(TEAM_ROOT, 'recreated-mail')
+    const mail = new TeamMail(dir)
+    mail.send('lead', 'alice', 'before')
+    rmSync(dir, { recursive: true, force: true })
+    mail.send('lead', 'alice', 'after')
+    const messages = mail.read('alice')
+    if (messages.length !== 1 || messages[0].body !== 'after') throw new Error('邮箱目录未重建')
+  })
+  await check('邮箱: 增量解析跨中文字符边界', () => {
+    const dir = join(TEAM_ROOT, 'incremental-mail')
+    const file = join(dir, 'alice.mail')
+    mkdirSync(dir, { recursive: true })
+    writeFileSync(file, '')
+    const mail = new TeamMail(dir)
+    mail.read('alice')
+    const message = Buffer.from(JSON.stringify({
+      messageId: 'split-utf8',
+      from: 'lead',
+      to: 'alice',
+      body: '追加中文',
+      ts: Date.now(),
+      read: false,
+      summary: '追加中文',
+    }) + '\n')
+    const marker = message.indexOf(Buffer.from('中'))
+    if (marker < 0) throw new Error('测试数据缺少中文字符')
+    const split = marker + 1
+    appendFileSync(file, message.subarray(0, split))
+    if (mail.read('alice').length !== 0) throw new Error('未完整的增量行被误解析')
+    appendFileSync(file, message.subarray(split))
+    appendFileSync(file, JSON.stringify({ messageId: 'backdated', from: 'lead', to: 'alice', body: '早到', ts: 1, read: false, summary: '早到' }) + '\n')
+    appendFileSync(join(dir, 'broadcast.mail'), JSON.stringify({ messageId: 'broadcast-same-time', from: 'lead', to: '*', body: '广播', ts: 1, read: false, summary: '广播' }) + '\n')
+    const messages = mail.read('alice')
+    if (messages.length !== 3 || messages[2].messageId !== 'split-utf8') throw new Error('分段 UTF-8 增量行解析失败')
+    if (messages[0].messageId !== 'backdated' || messages[1].messageId !== 'broadcast-same-time') throw new Error('增量邮件稳定排序失败')
+  })
   await check('邮箱: 事件等待消息', async () => {
     const mail = new TeamMail(join(TEAM_ROOT, 'wait-mail'))
     mail.register('alice')
@@ -126,6 +217,21 @@ async function main() {
     setTimeout(() => mail.send('lead', 'alice', 'wake'), 20)
     const message = await pending
     if (!message || message.body !== 'wake') throw new Error('邮件事件等待未唤醒')
+  })
+  await check('邮箱: 跨实例增量等待与谓词隔离', async () => {
+    const dir = join(TEAM_ROOT, 'external-wait-mail')
+    const receiver = new TeamMail(dir)
+    const sender = new TeamMail(dir)
+    receiver.register('alice')
+    const pending = receiver.waitForMessage('alice', (message) => {
+      if (message.body !== 'external-wake') return false
+      message.body = 'local-mutation'
+      return true
+    }, 2000)
+    setTimeout(() => sender.send('lead', 'alice', 'external-wake'), 20)
+    const message = await pending
+    if (!message || message.body !== 'local-mutation') throw new Error('跨实例文件监听未唤醒')
+    if (receiver.read('alice')[0].body !== 'external-wake') throw new Error('等待谓词污染了邮箱缓存')
   })
   await check('邮箱: 多等待者共享监听并独立唤醒', async () => {
     const mail = new TeamMail(join(TEAM_ROOT, 'multi-wait-mail'))
@@ -165,6 +271,15 @@ async function main() {
       executed = true
     })
     if (!executed) throw new Error('过期锁未覆盖')
+    const emptyStaleLock = join(TMP, 'empty-stale.lock')
+    writeFileSync(emptyStaleLock, '')
+    const staleTime = new Date(Date.now() - 60000)
+    utimesSync(emptyStaleLock, staleTime, staleTime)
+    let emptyStaleExecuted = false
+    withLock(emptyStaleLock, () => {
+      emptyStaleExecuted = true
+    })
+    if (!emptyStaleExecuted) throw new Error('空过期锁未按 mtime 覆盖')
     const waitLock = join(TMP, 'wait.lock')
     const holder = spawn(process.execPath, ['-e', `const fs=require('fs'); fs.writeFileSync(${JSON.stringify(waitLock)}, String(Date.now())); setTimeout(() => fs.unlinkSync(${JSON.stringify(waitLock)}), 500)`], { stdio: 'ignore' })
     const deadline = Date.now() + 2000

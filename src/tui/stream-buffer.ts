@@ -5,6 +5,12 @@ export interface StreamBuffer {
   dispose(): void
 }
 
+export function streamFlushDelay(messageCount: number): number {
+  if (messageCount >= 200) return 32
+  if (messageCount >= 50) return 24
+  return 16
+}
+
 export function createStreamBuffer(
   onFlush: (chunk: { text: string; thinking: string }) => void,
   delayMs = 16,

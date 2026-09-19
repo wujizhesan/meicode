@@ -1,5 +1,5 @@
 // 记忆系统测试：指令/会话/笔记
-import { mkdirSync, rmSync, writeFileSync, readFileSync, existsSync, utimesSync, readdirSync } from 'node:fs'
+import { appendFileSync, mkdirSync, rmSync, writeFileSync, readFileSync, existsSync, utimesSync, readdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { loadInstructions } from '../src/memory/instructions.ts'
 import { SessionStore } from '../src/memory/session.ts'
@@ -89,6 +89,29 @@ async function main() {
     if (latest.messages.length !== 2) throw new Error(`消息数 ${latest.messages.length}`)
     const listed = store.listSessions(10).find((session) => session.id === id)
     if (listed?.count !== 2) throw new Error(`会话列表消息数 ${listed?.count}`)
+  })
+
+  await check('会话: 列表计数缓存增量更新与失效', async () => {
+    const dir = join(TMP, 'sessions')
+    const store = new SessionStore(dir)
+    const id = '20260809-120050-cache'
+    store.append(id, [{ role: 'user', content: 'one' }])
+    if (store.listSessions(10).find((session) => session.id === id)?.count !== 1) throw new Error('初始计数错误')
+    store.append(id, [{ role: 'assistant', content: 'two' }])
+    if (store.listSessions(10).find((session) => session.id === id)?.count !== 2) throw new Error('增量计数错误')
+    appendFileSync(join(dir, `${id}.jsonl`), JSON.stringify({ role: 'user', content: 'external' }) + '\n')
+    if (store.listSessions(10).find((session) => session.id === id)?.count !== 3) throw new Error('外部修改后缓存未失效')
+  })
+
+  await check('会话: 存档目录删除后自动重建', async () => {
+    const dir = join(TMP, 'sessions-recreated')
+    const store = new SessionStore(dir)
+    const id = '20260809-120075-recreated'
+    store.append(id, [{ role: 'user', content: 'before' }])
+    rmSync(dir, { recursive: true, force: true })
+    store.append(id, [{ role: 'user', content: 'after' }])
+    const recovered = store.recoverById(id)
+    if (recovered?.messages.length !== 1 || recovered.messages[0].content !== 'after') throw new Error('存档目录未重建')
   })
 
   await check('会话: 坏行跳过', async () => {
@@ -208,6 +231,15 @@ async function main() {
     const index = buildNotesIndex(userDir, projDir)
     if (!index.includes('[项目知识](1条)') || !index.includes('- 技术栈')) throw new Error(`索引缺失: ${index}`)
     if (!index.includes('[用户偏好](1条)') || !index.includes('- 喜欢简洁回答')) throw new Error('用户笔记未入索引')
+  })
+
+  await check('笔记: 索引缓存随文件修改失效', () => {
+    const userDir = join(TMP, 'mem_user')
+    const projDir = join(TMP, 'mem_proj')
+    const file = readdirFiles(projDir)[0]
+    writeFileSync(file, readFileSync(file, 'utf8').replace('TypeScript + Node', 'Rust + Tokio + Axum'), 'utf8')
+    const index = buildNotesIndex(userDir, projDir)
+    if (!index.includes('Rust + Tokio + Axum')) throw new Error(`缓存未失效: ${index}`)
   })
 
   rmSync(TMP, { recursive: true, force: true })

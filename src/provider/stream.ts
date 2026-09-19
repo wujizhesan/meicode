@@ -1,4 +1,3 @@
-import { withIdleTimeout } from './timeout.ts'
 import type { StreamEvent } from './types.ts'
 
 const DEFAULT_IDLE_TIMEOUT_MS = 30_000
@@ -29,11 +28,27 @@ export function linkAbortSignal(signal?: AbortSignal): LinkedAbortController {
 
 export async function getResponseErrorDetail(response: Response): Promise<string> {
   let detail = `HTTP ${response.status}`
+  const reader = response.body?.getReader()
+  if (!reader) return detail
+  const decoder = new TextDecoder()
+  let body = ''
+  let bytesRead = 0
   try {
-    const body = await response.text()
+    while (body.length < 500 && bytesRead < 4096) {
+      const result = await reader.read()
+      if (result.done) break
+      const remaining = 4096 - bytesRead
+      const value = result.value.subarray(0, remaining)
+      bytesRead += value.length
+      body += decoder.decode(value, { stream: true })
+      if (value.length < result.value.length) break
+    }
+    body += decoder.decode()
     if (body) detail += `: ${body.slice(0, 500)}`
   } catch {
     return detail
+  } finally {
+    await reader.cancel().catch(() => undefined)
   }
   return detail
 }
@@ -75,14 +90,35 @@ export async function* readResponseStream(
   }
 
   signal?.addEventListener('abort', abort, { once: true })
+  let waitingSince: number | undefined
+  let timedOut = false
+  const watchdog = setInterval(() => {
+    if (waitingSince !== undefined && Date.now() - waitingSince >= idleTimeoutMs) {
+      timedOut = true
+      void reader.cancel().catch(() => undefined)
+    }
+  }, Math.min(Math.max(idleTimeoutMs, 1), 1000))
   try {
     if (signal?.aborted) await reader.cancel()
     while (true) {
-      const { done, value } = await withIdleTimeout(reader.read(), idleTimeoutMs)
+      timedOut = false
+      waitingSince = Date.now()
+      let result: Awaited<ReturnType<typeof reader.read>>
+      try {
+        result = await reader.read()
+      } catch (error) {
+        if (timedOut) throw new Error(`流式读取超时（${idleTimeoutMs / 1000}s 无数据）`)
+        throw error
+      } finally {
+        waitingSince = undefined
+      }
+      if (timedOut) throw new Error(`流式读取超时（${idleTimeoutMs / 1000}s 无数据）`)
+      const { done, value } = result
       if (done) return
       yield value
     }
   } finally {
+    clearInterval(watchdog)
     signal?.removeEventListener('abort', abort)
     await reader.cancel().catch(() => undefined)
   }

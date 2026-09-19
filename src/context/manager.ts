@@ -1,4 +1,4 @@
-import type { Provider } from '../provider/types.ts'
+import type { ChatMessage, Provider } from '../provider/types.ts'
 import type { History } from '../session/history.ts'
 import type { HookEngine } from '../hook/engine.ts'
 import { TokenEstimator } from './estimate.ts'
@@ -38,6 +38,10 @@ export class ContextManager {
   private autoMargin: number
   private manualMargin: number
   private lastInputTokens: number | undefined
+  private estimateVersion = -1
+  private estimatedTokens = 0
+  private spillVersion = -1
+  private spillLength = 0
   lastSummary: string | null = null
 
   constructor(opts: ContextManagerOptions) {
@@ -56,7 +60,7 @@ export class ContextManager {
 
   snapshot(): ContextBudgetSnapshot {
     const messages = this.history.view()
-    const estimatedTokens = this.estimator.estimate(messages)
+    const estimatedTokens = this.estimate(messages)
     return {
       window: this.window,
       estimatedTokens,
@@ -72,8 +76,13 @@ export class ContextManager {
   async beforeRequest(mode: 'auto' | 'manual'): Promise<void> {
     // ① 轻量预防：扫描未存盘的大 tool 消息 → 存盘
     let msgs = this.history.view()
+    const historyVersion = this.history.version
+    const appendedOnly = this.spillVersion >= 0
+      && historyVersion - this.spillVersion === msgs.length - this.spillLength
+      && msgs.length >= this.spillLength
+    const scanStart = appendedOnly ? this.spillLength : 0
     let didSpill = false
-    for (let i = 0; i < msgs.length; i++) {
+    for (let i = scanStart; i < msgs.length; i++) {
       const m = msgs[i]
       if (m.role === 'tool' && needsSpill(m.content) && !m.content.includes('[已存盘]')) {
         const [spilled] = await spillBatch([{ content: m.content }], this.cwd)
@@ -82,11 +91,13 @@ export class ContextManager {
       }
     }
     if (didSpill) msgs = this.history.view()
+    this.spillVersion = this.history.version
+    this.spillLength = msgs.length
 
     // ② 重量兜底：估算超限 → 摘要
     const margin = mode === 'manual' ? this.manualMargin : this.autoMargin
     if (this.breakerOpen && mode === 'auto') return
-    const total = this.estimator.estimate(msgs)
+    const total = this.estimate(msgs)
     if (total <= this.window - margin) return
 
     // 保留尾部：约 1 万 token 或 ≥5 条；小窗口下按窗口 10% 收缩（防 keep 大于窗口）
@@ -103,6 +114,8 @@ export class ContextManager {
       const summary = await summarize(this.provider, drop, { cwd: this.cwd, timeoutMs: 60000 })
       this.lastSummary = summary
       this.history.replaceRange(0, drop.length, [summaryMessage(summary), boundaryMessage()])
+      this.spillVersion = this.history.version
+      this.spillLength = this.history.length
       this.failCount = 0
       this.breakerOpen = false
       // post_compact hook：压缩完成（校验/记录）
@@ -122,6 +135,15 @@ export class ContextManager {
   afterRequest(usageInputTokens: number, messageCount: number): void {
     this.lastInputTokens = usageInputTokens
     this.estimator.update(usageInputTokens, messageCount)
+    this.estimateVersion = -1
+  }
+
+  private estimate(messages: readonly ChatMessage[]): number {
+    if (this.estimateVersion !== this.history.version) {
+      this.estimatedTokens = this.estimator.estimate(messages)
+      this.estimateVersion = this.history.version
+    }
+    return this.estimatedTokens
   }
 }
 

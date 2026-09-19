@@ -1,5 +1,5 @@
 // Workflow 系统测试：DSL 加载/校验/运行记录（对齐 Zcode .workflow.js DSL）
-import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, rmSync, writeFileSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { loadWorkflow, ensureWorkflowDirs, listWorkflows, workflowPath, WORKFLOW_TEMPLATE } from '../src/workflow/loader.ts'
 import { validateWorkflowMeta } from '../src/workflow/validate.ts'
@@ -96,8 +96,25 @@ async function main() {
     saveRun(TMP, rec)
     assert(loadRun(TMP, 'wf-test1')?.status === 'completed', '加载失败')
     assert(listRuns(TMP).some((r) => r.runId === 'wf-test1'), '列表缺失')
+    const listed = listRuns(TMP)
+    listed[0].phases[0].title = 'cache-poison'
+    assert(listRuns(TMP)[0].phases[0].title !== 'cache-poison', '运行记录缓存被调用方污染')
+    const file = join(runsDir(TMP), 'wf-test1.json')
+    writeFileSync(file, readFileSync(file, 'utf8').replace('"workflow": "demo"', '"workflow": "next"'), 'utf8')
+    assert(listRuns(TMP)[0].workflow === 'next', '同尺寸运行记录修改未使缓存失效')
     assert(loadRun(TMP, 'nope') === null, '不存在应 null')
     assert(runsDir(TMP).includes('runs'), 'runsDir 路径错')
+  })
+  await check('store: 运行目录删除后自动重建', () => {
+    rmSync(runsDir(TMP), { recursive: true, force: true })
+    saveRun(TMP, {
+      runId: 'wf-recreated',
+      workflow: 'demo',
+      status: 'running',
+      phases: [],
+      createdAt: Date.now(),
+    })
+    assert(loadRun(TMP, 'wf-recreated')?.status === 'running', '运行目录未重建')
   })
 
   // ---------- runner e2e ----------

@@ -9,6 +9,7 @@ import { createTools, ToolRegistry } from '../src/tools/index.ts'
 import { RuleEngine } from '../src/permission/index.ts'
 import type { ChatMessage, Provider, StreamEvent } from '../src/provider/types.ts'
 import type { ToolContext } from '../src/tools/index.ts'
+import { RuntimeEventLog } from '../src/runtime/index.ts'
 
 let passed = 0
 let failed = 0
@@ -109,6 +110,32 @@ async function main() {
     const output = events.filter((event) => event.type === 'text').map((event) => event.text).join('')
     if (output !== chunks.join('')) throw new Error(`事件流丢失或乱序: ${output.length}/${chunks.length}`)
     if (result.finalText !== output) throw new Error('最终文本与事件流不一致')
+  })
+  await check('历史清洗缓存: 增量追加并在结构替换后失效', async () => {
+    let round = 0
+    const p = new FakeAgentProvider(() => {
+      round++
+      if (round === 1) {
+        return { events: [{ type: 'tool_call', id: 'cache_call', name: 'read_file', arguments: { path: 'package.json' } }, { type: 'done' }] }
+      }
+      return { events: [{ type: 'text', text: '完成' }, { type: 'done' }] }
+    })
+    const history = new History()
+    history.push({ role: 'user', content: '原始问题' })
+    let request = 0
+    await consume(runAgent({
+      ...baseOpts(p, history),
+      ctx: {
+        ...ctx,
+        beforeRequest: async () => {
+          request++
+          if (request === 2) history.replaceRange(0, 1, [{ role: 'user', content: '替换后的问题' }])
+        },
+      },
+    }))
+    const second = p.capturedAll[1] ?? []
+    if (!second.some((message) => message.content === '替换后的问题')) throw new Error('结构替换后仍使用旧缓存')
+    if (!second.some((message) => message.role === 'tool' && message.tool_call_id === 'cache_call')) throw new Error('增量工具结果未进入请求历史')
   })
   await check('teamBusy: 纯文本轮+团队忙不判 complete(防"[等待]"当最终输出)', async () => {
     // 第一轮: 纯文本+团队忙 → 不 complete,注入提示继续;第二轮: 纯文本+团队闲 → complete
@@ -577,6 +604,41 @@ async function main() {
     const toolMsg = history.all().find((m) => m.role === 'tool')
     if (!toolMsg || !toolMsg.content.includes('用户拒绝')) throw new Error(`拒绝未回灌: ${JSON.stringify(toolMsg)}`)
     if (result.reason !== 'complete') throw new Error('循环应继续')
+  })
+
+  await check('运行时事件: 连续工具调用批量落盘', async () => {
+    const eventDir = join(process.cwd(), 'test', 'fixtures_loop_events')
+    rmSync(eventDir, { recursive: true, force: true })
+    class CountingRuntimeEventLog extends RuntimeEventLog {
+      batches: string[][] = []
+
+      override appendBatch(inputs: Parameters<RuntimeEventLog['appendBatch']>[0]) {
+        this.batches.push(inputs.map((input) => input.type))
+        return super.appendBatch(inputs)
+      }
+    }
+    const runtimeEvents = new CountingRuntimeEventLog(eventDir)
+    let round = 0
+    const p = new FakeAgentProvider(() => {
+      round++
+      return round === 1
+        ? { events: [
+            { type: 'tool_call', id: 'batch_1', name: 'read_file', arguments: { path: 'package.json' } },
+            { type: 'tool_call', id: 'batch_2', name: 'read_file', arguments: { path: 'tsconfig.json' } },
+            { type: 'done' },
+          ] }
+        : { events: [{ type: 'text', text: '完成' }, { type: 'done' }] }
+    })
+    const history = new History()
+    history.push({ role: 'user', content: '读取文件' })
+    const { result } = await consume(runAgent({
+      ...baseOpts(p, history),
+      ctx: { ...ctx, sessionId: 'batch-runtime-events', runtimeEvents },
+    }))
+    rmSync(eventDir, { recursive: true, force: true })
+    if (result.evidence.files.length !== 2) throw new Error('Agent 结果未携带执行期工具证据')
+    if (!runtimeEvents.batches.some((types) => types.join(',') === 'turn_started,context_snapshot,model_request')) throw new Error('轮次起始事件未与请求快照批量写入')
+    if (!runtimeEvents.batches.some((types) => types.join(',') === 'tool_call,tool_call')) throw new Error('连续工具调用未批量写入运行时日志')
   })
 
   // ---------- buildPrompt ----------

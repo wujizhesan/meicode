@@ -1,4 +1,5 @@
-import { writeFileSync, readFileSync, rmSync, openSync, closeSync } from 'node:fs'
+import { readFileSync, rmSync, openSync, closeSync, statSync, mkdirSync } from 'node:fs'
+import { dirname } from 'node:path'
 
 const LOCK_TTL_MS = 30000
 const MAX_RETRY = 50
@@ -14,11 +15,14 @@ export function withLock(lockFile: string, fn: () => void): void {
   for (let attempt = 0; attempt < MAX_RETRY; attempt++) {
     try {
       const fd = openSync(lockFile, 'wx')
-      writeFileSync(fd, String(Date.now()), 'utf8')
       closeSync(fd)
       acquired = true
       break
-    } catch {
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+        mkdirSync(dirname(lockFile), { recursive: true })
+        continue
+      }
       // 已存在：检查 TTL
     }
     let ts: number | null = null
@@ -27,11 +31,16 @@ export function withLock(lockFile: string, fn: () => void): void {
       if (Number.isFinite(value) && value > 0) ts = value
     } catch {
     }
+    if (ts === null) {
+      try {
+        ts = statSync(lockFile).mtimeMs
+      } catch {
+      }
+    }
     if (ts !== null && Date.now() - ts > LOCK_TTL_MS) {
       try {
         rmSync(lockFile, { force: true })
         const fd = openSync(lockFile, 'wx')
-        writeFileSync(fd, String(Date.now()), 'utf8')
         closeSync(fd)
         acquired = true
         break

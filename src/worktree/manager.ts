@@ -38,7 +38,6 @@ export class WorktreeManager {
   constructor(repoRoot: string) {
     this.repoRoot = repoRoot
     this.root = join(repoRoot, '.mewcode', 'worktrees')
-    mkdirSync(this.root, { recursive: true })
   }
 
   getRoot(): string {
@@ -49,6 +48,7 @@ export class WorktreeManager {
     if (!validateWorktreeName(name)) {
       throw new Error(`非法 worktree 名称: ${name}`)
     }
+    mkdirSync(this.root, { recursive: true })
     const path = resolve(join(this.root, name))
     // 快速恢复：目录已存在且 git 在册 → 复用（不执行 git 写）
     if (existsSync(path)) {
@@ -150,8 +150,9 @@ export class WorktreeManager {
     const dayMs = days * 24 * 3600 * 1000
     for (const entry of readdirSync(this.root)) {
       const path = join(this.root, entry)
-      if (!statSync(path).isDirectory()) continue
-      const age = Date.now() - statSync(path).mtimeMs
+      const stats = statSync(path)
+      if (!stats.isDirectory()) continue
+      const age = Date.now() - stats.mtimeMs
       if (age > dayMs) {
         try {
           const info = await this.exit(entry)

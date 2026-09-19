@@ -18,7 +18,6 @@ import { buildPrompt } from './agent/prompt/index.ts'
 import { buildNotesIndex } from './memory/notes.ts'
 import type { ToolContext } from './tools/index.ts'
 import { TeamManager } from './team/index.ts'
-import { createA2aTools } from './a2a/tools.ts'
 import { initLogger, log } from './log.ts'
 import type { MemoryContext } from './tui/useStream.ts'
 import type { ProviderConfig } from './config/types.ts'
@@ -63,7 +62,10 @@ export async function main(): Promise<void> {
   const history = new History()
   const registry = new ToolRegistry()
   createTools({ cwd: process.cwd() }).forEach((t) => registry.register(t))
-  createA2aTools(a2aAgents).forEach((t) => registry.register(t))
+  if (a2aAgents.length > 0) {
+    const { createA2aTools } = await import('./a2a/tools.ts')
+    createA2aTools(a2aAgents).forEach((t) => registry.register(t))
+  }
   const engine = new RuleEngine(
     join(homedir(), '.mewcode', 'rules.yaml'),
     join(process.cwd(), '.mewcode', 'rules.yaml'),
@@ -157,7 +159,7 @@ export async function main(): Promise<void> {
     console.warn('[团队] coordinator 模式已启用——Lead 写文件工具已剥夺')
   }
   // 跨重启恢复团队成员(workdir/history 复用)
-  const restored = await teamManager.restore()
+  const restored = await teamManager.restore(subAgentManager.listRoles())
   if (restored.length > 0) {
     console.log(`[团队] 已恢复 ${restored.length} 个成员: ${restored.join(', ')}`)
   }

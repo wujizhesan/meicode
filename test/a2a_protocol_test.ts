@@ -88,8 +88,13 @@ await check('A2aTaskStore: 深拷贝持久化并支持删除', () => {
     const loaded = store.load()
     assert(loaded[0]?.task.history[0]?.parts[0]?.text === 'original', '持久化数据被外部修改')
     assert(loaded[0]?.pushNotificationConfigs[0]?.id === 'push-1', 'Push 配置未恢复')
+    loaded[0].task.history[0].parts[0].text = 'cache-mutated'
+    assert(store.load()[0]?.task.history[0]?.parts[0]?.text === 'original', '缓存被调用方修改')
+    const peer = new A2aTaskStore(root)
+    peer.save({ ...task, id: 'task-2', contextId: 'ctx-2' })
+    assert(store.load().some((item) => item.task.id === 'task-2'), '缓存未识别跨实例写入')
     store.remove(task.id)
-    assert(store.load().length === 0, '任务未删除')
+    assert(store.load().length === 1 && store.load()[0].task.id === 'task-2', '任务未删除')
   } finally {
     rmSync(root, { recursive: true, force: true })
   }

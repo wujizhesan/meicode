@@ -6,11 +6,22 @@ const HOUR = 3600 * 1000
 const DAY = 24 * HOUR
 const SESSION_ID_RE = /^[A-Za-z0-9_-]{1,128}$/
 
-function countNonEmptyLines(text: string): number {
+interface SessionCountSnapshot {
+  size: number
+  mtimeMs: number
+  ctimeMs: number
+  count: number
+}
+
+function matchesSnapshot(snapshot: SessionCountSnapshot, stats: { size: number; mtimeMs: number; ctimeMs: number }): boolean {
+  return snapshot.size === stats.size && snapshot.mtimeMs === stats.mtimeMs && snapshot.ctimeMs === stats.ctimeMs
+}
+
+function countNonEmptyLines(content: Buffer): number {
   let count = 0
   let hasContent = false
-  for (let i = 0; i < text.length; i++) {
-    const char = text.charCodeAt(i)
+  for (let i = 0; i < content.length; i++) {
+    const char = content[i]
     if (char === 10) {
       if (hasContent) count++
       hasContent = false
@@ -72,10 +83,17 @@ export function newSessionId(): string {
 
 export class SessionStore {
   private dir: string
+  private countCache = new Map<string, SessionCountSnapshot>()
+  private dirReady = false
 
   constructor(dir: string) {
     this.dir = dir
-    mkdirSync(dir, { recursive: true })
+  }
+
+  private ensureDir(): void {
+    if (this.dirReady) return
+    mkdirSync(this.dir, { recursive: true })
+    this.dirReady = true
   }
 
   private fileFor(id: string): string | null {
@@ -95,11 +113,37 @@ export class SessionStore {
     if (messages.length === 0) return
     const file = this.fileFor(id)
     if (!file) throw new Error('非法会话 ID')
-    appendFileSync(file, messages.map((message) => JSON.stringify(message)).join('\n') + '\n', 'utf8')
+    this.ensureDir()
+    let before: ReturnType<typeof statSync> | null = null
+    try {
+      before = statSync(file)
+    } catch {
+    }
+    const cached = this.countCache.get(file)
+    const content = messages.map((message) => JSON.stringify(message)).join('\n') + '\n'
+    try {
+      appendFileSync(file, content, 'utf8')
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+      this.dirReady = false
+      this.countCache.delete(file)
+      this.ensureDir()
+      before = null
+      appendFileSync(file, content, 'utf8')
+    }
+    const after = statSync(file)
+    if (!before) {
+      this.countCache.set(file, { size: after.size, mtimeMs: after.mtimeMs, ctimeMs: after.ctimeMs, count: messages.length })
+    } else if (cached && matchesSnapshot(cached, before)) {
+      this.countCache.set(file, { size: after.size, mtimeMs: after.mtimeMs, ctimeMs: after.ctimeMs, count: cached.count + messages.length })
+    } else {
+      this.countCache.delete(file)
+    }
   }
 
   // 恢复：坏行跳过、工具调用无结果截断
   recoverLatest(): { id: string; messages: ChatMessage[] } | null {
+    if (!existsSync(this.dir)) return null
     const files = readdirSync(this.dir)
       .filter((f) => f.endsWith('.jsonl') && SESSION_ID_RE.test(f.slice(0, -'.jsonl'.length)))
       .sort()
@@ -110,17 +154,36 @@ export class SessionStore {
 
   recoverById(id: string): { id: string; messages: ChatMessage[] } | null {
     const file = this.fileFor(id)
-    if (!file || !existsSync(file)) return null
-    const raw = readFileSync(file, 'utf8')
+    if (!file) return null
+    let stats: ReturnType<typeof statSync>
+    let raw: string
+    try {
+      stats = statSync(file)
+      raw = readFileSync(file, 'utf8')
+    } catch {
+      return null
+    }
     const messages: ChatMessage[] = []
-    for (const line of raw.split('\n')) {
+    let lineCount = 0
+    let needsSanitization = false
+    let lineStart = 0
+    while (lineStart < raw.length) {
+      const newline = raw.indexOf('\n', lineStart)
+      const lineEnd = newline < 0 ? raw.length : newline
+      const line = raw.slice(lineStart, lineEnd)
+      lineStart = lineEnd + 1
       if (!line.trim()) continue
+      lineCount++
       try {
-        messages.push(JSON.parse(line))
+        const message = JSON.parse(line) as ChatMessage
+        messages.push(message)
+        if (message.role === 'tool' || (message.role === 'assistant' && message.tool_calls?.length)) needsSanitization = true
       } catch {
         continue // 坏行跳过
       }
     }
+    this.countCache.set(file, { size: stats.size, mtimeMs: stats.mtimeMs, ctimeMs: stats.ctimeMs, count: lineCount })
+    if (!needsSanitization) return { id, messages }
 
     // 截断：从尾部回溯，找到最后一个完整的「assistant(tool_calls) → tool 结果」轮
     let cut = messages.length
@@ -149,6 +212,7 @@ export class SessionStore {
   }
 
   listSessions(limit = 5): { id: string; count: number; mtime: number }[] {
+    if (!existsSync(this.dir)) return []
     return readdirSync(this.dir)
       .filter((f) => f.endsWith('.jsonl') && SESSION_ID_RE.test(f.slice(0, -'.jsonl'.length)))
       .sort()
@@ -158,14 +222,17 @@ export class SessionStore {
         const id = f.replace(/\.jsonl$/, '')
         const file = this.fileFor(id)
         if (!file) return { id, count: 0, mtime: 0 }
-        const count = countNonEmptyLines(readFileSync(file, 'utf8'))
-        let mtime = 0
         try {
-          mtime = statSync(file).mtimeMs
+          const stats = statSync(file)
+          const cached = this.countCache.get(file)
+          const count = cached && matchesSnapshot(cached, stats) ? cached.count : countNonEmptyLines(readFileSync(file))
+          if (!cached || !matchesSnapshot(cached, stats)) {
+            this.countCache.set(file, { size: stats.size, mtimeMs: stats.mtimeMs, ctimeMs: stats.ctimeMs, count })
+          }
+          return { id, count, mtime: stats.mtimeMs }
         } catch {
-          // 读取失败按 0
+          return { id, count: 0, mtime: 0 }
         }
-        return { id, count, mtime }
       })
   }
 
@@ -174,14 +241,20 @@ export class SessionStore {
     const file = this.fileFor(id)
     if (!file || !existsSync(file)) return false
     rmSync(file, { force: true })
+    this.countCache.delete(file)
     return true
   }
 
   // 距上次活动 >24h 的提醒消息
   timeGapMessage(id: string): ChatMessage | null {
     const file = this.fileFor(id)
-    if (!file || !existsSync(file)) return null
-    const mtime = statSync(file).mtimeMs
+    if (!file) return null
+    let mtime: number
+    try {
+      mtime = statSync(file).mtimeMs
+    } catch {
+      return null
+    }
     const gap = Date.now() - mtime
     if (gap <= 24 * HOUR) return null
     const days = Math.floor(gap / DAY)
@@ -192,6 +265,7 @@ export class SessionStore {
   }
 
   cleanup(olderThanDays = 30): number {
+    if (!existsSync(this.dir)) return 0
     let removed = 0
     for (const f of readdirSync(this.dir)) {
       if (!f.endsWith('.jsonl') || !SESSION_ID_RE.test(f.slice(0, -'.jsonl'.length))) continue
@@ -200,6 +274,7 @@ export class SessionStore {
       const age = Date.now() - statSync(file).mtimeMs
       if (age > olderThanDays * DAY) {
         rmSync(file, { force: true })
+        this.countCache.delete(file)
         removed++
       }
     }

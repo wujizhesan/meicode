@@ -16,7 +16,7 @@ import type { TeamManager } from '../team/index.ts'
 import { resolveMode } from './mode.ts'
 import type { RuntimeEventLog } from '../runtime/index.ts'
 import { createRuntimeId } from '../runtime/index.ts'
-import { createStreamBuffer } from './stream-buffer.ts'
+import { createStreamBuffer, streamFlushDelay } from './stream-buffer.ts'
 
 export interface MemoryContext {
   sessionStore?: SessionStore
@@ -278,19 +278,22 @@ export function useStreamingChat(
     let appendIdx = startLen
     const appendIncremental = () => {
       if (!memory?.sessionStore || !memory.sessionId) return
-      const all = history.all()
+      const all = history.view()
       if (appendIdx >= all.length) return
       memory.sessionStore.append(memory.sessionId, all.slice(appendIdx))
       appendIdx = all.length
     }
 
-    const streamBuffer = createStreamBuffer(({ text: textChunk, thinking: thinkingChunk }) => {
-      updateLast((message) => ({
-        ...message,
-        text: message.text + textChunk,
-        thinking: (message.thinking ?? '') + thinkingChunk,
-      }))
-    })
+    const streamBuffer = createStreamBuffer(
+      ({ text: textChunk, thinking: thinkingChunk }) => {
+        updateLast((message) => ({
+          ...message,
+          text: message.text + textChunk,
+          thinking: (message.thinking ?? '') + thinkingChunk,
+        }))
+      },
+      streamFlushDelay(messages.length),
+    )
 
     try {
       let lastRound = 0
@@ -334,7 +337,7 @@ export function useStreamingChat(
           else if (ev.reason === 'error') setError(ev.errorMessage ?? '流错误，已停止')
           // P8：自然停后异步笔记（不阻塞 UI，失败静默）
           if (ev.reason === 'complete' && toolCallCount === 0 && memory?.noteUserDir && memory?.noteProjectDir) {
-            const recent = history.all().slice(-6)
+            const recent = history.view().slice(-6)
             updateNotes(provider, recent, { userDir: memory.noteUserDir, projectDir: memory.noteProjectDir }).catch(() => {})
           }
         }
@@ -369,10 +372,10 @@ export function useStreamingChat(
       if (skillManager) skillManager.lastActivated = null
 
       // P11：message 事件（本轮新消息）
-      const newMsg = history.all().slice(startLen)
-      if (newMsg.length > 0) {
+      const currentHistory = history.view()
+      if (startLen < currentHistory.length) {
         try {
-          await hooks?.fire('message', { cwd: process.cwd(), message: newMsg[0] })
+          await hooks?.fire('message', { cwd: process.cwd(), message: currentHistory[startLen] })
         } catch {
           // Hook 失败不中断
         }
@@ -385,7 +388,7 @@ export function useStreamingChat(
       // P8：会话存档（增量 JSONL 追加——即时落盘已写大部分,这里兜底剩余）
       if (memory?.sessionStore && memory.sessionId) {
         try {
-          const all = history.all()
+          const all = history.view()
           if (appendIdx < all.length) memory.sessionStore.append(memory.sessionId, all.slice(appendIdx))
         } catch {
           // 存档失败静默

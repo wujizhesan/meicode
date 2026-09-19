@@ -1,4 +1,4 @@
-import { readdirSync, readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs'
+import { readdirSync, readFileSync, writeFileSync, mkdirSync, existsSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 import type { ChatMessage, Provider } from '../provider/types.ts'
 
@@ -31,20 +31,50 @@ const NOTES_PROMPT = `你是 MeiCode 的记忆整理器。分析最近一轮对�
 - 参考下方现有记忆索引——标题已存在的用 action=update（更新内容），否则 create
 - 不值得长期记住的（一次性对话、临时任务）输出 {"notes":[]}`
 
+interface CachedNoteMeta {
+  mtimeMs: number
+  ctimeMs: number
+  size: number
+  category: string
+  title: string
+  firstLine: string
+}
+
+const noteMetaCache = new Map<string, CachedNoteMeta>()
+const noteTitleCache = new Map<string, Map<string, string>>()
+
+function readNoteMeta(file: string, fallbackTitle: string): CachedNoteMeta {
+  const stat = statSync(file)
+  const cached = noteMetaCache.get(file)
+  if (cached && cached.mtimeMs === stat.mtimeMs && cached.ctimeMs === stat.ctimeMs && cached.size === stat.size) return cached
+  const content = readFileSync(file, 'utf8')
+  const meta: CachedNoteMeta = {
+    mtimeMs: stat.mtimeMs,
+    ctimeMs: stat.ctimeMs,
+    size: stat.size,
+    category: content.match(/^category:\s*(.+)$/m)?.[1] ?? 'other',
+    title: content.match(/^title:\s*(.+)$/m)?.[1] ?? fallbackTitle,
+    firstLine: content.split('\n').find((line) => line.trim() && !line.startsWith('---') && !line.includes(':'))?.trim() ?? '',
+  }
+  noteMetaCache.set(file, meta)
+  return meta
+}
+
 export function buildNotesIndex(userDir: string, projectDir: string): string {
   // 按类别分组（对齐 Qoder 结构化记忆）：模型找"用户偏好/踩坑"直接定位,不扫全量
   const byCat = new Map<string, string[]>()
   for (const dir of [projectDir, userDir]) {
     if (!existsSync(dir)) continue
+    const titles = new Map<string, string>()
     for (const f of readdirSync(dir).filter((f) => f.endsWith('.md') && f !== 'index.md').sort()) {
-      const content = readFileSync(join(dir, f), 'utf8')
-      const cat = content.match(/^category:\s*(.+)$/m)?.[1] ?? 'other'
-      const title = content.match(/^title:\s*(.+)$/m)?.[1] ?? f
-      const firstLine = content.split('\n').find((l) => l.trim() && !l.startsWith('---') && !l.includes(':'))?.trim() ?? ''
-      const list = byCat.get(cat) ?? []
-      list.push(`- ${title} — ${firstLine.slice(0, 80)}`)
-      byCat.set(cat, list)
+      const file = join(dir, f)
+      const meta = readNoteMeta(file, f)
+      if (!titles.has(meta.title)) titles.set(meta.title, file)
+      const list = byCat.get(meta.category) ?? []
+      list.push(`- ${meta.title} — ${meta.firstLine.slice(0, 80)}`)
+      byCat.set(meta.category, list)
     }
+    noteTitleCache.set(dir, titles)
   }
   const CAT_LABEL: Record<string, string> = {
     user_pref: '用户偏好',
@@ -118,9 +148,12 @@ export async function updateNotes(
 
 function findNoteByTitle(dir: string, title: string): string | null {
   if (!existsSync(dir)) return null
+  const indexed = noteTitleCache.get(dir)?.get(title)
+  if (indexed && existsSync(indexed) && readNoteMeta(indexed, title).title === title) return indexed
   for (const f of readdirSync(dir).filter((f) => f.endsWith('.md') && f !== 'index.md')) {
-    const content = readFileSync(join(dir, f), 'utf8')
-    if (content.includes(`title: ${title}`)) return join(dir, f)
+    const file = join(dir, f)
+    if (file === indexed) continue
+    if (readNoteMeta(file, f).title === title) return file
   }
   return null
 }

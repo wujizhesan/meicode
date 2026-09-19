@@ -1,7 +1,7 @@
-import { readdirSync, readFileSync, existsSync, statSync } from 'node:fs'
+import { closeSync, existsSync, fstatSync, openSync, readdirSync, readFileSync, statSync, type Dirent } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
-import { parse } from 'yaml'
+import { parseFrontmatter } from '../frontmatter.ts'
 import type { AgentRole, AgentRoleSource } from './types.ts'
 
 interface Frontmatter {
@@ -15,6 +15,47 @@ interface Frontmatter {
   permission?: string
 }
 
+interface CachedAgentRole {
+  size: number
+  mtimeMs: number
+  ctimeMs: number
+  ino: number
+  role: AgentRole | null
+}
+
+const agentRoleCache = new Map<string, CachedAgentRole>()
+
+function cloneAgentRole(role: AgentRole): AgentRole {
+  return {
+    ...role,
+    toolsAllow: role.toolsAllow ? [...role.toolsAllow] : undefined,
+    toolsDeny: role.toolsDeny ? [...role.toolsDeny] : undefined,
+    writePaths: role.writePaths ? [...role.writePaths] : undefined,
+  }
+}
+
+function loadCachedAgentRole(file: string, source: AgentRoleSource): AgentRole | null {
+  const key = `${source}:${file}`
+  let fd: number
+  try {
+    fd = openSync(file, 'r')
+  } catch {
+    return null
+  }
+  try {
+    const stats = fstatSync(fd)
+    const cached = agentRoleCache.get(key)
+    if (cached && cached.size === stats.size && cached.mtimeMs === stats.mtimeMs && cached.ctimeMs === stats.ctimeMs && cached.ino === stats.ino) {
+      return cached.role ? cloneAgentRole(cached.role) : null
+    }
+    const role = parseAgentContent(readFileSync(fd, 'utf8'), file, source)
+    agentRoleCache.set(key, { size: stats.size, mtimeMs: stats.mtimeMs, ctimeMs: stats.ctimeMs, ino: stats.ino, role })
+    return role ? cloneAgentRole(role) : null
+  } finally {
+    closeSync(fd)
+  }
+}
+
 export function parseAgentFile(file: string, source: AgentRoleSource): AgentRole | null {
   let raw: string
   try {
@@ -22,6 +63,10 @@ export function parseAgentFile(file: string, source: AgentRoleSource): AgentRole
   } catch {
     return null
   }
+  return parseAgentContent(raw, file, source)
+}
+
+function parseAgentContent(raw: string, file: string, source: AgentRoleSource): AgentRole | null {
   const m = raw.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/)
   if (!m) {
     console.warn(`[子Agent] 缺少 frontmatter，跳过: ${file}`)
@@ -29,7 +74,7 @@ export function parseAgentFile(file: string, source: AgentRoleSource): AgentRole
   }
   let fm: Frontmatter
   try {
-    fm = (parse(m[1]) ?? {}) as Frontmatter
+    fm = parseFrontmatter<Frontmatter>(m[1])
   } catch (e) {
     console.warn(`[子Agent] frontmatter 解析失败，跳过: ${file}（${(e as Error).message}）`)
     return null
@@ -54,18 +99,29 @@ export function parseAgentFile(file: string, source: AgentRoleSource): AgentRole
 }
 
 function scanAgentsDir(dir: string, source: AgentRoleSource): AgentRole[] {
-  if (!existsSync(dir)) return []
   const out: AgentRole[] = []
-  for (const entry of readdirSync(dir)) {
-    const full = join(dir, entry)
-    if (statSync(full).isDirectory()) {
-      const entryMd = join(full, 'AGENT.md')
-      if (existsSync(entryMd)) {
-        const role = parseAgentFile(entryMd, source)
-        if (role) out.push(role)
+  let entries: Dirent[]
+  try {
+    entries = readdirSync(dir, { withFileTypes: true })
+  } catch {
+    return out
+  }
+  for (const entry of entries) {
+    const full = join(dir, entry.name)
+    let isDirectory = entry.isDirectory()
+    if (entry.isSymbolicLink()) {
+      try {
+        isDirectory = statSync(full).isDirectory()
+      } catch {
+        continue
       }
-    } else if (entry.endsWith('.md')) {
-      const role = parseAgentFile(full, source)
+    }
+    if (isDirectory) {
+      const entryMd = join(full, 'AGENT.md')
+      const role = loadCachedAgentRole(entryMd, source)
+      if (role) out.push(role)
+    } else if (entry.name.endsWith('.md')) {
+      const role = loadCachedAgentRole(full, source)
       if (role) out.push(role)
     }
   }

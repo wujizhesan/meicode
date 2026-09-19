@@ -1,6 +1,6 @@
-import { readdirSync, readFileSync, existsSync, statSync } from 'node:fs'
+import { closeSync, fstatSync, openSync, readdirSync, readFileSync, statSync, type Dirent } from 'node:fs'
 import { join } from 'node:path'
-import { parse } from 'yaml'
+import { parseFrontmatter } from '../frontmatter.ts'
 import type { SkillDef, SkillSource } from './types.ts'
 
 interface Frontmatter {
@@ -12,6 +12,42 @@ interface Frontmatter {
   model?: string
 }
 
+interface CachedSkillDef {
+  size: number
+  mtimeMs: number
+  ctimeMs: number
+  ino: number
+  def: SkillDef | null
+}
+
+const skillDefCache = new Map<string, CachedSkillDef>()
+
+function cloneSkillDef(def: SkillDef): SkillDef {
+  return { ...def, tools: def.tools ? [...def.tools] : undefined }
+}
+
+function loadCachedSkillDef(file: string, source: SkillSource): SkillDef | null {
+  const key = `${source}:${file}`
+  let fd: number
+  try {
+    fd = openSync(file, 'r')
+  } catch {
+    return null
+  }
+  try {
+    const stats = fstatSync(fd)
+    const cached = skillDefCache.get(key)
+    if (cached && cached.size === stats.size && cached.mtimeMs === stats.mtimeMs && cached.ctimeMs === stats.ctimeMs && cached.ino === stats.ino) {
+      return cached.def ? cloneSkillDef(cached.def) : null
+    }
+    const def = parseSkillContent(readFileSync(fd, 'utf8'), file, source)
+    skillDefCache.set(key, { size: stats.size, mtimeMs: stats.mtimeMs, ctimeMs: stats.ctimeMs, ino: stats.ino, def })
+    return def ? cloneSkillDef(def) : null
+  } finally {
+    closeSync(fd)
+  }
+}
+
 export function parseSkillFile(file: string, source: SkillSource): SkillDef | null {
   let raw: string
   try {
@@ -19,6 +55,10 @@ export function parseSkillFile(file: string, source: SkillSource): SkillDef | nu
   } catch {
     return null
   }
+  return parseSkillContent(raw, file, source)
+}
+
+function parseSkillContent(raw: string, file: string, source: SkillSource): SkillDef | null {
   // frontmatter：---\n...\n---
   const m = raw.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/)
   if (!m) {
@@ -27,7 +67,7 @@ export function parseSkillFile(file: string, source: SkillSource): SkillDef | nu
   }
   let fm: Frontmatter
   try {
-    fm = (parse(m[1]) ?? {}) as Frontmatter
+    fm = parseFrontmatter<Frontmatter>(m[1])
   } catch (e) {
     console.warn(`[Skill] frontmatter 解析失败，跳过: ${file}（${(e as Error).message}）`)
     return null
@@ -50,18 +90,29 @@ export function parseSkillFile(file: string, source: SkillSource): SkillDef | nu
 
 // 扫描一个目录：文件型 *.md + 目录型 <name>/SKILL.md
 export function scanDir(dir: string, source: SkillSource): SkillDef[] {
-  if (!existsSync(dir)) return []
   const out: SkillDef[] = []
-  for (const entry of readdirSync(dir)) {
-    const full = join(dir, entry)
-    if (statSync(full).isDirectory()) {
-      const entryMd = join(full, 'SKILL.md')
-      if (existsSync(entryMd)) {
-        const def = parseSkillFile(entryMd, source)
-        if (def) out.push(def)
+  let entries: Dirent[]
+  try {
+    entries = readdirSync(dir, { withFileTypes: true })
+  } catch {
+    return out
+  }
+  for (const entry of entries) {
+    const full = join(dir, entry.name)
+    let isDirectory = entry.isDirectory()
+    if (entry.isSymbolicLink()) {
+      try {
+        isDirectory = statSync(full).isDirectory()
+      } catch {
+        continue
       }
-    } else if (entry.endsWith('.md')) {
-      const def = parseSkillFile(full, source)
+    }
+    if (isDirectory) {
+      const entryMd = join(full, 'SKILL.md')
+      const def = loadCachedSkillDef(entryMd, source)
+      if (def) out.push(def)
+    } else if (entry.name.endsWith('.md')) {
+      const def = loadCachedSkillDef(full, source)
       if (def) out.push(def)
     }
   }

@@ -8,6 +8,7 @@ import { buildSystemPrompt, buildEnvironmentInfo, sessionDirective } from './pro
 import { checkPermission } from '../permission/index.ts'
 import type { Rule } from '../permission/types.ts'
 import type { RuntimeEventInput } from '../runtime/index.ts'
+import { RuntimeEvidenceAccumulator } from '../runtime/index.ts'
 
 const READ_ONLY_TOOLS = new Set(['read_file', 'find_files', 'grep_code'])
 // 写类工具:重复检测阈值(5 次)——写死循环仍止损,但写同一文件迭代(报告草稿/读回再写)是合法场景,
@@ -23,10 +24,39 @@ function emitRuntimeEvent(ctx: ToolContext, input: Omit<RuntimeEventInput, 'sess
   }
 }
 
+function emitRuntimeEvents(ctx: ToolContext, inputs: readonly Omit<RuntimeEventInput, 'sessionId'>[]): void {
+  const sessionId = ctx.sessionId ?? ctx.agentId
+  if (!ctx.runtimeEvents || !sessionId) return
+  try {
+    ctx.runtimeEvents.appendBatch(inputs.map((input) => ({ ...input, sessionId })))
+  } catch {
+  }
+}
+
 export function runAgent(opts: AgentOptions): AgentHandle {
   const { provider, history, registry, ctx, maxIterations, mode, unknownToolLimit } = opts
   const controller = new AbortController()
   const toolCtx: ToolContext = { ...ctx, signal: controller.signal }
+  let sanitizedHistory: ChatMessage[] = []
+  let sanitizedSourceLength = 0
+  let sanitizedVersion = -1
+  let sanitizedStructureVersion = -1
+  let sanitizedSourceValid = true
+
+  const getSanitizedHistory = (): readonly ChatMessage[] => {
+    if (sanitizedVersion === history.version) return sanitizedHistory
+    const source = history.view()
+    if (sanitizedStructureVersion !== history.structureVersion || !sanitizedSourceValid || source.length < sanitizedSourceLength) {
+      sanitizedHistory = sanitizeMessages(source)
+    } else if (source.length > sanitizedSourceLength) {
+      sanitizedHistory.push(...sanitizeMessages(source.slice(sanitizedSourceLength)))
+    }
+    sanitizedSourceLength = source.length
+    sanitizedSourceValid = sanitizedHistory.length === source.length
+    sanitizedVersion = history.version
+    sanitizedStructureVersion = history.structureVersion
+    return sanitizedHistory
+  }
 
   // ---------- 事件流 ----------
   const eventQueue: AgentEvent[] = []
@@ -74,6 +104,7 @@ export function runAgent(opts: AgentOptions): AgentHandle {
     let reason: StopReason = 'complete'
     let roundErrorMessage: string | null = null
     let fatalError: string | null = null
+    const evidence = new RuntimeEvidenceAccumulator()
     let toolFailStreak = 0
     let compactRetries = 0 // 超限自动压缩重试计数(最多 2 次)
     // 重复工具调用检测(对齐 Zcode):最近窗口内同一签名 ≥3 次 → 停止(防死循环烧 token)
@@ -106,16 +137,16 @@ export function runAgent(opts: AgentOptions): AgentHandle {
       const hookInjections = ctx.hooks?.collectInjections() ?? []
 
       const roundCalls: Extract<StreamEvent, { type: 'tool_call' }>[] = []
+      let pendingToolCallEvents: Omit<RuntimeEventInput, 'sessionId'>[] = []
       const roundTextParts: string[] = []
       let roundError: string | null = null
+      const flushToolCallEvents = (): void => {
+        if (pendingToolCallEvents.length === 0) return
+        emitRuntimeEvents(ctx, pendingToolCallEvents)
+        pendingToolCallEvents = []
+      }
 
       // P7：请求前上下文检查（轻量预防 + 重量兜底）
-      emitRuntimeEvent(ctx, {
-        type: 'turn_started',
-        agentId: ctx.agentId,
-        turn: round,
-        payload: { mode },
-      })
       await ctx.beforeRequest?.('auto')
 
       log('info', `round ${round}/${maxIterations} 请求 model=${opts.systemPrompt ? 'custom' : mode} msgs=${history.length}`)
@@ -134,7 +165,7 @@ export function runAgent(opts: AgentOptions): AgentHandle {
         ...hookInjections.map((c) => ({ role: 'system' as const, content: c })),
         ...endgameHint,
         // P14：请求前 sanitize——任何路径产生的不完整 assistant(tool_calls) 都被过滤（防 DeepSeek 400）
-        ...sanitizeMessages(history.view()),
+        ...getSanitizedHistory(),
       ]
       // P12：请求前注入回流结果——追加在末尾（请求时历史是稳定快照，永不插 assistant/tool 中间）
       for (const c of opts.injectSystem?.() ?? []) {
@@ -142,49 +173,62 @@ export function runAgent(opts: AgentOptions): AgentHandle {
       }
 
       const contextBudget = ctx.contextBudget?.()
-      emitRuntimeEvent(ctx, {
-        type: 'context_snapshot',
-        agentId: ctx.agentId,
-        turn: round,
-        payload: { ...(contextBudget ?? {}) },
-      })
-      emitRuntimeEvent(ctx, {
-        type: 'model_request',
-        agentId: ctx.agentId,
-        turn: round,
-        payload: { messageCount: msgs.length, toolCount: tools.length, contextBudget: { ...(contextBudget ?? {}) } },
-      })
+      emitRuntimeEvents(ctx, [
+        {
+          type: 'turn_started',
+          agentId: ctx.agentId,
+          turn: round,
+          payload: { mode },
+        },
+        {
+          type: 'context_snapshot',
+          agentId: ctx.agentId,
+          turn: round,
+          payload: { ...(contextBudget ?? {}) },
+        },
+        {
+          type: 'model_request',
+          agentId: ctx.agentId,
+          turn: round,
+          payload: { messageCount: msgs.length, toolCount: tools.length, contextBudget: { ...(contextBudget ?? {}) } },
+        },
+      ])
 
-      for await (const ev of provider.streamChat(msgs, { thinking: false, tools, signal: controller.signal })) {
-        if (controller.signal.aborted) break
-        if (ev.type === 'text') {
-          roundTextParts.push(ev.text)
-          emit({ type: 'text', text: ev.text })
-        } else if (ev.type === 'thinking') {
-          emit({ type: 'thinking', text: ev.text })
-        } else if (ev.type === 'tool_call') {
-          roundCalls.push(ev)
-          emitRuntimeEvent(ctx, {
-            type: 'tool_call',
-            agentId: ctx.agentId,
-            turn: round,
-            correlationId: ev.id,
-            payload: { name: ev.name, arguments: ev.arguments },
-          })
-        } else if (ev.type === 'usage') {
-          totalTokens += ev.inputTokens + ev.outputTokens
-          ctx.afterRequest?.(ev.inputTokens, history.length)
-          emit({
-            type: 'usage',
-            round,
-            inputTokens: ev.inputTokens,
-            outputTokens: ev.outputTokens,
-            cacheHitTokens: ev.cacheHitTokens,
-            cacheMissTokens: ev.cacheMissTokens,
-          })
-        } else if (ev.type === 'error') {
-          roundError = ev.message
+      try {
+        for await (const ev of provider.streamChat(msgs, { thinking: false, tools, signal: controller.signal })) {
+          if (controller.signal.aborted) break
+          if (ev.type !== 'tool_call') flushToolCallEvents()
+          if (ev.type === 'text') {
+            roundTextParts.push(ev.text)
+            emit({ type: 'text', text: ev.text })
+          } else if (ev.type === 'thinking') {
+            emit({ type: 'thinking', text: ev.text })
+          } else if (ev.type === 'tool_call') {
+            roundCalls.push(ev)
+            pendingToolCallEvents.push({
+              type: 'tool_call',
+              agentId: ctx.agentId,
+              turn: round,
+              correlationId: ev.id,
+              payload: { name: ev.name, arguments: ev.arguments },
+            })
+          } else if (ev.type === 'usage') {
+            totalTokens += ev.inputTokens + ev.outputTokens
+            ctx.afterRequest?.(ev.inputTokens, history.length)
+            emit({
+              type: 'usage',
+              round,
+              inputTokens: ev.inputTokens,
+              outputTokens: ev.outputTokens,
+              cacheHitTokens: ev.cacheHitTokens,
+              cacheMissTokens: ev.cacheMissTokens,
+            })
+          } else if (ev.type === 'error') {
+            roundError = ev.message
+          }
         }
+      } finally {
+        flushToolCallEvents()
       }
 
       const roundText = roundTextParts.join('')
@@ -261,11 +305,13 @@ export function runAgent(opts: AgentOptions): AgentHandle {
         tool_calls: roundCalls.map((c) => ({ id: c.id, name: c.name, arguments: JSON.stringify(c.arguments) })),
       })
 
+      const toolResultEvents: Omit<RuntimeEventInput, 'sessionId'>[] = []
       const executed = await executeBatch(roundCalls, registry, toolCtx, (call, result) => {
+        evidence.add(result.evidence)
         // P11：tool_after Hook
         void ctx.hooks?.fire('tool_after', { cwd: ctx.cwd, call: { name: call.name, args: call.arguments } })
         log('info', `tool ${call.name} ${result.success ? 'ok' : 'fail'}${result.error ? `: ${result.error.slice(0, 120)}` : ''}`)
-        emitRuntimeEvent(ctx, {
+        toolResultEvents.push({
           type: 'tool_result',
           agentId: ctx.agentId,
           turn: round,
@@ -280,6 +326,7 @@ export function runAgent(opts: AgentOptions): AgentHandle {
           summary: result.success ? (result.truncated ? '成功（结果已截断）' : '成功') : (result.error ?? '失败'),
         })
       })
+      emitRuntimeEvents(ctx, toolResultEvents)
       // 连续工具失败止损：≥3 轮全失败停止（防模型死磕烧 token）
       const allFailed = executed.length > 0 && executed.every(({ result }) => !result.success)
       let stopEarly = false
@@ -349,7 +396,7 @@ export function runAgent(opts: AgentOptions): AgentHandle {
       ...(roundErrorMessage ? { errorMessage: roundErrorMessage } : {}),
       ...(fatalError ? { errorMessage: fatalError } : {}),
     })
-    return { reason, rounds: Math.min(round, maxIterations), totalTokens, finalText, ...(roundErrorMessage ? { errorMessage: roundErrorMessage } : {}) }
+    return { reason, rounds: Math.min(round, maxIterations), totalTokens, finalText, evidence: evidence.snapshot(), ...(roundErrorMessage ? { errorMessage: roundErrorMessage } : {}) }
   })()
 
   return {

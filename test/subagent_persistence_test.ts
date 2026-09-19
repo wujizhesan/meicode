@@ -7,6 +7,9 @@ rmSync(root, { recursive: true, force: true })
 mkdirSync(root, { recursive: true })
 const store = new SubAgentStore(root, 'session_test')
 store.save({ id: 'agent_old', role: 'worker', type: 'defined', status: 'running', startedAt: 1 })
+const isolated = store.load()
+isolated[0].role = 'mutated'
+if (store.load()[0].role !== 'worker') throw new Error('Store 缓存被调用方修改')
 const dirs = { builtin: join(root, 'builtin'), user: join(root, 'user'), project: join(root, 'project') }
 const manager = new SubAgentManager(dirs, null, store)
 const recovered = manager.getRecord('agent_old')

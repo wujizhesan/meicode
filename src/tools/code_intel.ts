@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync, readFileSync, statSync } from 'node:fs'
 import { resolve } from 'node:path'
 // 用 typescript5(独立依赖,API 稳定)——项目编译用 TS7,代码智能用 TS5
 import type ts from 'typescript5'
@@ -8,15 +8,75 @@ import type { Tool, ToolContext, ToolResult } from './types.ts'
 // defs=符号定义位置 / refs=符号引用 / diagnostics=文件诊断(错误/警告)
 // 对 TS/JS 项目立即可用——改代码时快速定位、查编译错误
 
-function createService(cwd: string, typescript: typeof ts): ts.LanguageService {
-  const files = new Map<string, { version: number; text: string }>()
+interface CachedScript {
+  version: number
+  text: string
+  size: number
+  mtimeMs: number
+  ctimeMs: number
+  ino: number
+}
+
+const MAX_SERVICE_CACHE = 4
+interface ServiceEntry {
+  service: ts.LanguageService
+  refreshFiles: () => void
+  configFile?: string
+  configStamp: string
+}
+
+const serviceCache = new Map<string, ServiceEntry>()
+
+function fileStamp(file: string | undefined): string {
+  if (!file) return ''
+  try {
+    const stats = statSync(file)
+    return `${stats.size}:${stats.mtimeMs}:${stats.ctimeMs}:${stats.ino}`
+  } catch {
+    return ''
+  }
+}
+
+function createService(cwd: string, typescript: typeof ts): Pick<ServiceEntry, 'service' | 'refreshFiles'> {
+  const files = new Map<string, CachedScript>()
   const tsconfig = typescript.findConfigFile(cwd, typescript.sys.fileExists)
-  const options: ts.CompilerOptions = {}
+  const parsedConfig = tsconfig ? typescript.getParsedCommandLineOfConfigFile(tsconfig, {}, typescript.sys as never) : undefined
+  const options: ts.CompilerOptions = parsedConfig?.options ?? {}
+  let scriptFileNames = parsedConfig?.fileNames ?? []
+  const refreshFiles = () => {
+    if (!tsconfig) return
+    scriptFileNames = typescript.getParsedCommandLineOfConfigFile(tsconfig, {}, typescript.sys as never)?.fileNames ?? []
+  }
+  const loadScript = (fileName: string): CachedScript | undefined => {
+    let stats: ReturnType<typeof statSync>
+    try {
+      stats = statSync(fileName)
+    } catch {
+      files.delete(fileName)
+      return undefined
+    }
+    const cached = files.get(fileName)
+    if (cached && cached.size === stats.size && cached.mtimeMs === stats.mtimeMs && cached.ctimeMs === stats.ctimeMs && cached.ino === stats.ino) return cached
+    try {
+      const script = {
+        version: cached ? cached.version + 1 : 0,
+        text: readFileSync(fileName, 'utf8'),
+        size: stats.size,
+        mtimeMs: stats.mtimeMs,
+        ctimeMs: stats.ctimeMs,
+        ino: stats.ino,
+      }
+      files.set(fileName, script)
+      return script
+    } catch {
+      files.delete(fileName)
+      return undefined
+    }
+  }
   const host: ts.LanguageServiceHost = {
     getScriptFileNames: () => {
       if (tsconfig) {
-        const parsed = typescript.getParsedCommandLineOfConfigFile(tsconfig, {}, typescript.sys as never)
-        if (parsed) return [...parsed.fileNames]
+        return [...scriptFileNames]
       }
       // 无 tsconfig:扫描 cwd 下 TS/JS
       const out: string[] = []
@@ -30,18 +90,10 @@ function createService(cwd: string, typescript: typeof ts): ts.LanguageService {
       walk(cwd, 0)
       return out
     },
-    getScriptVersion: (fileName) => String(files.get(fileName)?.version ?? 0),
+    getScriptVersion: (fileName) => String(loadScript(fileName)?.version ?? 0),
     getScriptSnapshot: (fileName) => {
-      let text = files.get(fileName)?.text
-      if (text === undefined) {
-        try {
-          text = readFileSync(fileName, 'utf8')
-          files.set(fileName, { version: 0, text })
-        } catch {
-          return undefined
-        }
-      }
-      return typescript.ScriptSnapshot.fromString(text)
+      const script = loadScript(fileName)
+      return script ? typescript.ScriptSnapshot.fromString(script.text) : undefined
     },
     getCurrentDirectory: () => cwd,
     getCompilationSettings: () => options,
@@ -52,7 +104,32 @@ function createService(cwd: string, typescript: typeof ts): ts.LanguageService {
     directoryExists: typescript.sys.directoryExists,
     getDirectories: typescript.sys.getDirectories,
   }
-  return typescript.createLanguageService(host, typescript.createDocumentRegistry())
+  return { service: typescript.createLanguageService(host, typescript.createDocumentRegistry()), refreshFiles }
+}
+
+function getService(cwd: string, typescript: typeof ts): ts.LanguageService {
+  const absolute = resolve(cwd)
+  const key = process.platform === 'win32' ? absolute.toLowerCase() : absolute
+  const configFile = typescript.findConfigFile(absolute, typescript.sys.fileExists)
+  const configStamp = fileStamp(configFile)
+  const cached = serviceCache.get(key)
+  if (cached && cached.configFile === configFile && cached.configStamp === configStamp) {
+    cached.refreshFiles()
+    serviceCache.delete(key)
+    serviceCache.set(key, cached)
+    return cached.service
+  }
+  cached?.service.dispose()
+  const created = createService(absolute, typescript)
+  serviceCache.set(key, { ...created, configFile, configStamp })
+  if (serviceCache.size > MAX_SERVICE_CACHE) {
+    const oldest = serviceCache.entries().next().value as [string, { service: ts.LanguageService }] | undefined
+    if (oldest) {
+      serviceCache.delete(oldest[0])
+      oldest[1].service.dispose()
+    }
+  }
+  return created.service
 }
 
 export const codeIntelTool: Tool = {
@@ -80,7 +157,7 @@ export const codeIntelTool: Tool = {
 
     try {
       const { default: typescript } = await import('typescript5')
-      const svc = createService(ctx.cwd, typescript)
+      const svc = getService(ctx.cwd, typescript)
 
       if (action === 'diagnostics') {
         if (!file) return { success: false, output: '', error: 'diagnostics 需要 file' }
@@ -128,10 +205,7 @@ export const codeIntelTool: Tool = {
         }
         const refs = svc.findReferences(file, pos) ?? []
         const lines = refs.slice(0, 30).map((r) => {
-          const items = r.references.slice(0, 5).map((ref) => {
-            const lc = ref.fileName && existsSync(ref.fileName) ? typescript.createSourceFile(ref.fileName, readFileSync(ref.fileName, 'utf8'), typescript.ScriptTarget.Latest, false) : null
-            return `${ref.fileName.split(/[\\/]/).pop()}`
-          })
+          const items = r.references.slice(0, 5).map((ref) => ref.fileName.split(/[\\/]/).pop())
           return `${r.definition.fileName.split(/[\\/]/).pop()}: ${items.join(', ')}`
         })
         return { success: true, output: `引用(${refs.length} 组):\n${lines.join('\n') || '(无)'}` }

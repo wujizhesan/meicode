@@ -1,4 +1,4 @@
-import { useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Box, Text, useInput } from 'ink'
 
 // 多行输入（自实现）：Enter 提交 / Shift+Enter 换行 / ←→ 移动光标 /
@@ -9,31 +9,49 @@ export function Input({
   disabled,
   placeholder,
   menuOpen,
+  onEditingChange,
 }: {
   onSend: (value: string) => void
   onTabComplete: (value: string) => string | null
   disabled: boolean
   placeholder?: string
   menuOpen?: boolean // 补全菜单打开时禁用 ↑↓ 历史导航（菜单用 ↑↓ 选择）
+  onEditingChange?: (editing: boolean) => void
 }) {
   const [value, setValue] = useState('')
   const [cursor, setCursor] = useState(0)
   const historyRef = useRef<string[]>([])
   const histIdxRef = useRef(-1)
+  const editingRef = useRef(false)
   const multiline = value.includes('\n')
 
+  useEffect(() => {
+    return () => {
+      if (editingRef.current) onEditingChange?.(false)
+    }
+  }, [onEditingChange])
+
+  const updateValue = (next: string): void => {
+    const editing = next.length > 0
+    if (editing !== editingRef.current) {
+      editingRef.current = editing
+      onEditingChange?.(editing)
+    }
+    setValue(next)
+  }
+
   const insert = (ch: string): void => {
-    setValue((v) => v.slice(0, cursor) + ch + v.slice(cursor))
+    updateValue(value.slice(0, cursor) + ch + value.slice(cursor))
     setCursor((c) => c + ch.length)
   }
   const backspace = (): void => {
     if (cursor <= 0) return
-    setValue((v) => v.slice(0, cursor - 1) + v.slice(cursor))
+    updateValue(value.slice(0, cursor - 1) + value.slice(cursor))
     setCursor((c) => c - 1)
   }
   const del = (): void => {
     if (cursor >= value.length) return
-    setValue((v) => v.slice(0, cursor) + v.slice(cursor + 1))
+    updateValue(value.slice(0, cursor) + value.slice(cursor + 1))
   }
   // 行间移动（按 \n 分段；目标行同列偏移，越界收敛到行尾）
   const moveLine = (dir: number): void => {
@@ -62,7 +80,7 @@ export function Input({
         if (trimmed) {
           historyRef.current.push(trimmed)
           histIdxRef.current = -1
-          setValue('')
+          updateValue('')
           setCursor(0)
           onSend(trimmed)
         }
@@ -95,7 +113,7 @@ export function Input({
           const h = historyRef.current
           if (h.length === 0) return
           histIdxRef.current = histIdxRef.current === -1 ? h.length - 1 : Math.max(0, histIdxRef.current - 1)
-          setValue(h[histIdxRef.current])
+          updateValue(h[histIdxRef.current])
           setCursor(h[histIdxRef.current].length)
         }
         return
@@ -107,10 +125,10 @@ export function Input({
           histIdxRef.current++
           if (histIdxRef.current >= historyRef.current.length) {
             histIdxRef.current = -1
-            setValue('')
+            updateValue('')
             setCursor(0)
           } else {
-            setValue(historyRef.current[histIdxRef.current])
+            updateValue(historyRef.current[histIdxRef.current])
             setCursor(historyRef.current[histIdxRef.current].length)
           }
         }
@@ -119,7 +137,7 @@ export function Input({
       if (key.tab) {
         const completed = onTabComplete(value)
         if (completed !== null) {
-          setValue(completed)
+          updateValue(completed)
           setCursor(completed.length)
         }
         return

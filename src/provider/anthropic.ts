@@ -20,6 +20,33 @@ interface ToolResultBlock {
   content: string
 }
 
+interface AnthropicContentBlock {
+  type: string
+  text?: string
+  id?: string
+  name?: string
+  input?: unknown
+}
+
+interface AnthropicMessage {
+  role: 'assistant' | 'user'
+  content: string | ToolResultBlock[] | AnthropicContentBlock[]
+}
+
+const toolInputCache = new WeakMap<ToolCallMeta, { arguments: string; input: unknown }>()
+
+function parseToolInput(toolCall: ToolCallMeta): unknown {
+  const cached = toolInputCache.get(toolCall)
+  if (cached?.arguments === toolCall.arguments) return cached.input
+  let input: unknown = {}
+  try {
+    input = JSON.parse(toolCall.arguments)
+  } catch {
+  }
+  toolInputCache.set(toolCall, { arguments: toolCall.arguments, input })
+  return input
+}
+
 export class AnthropicProvider implements Provider {
   readonly protocol = 'anthropic' as const
   private readonly cfg: ProviderConfig
@@ -165,32 +192,47 @@ export function toAnthropicBody(
   tools?: ProviderTool[],
 ): Record<string, unknown> {
   const systemParts: string[] = []
-  const merged: { role: string; content: string | ToolResultBlock[]; tool_calls?: ToolCallMeta[]; tool_call_id?: string }[] = []
+  const converted: AnthropicMessage[] = []
+  let previousRole: ChatMessage['role'] | null = null
+  let previousMergeable = false
   for (const m of messages) {
     if (m.role === 'system') {
       systemParts.push(m.content)
       continue
     }
-    const prev = merged[merged.length - 1]
-    // 同一轮连续 tool 消息：合并成 tool_result 数组——Anthropic 要求一个 assistant(tool_use)
-    // 的所有 result 在"下一条消息"里，分开成多条会报 tool_use without tool_result
-    if (prev && prev.role === 'tool' && m.role === 'tool') {
-      if (Array.isArray(prev.content)) {
-        prev.content.push({ type: 'tool_result', tool_use_id: m.tool_call_id ?? '', content: m.content })
+    const previous = converted[converted.length - 1]
+    if (previous && previousRole === 'tool' && m.role === 'tool') {
+      (previous.content as ToolResultBlock[]).push({ type: 'tool_result', tool_use_id: m.tool_call_id ?? '', content: m.content })
+      continue
+    }
+    if (previous && previousRole === m.role && previousMergeable && !m.tool_calls) {
+      if (m.role === 'assistant') {
+        const blocks = previous.content as AnthropicContentBlock[]
+        const text = `${blocks[0]?.text ?? ''}\n\n${m.content}`
+        if (blocks.length === 0) blocks.push({ type: 'text', text })
+        else blocks[0].text = text
       } else {
-        prev.content = [
-          { type: 'tool_result', tool_use_id: prev.tool_call_id ?? '', content: prev.content },
-          { type: 'tool_result', tool_use_id: m.tool_call_id ?? '', content: m.content },
-        ]
+        previous.content = `${previous.content as string}\n\n${m.content}`
       }
       continue
     }
-    // 连续同角色合并（流中断后可能出现连续 user）；带 tool_calls 的不合并（保持配对）
-    if (prev && prev.role === m.role && !prev.tool_calls && !m.tool_calls) {
-      prev.content += '\n\n' + m.content
+    if (m.role === 'assistant') {
+      const blocks: AnthropicContentBlock[] = []
+      if (m.content) blocks.push({ type: 'text', text: m.content })
+      for (const toolCall of m.tool_calls ?? []) {
+        blocks.push({ type: 'tool_use', id: toolCall.id, name: toolCall.name, input: parseToolInput(toolCall) })
+      }
+      converted.push({ role: 'assistant', content: blocks })
+    } else if (m.role === 'tool') {
+      converted.push({
+        role: 'user',
+        content: [{ type: 'tool_result', tool_use_id: m.tool_call_id ?? '', content: m.content }],
+      })
     } else {
-      merged.push({ role: m.role, content: m.content, tool_calls: m.tool_calls, tool_call_id: m.tool_call_id })
+      converted.push({ role: 'user', content: m.content })
     }
+    previousRole = m.role
+    previousMergeable = !m.tool_calls
   }
 
   const body: Record<string, unknown> = {
@@ -198,30 +240,7 @@ export function toAnthropicBody(
     max_tokens: thinking ? 32000 : 16384,
     stream: true,
     ...(thinking ? { thinking: { type: 'enabled' as const, budget_tokens: 16000 } } : {}),
-    messages: merged.map((m) => {
-      if (m.role === 'assistant') {
-        const blocks: { type: string; text?: string; id?: string; name?: string; input?: unknown }[] = []
-        if (typeof m.content === 'string' && m.content) blocks.push({ type: 'text', text: m.content })
-        for (const tc of m.tool_calls ?? []) {
-          let input: unknown = {}
-          try {
-            input = JSON.parse(tc.arguments)
-          } catch {
-            // 参数解析失败保持空对象
-          }
-          blocks.push({ type: 'tool_use', id: tc.id, name: tc.name, input })
-        }
-        return { role: 'assistant', content: blocks }
-      }
-      if (m.role === 'tool') {
-        // 单条 tool_result 或合并后的 tool_result 数组（同一轮所有 result 一条消息）
-        const content = Array.isArray(m.content)
-          ? m.content
-          : [{ type: 'tool_result' as const, tool_use_id: m.tool_call_id ?? '', content: m.content }]
-        return { role: 'user', content }
-      }
-      return { role: 'user', content: m.content }
-    }),
+    messages: converted,
   }
   if (systemParts.length > 0) body.system = systemParts.join('\n\n')
   if (tools && tools.length > 0) {

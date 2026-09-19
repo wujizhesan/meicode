@@ -1,7 +1,7 @@
 // Skill 系统测试：解析/覆盖/管理/白名单/load_skill/runIsolated
 import { mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { SkillManager, loadAllSkills, parseSkillFile, createLoadSkillTool, runIsolated } from '../src/skill/index.ts'
+import { SkillManager, loadAllSkills, parseSkillFile, createLoadSkillTool, runIsolated, buildSummaryTail } from '../src/skill/index.ts'
 import { createTools, ToolRegistry } from '../src/tools/index.ts'
 import { History } from '../src/session/history.ts'
 import type { ChatMessage, Provider, StreamEvent } from '../src/provider/types.ts'
@@ -29,6 +29,12 @@ const PROJECT = join(TMP, 'project')
 mkdirSync(BUILTIN, { recursive: true })
 mkdirSync(USER, { recursive: true })
 mkdirSync(PROJECT, { recursive: true })
+
+const summaryTail = buildSummaryTail([
+  { role: 'tool', tool_call_id: 'a', content: 'old' },
+  { role: 'tool', tool_call_id: 'b', content: `${'x'.repeat(9000)}🚀` },
+], 'output', 8000)
+if (summaryTail.length !== 8000 || !summaryTail.endsWith('🚀') || summaryTail.includes('old')) throw new Error('Skill 摘要尾部截取错误')
 
 function skillMd(name: string, desc: string, extra = ''): string {
   return `---
@@ -78,9 +84,15 @@ async function main() {
   })
   await check('解析: 目录型 SKILL.md', () => {
     mkdirSync(join(PROJECT, 'my-skill'), { recursive: true })
-    writeFileSync(join(PROJECT, 'my-skill', 'SKILL.md'), skillMd('my-skill', '目录型'), 'utf8')
+    const file = join(PROJECT, 'my-skill', 'SKILL.md')
+    writeFileSync(file, skillMd('my-skill', '目录型', 'history: 3\n'), 'utf8')
     const { skills } = loadAllSkills({ builtin: BUILTIN, user: USER, project: PROJECT })
-    if (!skills.some((s) => s.name === 'my-skill')) throw new Error('目录型未识别')
+    const loaded = skills.find((s) => s.name === 'my-skill')
+    if (!loaded || loaded.history !== 3) throw new Error('目录型未识别')
+    loaded.tools?.push('cache-poison')
+    if (loadAllSkills({ builtin: BUILTIN, user: USER, project: PROJECT }).skills.find((s) => s.name === 'my-skill')?.tools?.includes('cache-poison')) throw new Error('Skill 缓存被调用方污染')
+    writeFileSync(file, skillMd('my-skill', '目录型', 'history: 4\n'), 'utf8')
+    if (loadAllSkills({ builtin: BUILTIN, user: USER, project: PROJECT }).skills.find((s) => s.name === 'my-skill')?.history !== 4) throw new Error('同尺寸 Skill 修改未使缓存失效')
   })
 
   // ---------- 三级覆盖 ----------

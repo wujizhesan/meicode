@@ -199,6 +199,25 @@ async function main() {
     const all = history.all()
     if (all.some((m) => m.content.includes('早期对话摘要'))) throw new Error('不应触发摘要')
   })
+  await check('manager: 快照随历史版本失效', () => {
+    const history = new History()
+    const manager = new ContextManager({ provider: new FakeCtxProvider(), history, cwd: TMP, window: 131072 })
+    history.push(msg('user', 'a'.repeat(40)))
+    const first = manager.snapshot().estimatedTokens
+    history.push(msg('assistant', 'b'.repeat(80)))
+    const second = manager.snapshot().estimatedTokens
+    if (first !== 10 || second !== 30) throw new Error(`缓存未失效: ${first} → ${second}`)
+  })
+  await check('manager: 增量扫描能存盘新增工具结果', async () => {
+    const history = new History()
+    history.push(msg('user', '初始消息'))
+    const manager = new ContextManager({ provider: new FakeCtxProvider(), history, cwd: TMP, window: 131072 })
+    await manager.beforeRequest('auto')
+    history.push({ role: 'assistant', content: '', tool_calls: [{ id: 'spill-1', name: 'read_file', arguments: '{}' }] })
+    history.push({ role: 'tool', tool_call_id: 'spill-1', content: '大'.repeat(SPILL_THRESHOLD + 100) })
+    await manager.beforeRequest('auto')
+    if (!history.view().at(-1)?.content.includes('[已存盘]')) throw new Error('新增工具结果未存盘')
+  })
 
   // ---------- replaceRange ----------
   await check('history: replaceRange 替换', () => {

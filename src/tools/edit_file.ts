@@ -21,7 +21,7 @@ export const editFileTool: Tool = {
     const path = args.path as string
     const oldText = args.old_text as string
     const newText = args.new_text as string
-    if (!path || typeof oldText !== 'string' || typeof newText !== 'string') {
+    if (!path || typeof oldText !== 'string' || oldText.length === 0 || typeof newText !== 'string') {
       return { success: false, output: '', error: '缺少参数 path / old_text / new_text' }
     }
 
@@ -35,20 +35,19 @@ export const editFileTool: Tool = {
       return { success: false, output: '', error: `读取失败: ${(e as Error).message}` }
     }
 
-    const count = content.split(oldText).length - 1
-    if (count === 0) {
+    const firstPos = content.indexOf(oldText)
+    if (firstPos < 0) {
       return { success: false, output: '', error: '未找到原文片段（检查转义、换行与实际文件内容）' }
     }
-    if (count > 1) {
-      const firstPos = content.indexOf(oldText)
+    if (content.indexOf(oldText, firstPos + oldText.length) >= 0) {
       return {
         success: false,
         output: '',
-        error: `原文匹配到 ${count} 处（首个匹配位置在第 ${firstPos} 个字符），请提供更长、更唯一的上下文`,
+        error: `原文匹配到多处（首个匹配位置在第 ${firstPos} 个字符），请提供更长、更唯一的上下文`,
       }
     }
 
-    const updated = content.replace(oldText, newText)
+    const updated = content.slice(0, firstPos) + newText + content.slice(firstPos + oldText.length)
     try {
       await writeFile(target, updated, 'utf8')
       const summary = `已替换 1 处\n--- 旧 ---\n${oldText}\n--- 新 ---\n${newText}`

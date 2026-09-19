@@ -9,31 +9,41 @@ export interface RuntimeEvidenceSummary {
   tests: { command: string; passed: boolean; output?: string }[]
 }
 
-function unique(values: string[]): string[] {
-  return [...new Set(values)]
+export class RuntimeEvidenceAccumulator {
+  private files = new Set<string>()
+  private commands = new Set<string>()
+  private artifacts = new Set<string>()
+  private changedFiles = new Set<string>()
+  private tests = new Map<string, { command: string; passed: boolean; output?: string }>()
+
+  add(evidence: ToolEvidence | undefined): void {
+    if (!evidence) return
+    for (const file of evidence.files ?? []) this.files.add(file)
+    for (const command of evidence.commands ?? []) this.commands.add(command)
+    for (const artifact of evidence.artifactPaths ?? []) this.artifacts.add(artifact)
+    for (const file of evidence.changedFiles ?? []) this.changedFiles.add(file)
+    for (const test of evidence.tests ?? []) {
+      const key = `${test.command}\u0000${test.passed}\u0000${test.output ?? ''}`
+      if (!this.tests.has(key)) this.tests.set(key, test)
+    }
+  }
+
+  snapshot(): RuntimeEvidenceSummary {
+    return {
+      files: [...this.files],
+      commands: [...this.commands],
+      artifacts: [...this.artifacts],
+      changedFiles: [...this.changedFiles],
+      tests: [...this.tests.values()],
+    }
+  }
 }
 
 export function collectRuntimeEvidence(events: RuntimeEvent[], agentId: string, since = 0): RuntimeEvidenceSummary {
-  const files: string[] = []
-  const commands: string[] = []
-  const artifacts: string[] = []
-  const changedFiles: string[] = []
-  const tests: { command: string; passed: boolean; output?: string }[] = []
+  const accumulator = new RuntimeEvidenceAccumulator()
   for (const event of events) {
     if (event.type !== 'tool_result' || event.agentId !== agentId || event.ts < since) continue
-    const evidence = (event.payload?.evidence ?? {}) as ToolEvidence
-    files.push(...(evidence.files ?? []))
-    commands.push(...(evidence.commands ?? []))
-    artifacts.push(...(evidence.artifactPaths ?? []))
-    changedFiles.push(...(evidence.changedFiles ?? []))
-    tests.push(...(evidence.tests ?? []))
+    accumulator.add((event.payload?.evidence ?? {}) as ToolEvidence)
   }
-  const testKeys = new Set<string>()
-  const uniqueTests = tests.filter((test) => {
-    const key = `${test.command}\u0000${test.passed}\u0000${test.output ?? ''}`
-    if (testKeys.has(key)) return false
-    testKeys.add(key)
-    return true
-  })
-  return { files: unique(files), commands: unique(commands), artifacts: unique(artifacts), changedFiles: unique(changedFiles), tests: uniqueTests }
+  return accumulator.snapshot()
 }

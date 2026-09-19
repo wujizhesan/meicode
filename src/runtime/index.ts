@@ -1,7 +1,7 @@
 export { createRuntimeId } from './ids.ts'
 export type { RuntimeIdPrefix } from './ids.ts'
 export { RuntimeEventLog } from './event-log.ts'
-export { collectRuntimeEvidence } from './evidence.ts'
+export { collectRuntimeEvidence, RuntimeEvidenceAccumulator } from './evidence.ts'
 export type { RuntimeEvidenceSummary } from './evidence.ts'
 export { recordAudit } from './audit.ts'
 export type { AuditInput } from './audit.ts'

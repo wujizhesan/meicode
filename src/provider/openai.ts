@@ -169,6 +169,7 @@ export function toOpenAIMessages(messages: ChatMessage[]): Record<string, unknow
     if (m.role === 'tool') {
       return { role: 'tool', tool_call_id: m.tool_call_id ?? '', content: m.content }
     }
+    if (m.tool_calls === undefined && m.tool_call_id === undefined) return m as unknown as Record<string, unknown>
     return { role: m.role, content: m.content }
   })
 }

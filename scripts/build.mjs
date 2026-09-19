@@ -10,12 +10,28 @@ mkdirSync(dist, { recursive: true })
 
 const common = {
   bundle: true,
-  packages: 'external',
   platform: 'node',
   format: 'esm',
   target: 'node20',
   sourcemap: true,
+  minifySyntax: true,
+  minifyWhitespace: true,
+  minifyIdentifiers: true,
+  charset: 'utf8',
 }
+
+const runtimeExternals = [
+  'ink',
+  'react',
+  'react/*',
+  'playwright-core',
+  'typescript5',
+  '@modelcontextprotocol/sdk',
+  '@modelcontextprotocol/sdk/*',
+  'pngjs',
+  'pixelmatch',
+  'minimatch',
+]
 
 await Promise.all([
   build({
@@ -25,12 +41,19 @@ await Promise.all([
     outExtension: { '.js': '.mjs' },
     chunkNames: 'chunks/[name]-[hash]',
     splitting: true,
-    banner: { js: '#!/usr/bin/env node' },
+    external: runtimeExternals,
+    banner: { js: "#!/usr/bin/env node\nimport { createRequire as __createRequire } from 'node:module'; const require = __createRequire(import.meta.url);" },
   }),
   build({
     ...common,
     entryPoints: [join(root, 'src', 'cli-fast.ts')],
     outfile: join(dist, 'cli-fast.mjs'),
+    banner: { js: "import { createRequire as __createRequire } from 'node:module'; const require = __createRequire(import.meta.url);" },
+  }),
+  build({
+    ...common,
+    entryPoints: [join(root, 'src', 'cli-init.ts')],
+    outfile: join(dist, 'cli-init.mjs'),
   }),
 ])
 

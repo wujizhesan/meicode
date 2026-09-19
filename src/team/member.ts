@@ -9,7 +9,8 @@ import { summarize, tailKeep, summaryMessage, boundaryMessage } from '../context
 import type { TeamGroupStore } from './group.ts'
 import type { TeamMail } from './mail.ts'
 import type { TeamMember, TeamTaskReport } from './types.ts'
-import { collectRuntimeEvidence, createRuntimeId } from '../runtime/index.ts'
+import { createRuntimeId } from '../runtime/index.ts'
+import { atomicWriteFile } from './atomic.ts'
 
 // 成员上下文压缩阈值:历史估算超限时,摘要早期对话(对齐主会话 compact)
 // 大任务几十轮后成员历史无限累积——不压缩会上下文爆炸
@@ -25,13 +26,49 @@ const MEMBER_SYSTEM = `你是团队成员。使用团队协作工具（team_task
 // 团队成员可用的基础工具（不含 load_skill——绑定主会话 SkillManager 会污染主会话状态）
 const MEMBER_BASE_TOOLS = ['read_file', 'find_files', 'grep_code', 'run_command', 'write_file', 'edit_file', 'team_task', 'team_send']
 
+const MIN_REPLAY_LINES = 8
+
+function replayedPrefixLength(lines: string[]): number {
+  const matches = new Array<number>(lines.length).fill(0)
+  let left = 0
+  let right = 0
+  for (let index = 1; index < lines.length; index++) {
+    if (index <= right) matches[index] = Math.min(right - index + 1, matches[index - left])
+    while (index + matches[index] < lines.length && lines[matches[index]] === lines[index + matches[index]]) matches[index]++
+    if (index + matches[index] - 1 > right) {
+      left = index
+      right = index + matches[index] - 1
+    }
+  }
+  for (let size = Math.floor(lines.length / 2); size >= MIN_REPLAY_LINES; size--) {
+    if (matches[size] >= size) return size
+  }
+  return 0
+}
+
+function removeReplayedPrefixes(lines: string[]): { lines: string[]; changed: boolean } {
+  let current = lines
+  let changed = false
+  while (current.length >= MIN_REPLAY_LINES * 2) {
+    const size = replayedPrefixLength(current)
+    if (size === 0) break
+    current = [...current.slice(0, size), ...current.slice(size * 2)]
+    changed = true
+  }
+  return { lines: current, changed }
+}
+
 export class MemberHost {
-  history: History
+  private historyValue = new History()
+  private historyLoaded = false
   private member: TeamMember
   private provider: Provider
   private registry: ToolRegistry
   private ctx: ToolContext
   private historyFile: string
+  private persistedLength = 0
+  private persistedStructureVersion = 0
+  private historyNeedsRewrite = false
 
   private groupName: string
   private store: TeamGroupStore
@@ -73,29 +110,44 @@ export class MemberHost {
     this.roleToolsDeny = opts.roleToolsDeny ?? []
     this.roleToolsAllow = opts.roleToolsAllow ?? []
     this.roleMaxRounds = opts.roleMaxRounds
-    this.history = new History()
+  }
+
+  get history(): History {
     this.resume()
+    return this.historyValue
   }
 
   // 从磁盘恢复上下文
   resume(): void {
+    if (this.historyLoaded) return
+    this.historyLoaded = true
     if (!existsSync(this.historyFile)) return
-    for (const line of readFileSync(this.historyFile, 'utf8').split('\n')) {
+    const recovered = removeReplayedPrefixes(readFileSync(this.historyFile, 'utf8').split('\n').filter(Boolean))
+    for (const line of recovered.lines) {
       if (!line.trim()) continue
       try {
-        this.history.push(JSON.parse(line))
+        this.historyValue.push(JSON.parse(line))
       } catch {
         // 坏行跳过
       }
     }
+    this.persistedLength = this.historyValue.length
+    this.persistedStructureVersion = this.historyValue.structureVersion
+    this.historyNeedsRewrite = recovered.changed
   }
 
   private persist(): void {
-    const msgs = this.history.all()
-    if (msgs.length === 0) return
-    appendFileSync(this.historyFile, msgs.map((message) => JSON.stringify(message)).join('\n') + '\n', 'utf8')
-    // 防止重复：落盘后重建 history（下次 resume 不会重复）
-    this.history = new History()
+    const msgs = this.history.view()
+    const rewrite = this.historyNeedsRewrite || this.history.structureVersion !== this.persistedStructureVersion || msgs.length < this.persistedLength
+    if (rewrite) {
+      atomicWriteFile(this.historyFile, msgs.length > 0 ? `${msgs.map((message) => JSON.stringify(message)).join('\n')}\n` : '')
+    } else if (msgs.length > this.persistedLength) {
+      const pending = msgs.slice(this.persistedLength)
+      appendFileSync(this.historyFile, `${pending.map((message) => JSON.stringify(message)).join('\n')}\n`, 'utf8')
+    }
+    this.persistedLength = msgs.length
+    this.persistedStructureVersion = this.history.structureVersion
+    this.historyNeedsRewrite = false
   }
 
   isBusy(): boolean {
@@ -111,7 +163,7 @@ export class MemberHost {
 
   // 上下文压缩:历史估算超阈值 → 摘要早期对话,保留尾部(对齐主会话 compact)
   private async compactIfNeeded(): Promise<void> {
-    const msgs = this.history.all()
+    const msgs = this.history.view()
     const total = msgs.reduce((sum, m) => sum + (m.content?.length ?? 0), 0)
     if (total <= MEMBER_COMPACT_CHARS) return
     const keepTokens = 10000
@@ -213,11 +265,7 @@ export class MemberHost {
       summary: outcome.text.slice(0, 4000),
       tokens: result.totalTokens,
       durationMs: Date.now() - startedAt,
-      evidence: collectRuntimeEvidence(
-        this.ctx.runtimeEvents?.read(this.ctx.sessionId ?? this.ctx.agentId ?? this.member.name) ?? [],
-        this.ctx.agentId ?? this.member.agentId ?? this.member.name,
-        startedAt,
-      ),
+      evidence: result.evidence,
       ...(result.errorMessage ? { error: result.errorMessage } : {}),
     }
     // subagent_stop hook：成员任务结束

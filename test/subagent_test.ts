@@ -2,6 +2,7 @@
 import { mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { SubAgentManager, createSpawnAgentTool, loadAgentRoles, parseAgentFile } from '../src/subagent/index.ts'
+import { summarizeLocally } from '../src/subagent/manager.ts'
 import { createTools, ToolRegistry } from '../src/tools/index.ts'
 import type { ChatMessage, Provider, StreamEvent } from '../src/provider/types.ts'
 import type { Tool } from '../src/tools/index.ts'
@@ -29,6 +30,11 @@ const PROJECT = join(TMP, 'project_agents')
 mkdirSync(BUILTIN, { recursive: true })
 mkdirSync(USER, { recursive: true })
 mkdirSync(PROJECT, { recursive: true })
+
+const shortSummary = summarizeLocally(['  alpha\n beta  ', ' gamma '])
+if (shortSummary !== 'alpha beta gamma') throw new Error(`短摘要规范化错误: ${shortSummary}`)
+const boundedSummary = summarizeLocally(['alpha', '---', `${'x'.repeat(1000)}🚀`], 100)
+if (boundedSummary.length !== 100 || !boundedSummary.includes(' ... ') || !boundedSummary.endsWith('🚀')) throw new Error('长摘要边界截取错误')
 
 // fake provider：主请求返回文本，摘要请求返回固定摘要
 class FakeSubProvider implements Provider {
@@ -66,12 +72,16 @@ async function main() {
     if (!r || r.toolsAllow?.length !== 2 || r.maxRounds !== 5) throw new Error('解析失败')
     if (r.content !== '# Reviewer\n审查任务') throw new Error('正文缺失')
     if (roles.some((x) => x.name === 'bad')) throw new Error('坏文件未跳过')
+    r.toolsAllow?.push('cache-poison')
+    if (loadAgentRoles({ builtin: BUILTIN, user: USER, project: PROJECT }).find((x) => x.name === 'reviewer')?.toolsAllow?.includes('cache-poison')) throw new Error('角色缓存被调用方污染')
   })
   await check('角色: 项目覆盖内置', () => {
     writeFileSync(join(PROJECT, 'reviewer.md'), '---\nname: reviewer\ndescription: 项目版\nmax_rounds: 8\n---\n项目版正文', 'utf8')
     const roles = loadAgentRoles({ builtin: BUILTIN, user: USER, project: PROJECT })
     const r = roles.find((x) => x.name === 'reviewer')
     if (!r || r.maxRounds !== 8 || r.source !== 'project') throw new Error(`覆盖失败: ${JSON.stringify(r)}`)
+    writeFileSync(join(PROJECT, 'reviewer.md'), '---\nname: reviewer\ndescription: 项目版\nmax_rounds: 9\n---\n项目版正文', 'utf8')
+    if (loadAgentRoles({ builtin: BUILTIN, user: USER, project: PROJECT }).find((x) => x.name === 'reviewer')?.maxRounds !== 9) throw new Error('同尺寸角色修改未使缓存失效')
   })
 
   // ---------- 工具过滤 ----------
