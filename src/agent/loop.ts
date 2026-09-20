@@ -14,6 +14,42 @@ const READ_ONLY_TOOLS = new Set(['read_file', 'find_files', 'grep_code'])
 // 写类工具:重复检测阈值(5 次)——写死循环仍止损,但写同一文件迭代(报告草稿/读回再写)是合法场景,
 // 3 次误杀过主会话写报告(实战实锤)
 const WRITE_TOOLS = new Set(['write_file', 'edit_file'])
+const RUNTIME_STRING_LIMIT = 500
+const RUNTIME_COLLECTION_LIMIT = 20
+const RUNTIME_VALUE_DEPTH = 3
+
+interface RuntimeValueSummary {
+  value: unknown
+  truncated: boolean
+}
+
+function summarizeRuntimeValue(value: unknown, depth = 0): RuntimeValueSummary {
+  if (typeof value === 'string') {
+    if (value.length <= RUNTIME_STRING_LIMIT) return { value, truncated: false }
+    return {
+      value: `${value.slice(0, RUNTIME_STRING_LIMIT)}...[${value.length - RUNTIME_STRING_LIMIT} chars omitted]`,
+      truncated: true,
+    }
+  }
+  if (value === null || typeof value !== 'object') return { value, truncated: false }
+  if (depth >= RUNTIME_VALUE_DEPTH) return { value: '[nested value omitted]', truncated: true }
+  if (Array.isArray(value)) {
+    const summaries = value.slice(0, RUNTIME_COLLECTION_LIMIT).map((item) => summarizeRuntimeValue(item, depth + 1))
+    return {
+      value: summaries.map((summary) => summary.value),
+      truncated: value.length > RUNTIME_COLLECTION_LIMIT || summaries.some((summary) => summary.truncated),
+    }
+  }
+  const entries = Object.entries(value)
+  const selected = entries.slice(0, RUNTIME_COLLECTION_LIMIT).map(([key, item]) => {
+    const summary = summarizeRuntimeValue(item, depth + 1)
+    return { key, ...summary }
+  })
+  return {
+    value: Object.fromEntries(selected.map(({ key, value }) => [key, value])),
+    truncated: entries.length > RUNTIME_COLLECTION_LIMIT || selected.some((summary) => summary.truncated),
+  }
+}
 
 function emitRuntimeEvent(ctx: ToolContext, input: Omit<RuntimeEventInput, 'sessionId'>): void {
   const sessionId = ctx.sessionId ?? ctx.agentId
@@ -137,6 +173,14 @@ export function runAgent(opts: AgentOptions): AgentHandle {
       const hookInjections = ctx.hooks?.collectInjections() ?? []
 
       const roundCalls: Extract<StreamEvent, { type: 'tool_call' }>[] = []
+      const serializedArguments = new Map<Extract<StreamEvent, { type: 'tool_call' }>, string>()
+      const serializeArguments = (call: Extract<StreamEvent, { type: 'tool_call' }>): string => {
+        const cached = serializedArguments.get(call)
+        if (cached !== undefined) return cached
+        const serialized = JSON.stringify(call.arguments)
+        serializedArguments.set(call, serialized)
+        return serialized
+      }
       let pendingToolCallEvents: Omit<RuntimeEventInput, 'sessionId'>[] = []
       const roundTextParts: string[] = []
       let roundError: string | null = null
@@ -205,12 +249,17 @@ export function runAgent(opts: AgentOptions): AgentHandle {
             emit({ type: 'thinking', text: ev.text })
           } else if (ev.type === 'tool_call') {
             roundCalls.push(ev)
+            const argumentSummary = summarizeRuntimeValue(ev.arguments)
             pendingToolCallEvents.push({
               type: 'tool_call',
               agentId: ctx.agentId,
               turn: round,
               correlationId: ev.id,
-              payload: { name: ev.name, arguments: ev.arguments },
+              payload: {
+                name: ev.name,
+                arguments: argumentSummary.value,
+                ...(argumentSummary.truncated ? { argumentsTruncated: true } : {}),
+              },
             })
           } else if (ev.type === 'usage') {
             totalTokens += ev.inputTokens + ev.outputTokens
@@ -283,7 +332,7 @@ export function runAgent(opts: AgentOptions): AgentHandle {
       for (const c of roundCalls) {
         if (!registry.get(c.name)) continue
         if (READ_ONLY_TOOLS.has(c.name) || c.name === 'team_tasks' || c.name === 'team_mail') continue
-        const sig = `${c.name}:${JSON.stringify(c.arguments).slice(0, 100)}`
+        const sig = `${c.name}:${serializeArguments(c).slice(0, 100)}`
         recentCallSigs.push(sig)
         if (recentCallSigs.length > REPEAT_WINDOW) recentCallSigs.shift()
         const count = recentCallSigs.filter((s) => s === sig).length
@@ -302,7 +351,7 @@ export function runAgent(opts: AgentOptions): AgentHandle {
       history.push({
         role: 'assistant',
         content: roundText,
-        tool_calls: roundCalls.map((c) => ({ id: c.id, name: c.name, arguments: JSON.stringify(c.arguments) })),
+        tool_calls: roundCalls.map((c) => ({ id: c.id, name: c.name, arguments: serializeArguments(c) })),
       })
 
       const toolResultEvents: Omit<RuntimeEventInput, 'sessionId'>[] = []

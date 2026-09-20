@@ -198,13 +198,20 @@ async function main() {
     if (!r.success || !r.output.includes('未找到')) throw new Error(`结果不符: ${r.output}`)
   })
 
+  mkdirSync(join(TMP, 'grep-empty'), { recursive: true })
+  writeFileSync(join(TMP, 'grep-empty', 'blank.txt'), '\n\n', 'utf8')
+  await check('grep_code: 纯文本快速路径不误匹配空行', async () => {
+    const r = await tools[5].execute({ pattern: 'plain_literal', path: 'grep-empty' }, ctx)
+    if (!r.success || r.output.includes('blank.txt')) throw new Error(`空行被误匹配: ${r.output}`)
+  })
+
   writeFileSync(join(TMP, 'grep_large_early.txt'), `${Array.from({ length: 20 }, (_, i) => `EARLY_MATCH_${i}`).join('\n')}\n${'filler line\n'.repeat(200000)}`, 'utf8')
   await check('grep_code: 大文件达到单文件上限后返回 20 条', async () => {
     const r = await tools[5].execute({ pattern: 'EARLY_MATCH_' }, ctx)
     if (!r.success || r.output.split('\n').length !== 20) throw new Error(`结果不符: ${r.output.slice(0, 200)}`)
   })
   writeFileSync(join(TMP, 'grep_utf8_boundary.txt'), `${'x'.repeat(3 * 1024 * 1024 - 4)}ABC中BOUNDARY_MATCH\n`, 'utf8')
-  await check('grep_code: 长单行流式搜索保持 UTF-8 分块边界', async () => {
+  await check('grep_code: 长单行搜索保持 UTF-8 字符边界', async () => {
     const r = await tools[5].execute({ pattern: 'ABC中BOUNDARY_MATCH' }, ctx)
     if (!r.success || !r.output.includes('grep_utf8_boundary.txt:1:')) throw new Error(`结果不符: ${r.output.slice(0, 200)}`)
   })

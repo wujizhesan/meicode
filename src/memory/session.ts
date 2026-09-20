@@ -6,14 +6,22 @@ const HOUR = 3600 * 1000
 const DAY = 24 * HOUR
 const SESSION_ID_RE = /^[A-Za-z0-9_-]{1,128}$/
 
-interface SessionCountSnapshot {
+interface SessionFileMetadata {
   size: number
   mtimeMs: number
   ctimeMs: number
+}
+
+interface SessionCountSnapshot extends SessionFileMetadata {
   count: number
 }
 
-function matchesSnapshot(snapshot: SessionCountSnapshot, stats: { size: number; mtimeMs: number; ctimeMs: number }): boolean {
+interface SessionFileInfo {
+  file: string
+  stats: SessionFileMetadata | null
+}
+
+function matchesSnapshot(snapshot: SessionCountSnapshot, stats: SessionFileMetadata): boolean {
   return snapshot.size === stats.size && snapshot.mtimeMs === stats.mtimeMs && snapshot.ctimeMs === stats.ctimeMs
 }
 
@@ -96,29 +104,32 @@ export class SessionStore {
     this.dirReady = true
   }
 
-  private fileFor(id: string): string | null {
+  private fileInfoFor(id: string): SessionFileInfo | null {
     if (!SESSION_ID_RE.test(id)) return null
     const root = resolve(this.dir)
     const file = resolve(join(root, `${id}.jsonl`))
     if (file !== root && !file.startsWith(root + sep)) return null
     try {
-      if (lstatSync(file).isSymbolicLink()) return null
+      const stats = lstatSync(file)
+      if (stats.isSymbolicLink()) return null
+      return { file, stats }
     } catch (e) {
       if ((e as NodeJS.ErrnoException).code !== 'ENOENT') return null
     }
-    return file
+    return { file, stats: null }
+  }
+
+  private fileFor(id: string): string | null {
+    return this.fileInfoFor(id)?.file ?? null
   }
 
   append(id: string, messages: ChatMessage[]): void {
     if (messages.length === 0) return
-    const file = this.fileFor(id)
-    if (!file) throw new Error('非法会话 ID')
+    const info = this.fileInfoFor(id)
+    if (!info) throw new Error('非法会话 ID')
+    const { file } = info
     this.ensureDir()
-    let before: ReturnType<typeof statSync> | null = null
-    try {
-      before = statSync(file)
-    } catch {
-    }
+    let before: SessionFileMetadata | null = info.stats
     const cached = this.countCache.get(file)
     const content = messages.map((message) => JSON.stringify(message)).join('\n') + '\n'
     try {

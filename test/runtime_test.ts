@@ -20,6 +20,9 @@ if (!first.eventId.startsWith('event_')) throw new Error('事件 ID 前缀错误
 const activeFile = join(tmp, `${id}.jsonl`)
 const activeIndex = JSON.parse(readFileSync(join(tmp, `${id}.index.json`), 'utf8')) as { activeBytes?: number }
 if (activeIndex.activeBytes !== statSync(activeFile).size) throw new Error('事件索引未记录活动文件大小')
+if (log.read(id).length !== 2) throw new Error('重复读取缓存结果错误')
+log.append({ sessionId: id, type: 'audit', payload: { source: 'cache-invalidation' } })
+if (log.read(id).length !== 3) throw new Error('追加后事件读取缓存未失效')
 
 const pending = log.waitForEvent(id, 1000)
 setTimeout(() => log.append({ sessionId: id, type: 'tool_call', payload: { name: 'wait_test' } }), 10)

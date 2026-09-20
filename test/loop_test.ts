@@ -611,9 +611,11 @@ async function main() {
     rmSync(eventDir, { recursive: true, force: true })
     class CountingRuntimeEventLog extends RuntimeEventLog {
       batches: string[][] = []
+      payloads: Record<string, unknown>[] = []
 
       override appendBatch(inputs: Parameters<RuntimeEventLog['appendBatch']>[0]) {
         this.batches.push(inputs.map((input) => input.type))
+        this.payloads.push(...inputs.flatMap((input) => input.payload ? [input.payload] : []))
         return super.appendBatch(inputs)
       }
     }
@@ -623,7 +625,7 @@ async function main() {
       round++
       return round === 1
         ? { events: [
-            { type: 'tool_call', id: 'batch_1', name: 'read_file', arguments: { path: 'package.json' } },
+            { type: 'tool_call', id: 'batch_1', name: 'read_file', arguments: { path: 'package.json', probe: 'x'.repeat(2000) } },
             { type: 'tool_call', id: 'batch_2', name: 'read_file', arguments: { path: 'tsconfig.json' } },
             { type: 'done' },
           ] }
@@ -639,6 +641,12 @@ async function main() {
     if (result.evidence.files.length !== 2) throw new Error('Agent 结果未携带执行期工具证据')
     if (!runtimeEvents.batches.some((types) => types.join(',') === 'turn_started,context_snapshot,model_request')) throw new Error('轮次起始事件未与请求快照批量写入')
     if (!runtimeEvents.batches.some((types) => types.join(',') === 'tool_call,tool_call')) throw new Error('连续工具调用未批量写入运行时日志')
+    const compacted = runtimeEvents.payloads.find((payload) => payload.argumentsTruncated === true)
+    const compactedArgs = compacted?.arguments as Record<string, unknown> | undefined
+    if (typeof compactedArgs?.probe !== 'string' || compactedArgs.probe.length > 600) throw new Error('大工具参数未在运行时日志中截断')
+    const persistedCall = history.view().find((message) => message.role === 'assistant' && message.tool_calls?.[0]?.id === 'batch_1')?.tool_calls?.[0]
+    const persistedArgs = persistedCall ? JSON.parse(persistedCall.arguments) as Record<string, unknown> : undefined
+    if (typeof persistedArgs?.probe !== 'string' || persistedArgs.probe.length !== 2000) throw new Error('会话历史中的完整工具参数被误截断')
   })
 
   // ---------- buildPrompt ----------

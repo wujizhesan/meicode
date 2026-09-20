@@ -1,12 +1,18 @@
 import { readFileSync, writeFileSync, mkdirSync, existsSync, renameSync, rmSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { parse, stringify } from 'yaml'
-import { minimatch } from 'minimatch'
+import { Minimatch } from 'minimatch'
 import type { Rule, RuleSource, ToolCallInfo } from './types.ts'
 
 interface RuleFileShape {
   mode?: string
   rules?: { tool: string; pattern: string; action: string }[]
+}
+
+interface PatternMatcher {
+  normalized: string
+  prefix?: string
+  glob?: Minimatch
 }
 
 function normalizeShape(value: unknown): RuleFileShape {
@@ -22,6 +28,7 @@ const SOURCE_ORDER: RuleSource[] = ['session', 'local', 'project', 'user']
 
 export class RuleEngine {
   private rulesBySource: Record<RuleSource, Rule[]> = { session: [], local: [], project: [], user: [] }
+  private patternMatchers = new Map<string, PatternMatcher>()
   private userMode: string | null = null
   private userFile: string
   private projectFile: string
@@ -97,33 +104,35 @@ export class RuleEngine {
   }
 
   match(call: ToolCallInfo): Rule | null {
+    const value = call.args.command ?? call.args.path ?? call.args.pattern
+    if (typeof value !== 'string') return null
+    const normalizedInput = call.name === 'run_command' ? value.replace(/\s+/g, ' ').trim() : value
+    const normalizedValue = normalizedInput.replaceAll('\\', '/')
     for (const source of SOURCE_ORDER) {
       const layer = this.rulesBySource[source]
       // deny 优先于 allow（同层）
       for (const r of layer) {
-        if (r.tool === call.name && r.action === 'deny' && this.matches(r.pattern, call)) return r
+        if (r.tool === call.name && r.action === 'deny' && this.matches(r.pattern, normalizedValue)) return r
       }
       for (const r of layer) {
-        if (r.tool === call.name && r.action === 'allow' && this.matches(r.pattern, call)) return r
+        if (r.tool === call.name && r.action === 'allow' && this.matches(r.pattern, normalizedValue)) return r
       }
     }
     return null
   }
 
-  private matches(pattern: string, call: ToolCallInfo): boolean {
-    const value = call.args.command ?? call.args.path ?? call.args.pattern
-    if (typeof value !== 'string') return false
-    // 命令规范化：与 patternFor 写入侧一致（空白归一）——同一缓存键可命中
-    const normInput = call.name === 'run_command' ? value.replace(/\s+/g, ' ').trim() : value
-    // Windows 路径反斜杠在 glob 中是转义符——统一转正斜杠
-    const normValue = normInput.replaceAll('\\', '/')
-    const normPattern = pattern.replaceAll('\\', '/')
-    if (normValue === normPattern) return true
-    // 命令类模式：'git *' 语义 = 前缀匹配（minimatch 的 * 不跨空格）
-    if (normPattern.endsWith('*') && !normPattern.endsWith('**')) {
-      return normValue.startsWith(normPattern.slice(0, -1))
+  private matches(pattern: string, normalizedValue: string): boolean {
+    let cached = this.patternMatchers.get(pattern)
+    if (!cached) {
+      const normalized = pattern.replaceAll('\\', '/')
+      cached = normalized.endsWith('*') && !normalized.endsWith('**')
+        ? { normalized, prefix: normalized.slice(0, -1) }
+        : { normalized, glob: new Minimatch(normalized) }
+      this.patternMatchers.set(pattern, cached)
     }
-    return minimatch(normValue, normPattern)
+    if (normalizedValue === cached.normalized) return true
+    if (cached.prefix !== undefined) return normalizedValue.startsWith(cached.prefix)
+    return cached.glob!.match(normalizedValue)
   }
 
   getUserMode(): string | null {

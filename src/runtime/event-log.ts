@@ -23,6 +23,15 @@ interface RuntimeEventPaths {
   segmentPrefix: string
 }
 
+interface RuntimeReadCache {
+  signature: string
+  events: RuntimeEvent[]
+}
+
+function cloneRuntimeEvent(event: RuntimeEvent): RuntimeEvent {
+  return event.payload === undefined ? { ...event } : { ...event, payload: structuredClone(event.payload) }
+}
+
 export class RuntimeEventLog {
   private waiters = new Map<string, Set<(event: RuntimeEvent) => void>>()
   private readonly root: string
@@ -30,6 +39,7 @@ export class RuntimeEventLog {
   private readonly checkpointInterval: number
   private states = new Map<string, RuntimeEventState>()
   private paths = new Map<string, RuntimeEventPaths>()
+  private readCache = new Map<string, Map<string, RuntimeReadCache>>()
   private rootReady = false
 
   constructor(root: string, options: { maxBytes?: number; checkpointInterval?: number } = {}) {
@@ -153,6 +163,17 @@ export class RuntimeEventLog {
     }
   }
 
+  private readSignature(files: readonly string[]): string {
+    return files.map((file) => {
+      try {
+        const stats = statSync(file)
+        return `${file}:${stats.dev}:${stats.ino}:${stats.size}:${stats.mtimeMs}:${stats.ctimeMs}`
+      } catch {
+        return `${file}:missing`
+      }
+    }).join('|')
+  }
+
   private acquireLock(sessionId: string): string {
     const lock = this.lockFor(sessionId)
     for (let attempt = 0; attempt < 1000; attempt++) {
@@ -245,6 +266,7 @@ export class RuntimeEventLog {
         pending: (cacheValid ? cached.pending : 0) + events.length,
       }
       this.states.set(sessionId, state)
+      this.readCache.delete(sessionId)
       if (shouldRotate || state.pending >= this.checkpointInterval || inputs.some((input) => input.type === 'run_finished')) {
         this.writeIndex(sessionId, state)
         state.pending = 0
@@ -348,6 +370,12 @@ export class RuntimeEventLog {
   }
 
   read(sessionId: string, options: { type?: RuntimeEvent['type'] } = {}): RuntimeEvent[] {
+    const files = this.segmentFiles(sessionId)
+    const signature = this.readSignature(files)
+    const typeKey = options.type ?? ''
+    const sessionCache = this.readCache.get(sessionId)
+    const cached = sessionCache?.get(typeKey)
+    if (cached?.signature === signature) return cached.events.map(cloneRuntimeEvent)
     const events: RuntimeEvent[] = []
     let ordered = true
     let previousSeq = Number.NEGATIVE_INFINITY
@@ -366,7 +394,7 @@ export class RuntimeEventLog {
       } catch {
       }
     }
-    for (const file of this.segmentFiles(sessionId)) {
+    for (const file of files) {
       if (statSync(file).size <= this.maxBytes * 2) {
         const content = readFileSync(file, 'utf8')
         let lineStart = 0
@@ -410,6 +438,10 @@ export class RuntimeEventLog {
         closeSync(fd)
       }
     }
-    return ordered ? events : events.sort((a, b) => a.seq - b.seq)
+    const result = ordered ? events : events.sort((a, b) => a.seq - b.seq)
+    const nextCache = sessionCache ?? new Map<string, RuntimeReadCache>()
+    nextCache.set(typeKey, { signature, events: result })
+    this.readCache.set(sessionId, nextCache)
+    return result.map(cloneRuntimeEvent)
   }
 }
