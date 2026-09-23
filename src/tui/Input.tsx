@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { Box, Text, useInput } from 'ink'
+import type { CompletionRequest } from './completion.ts'
 
 // 多行输入（自实现）：Enter 提交 / Shift+Enter 换行 / ←→ 移动光标 /
 // ↑↓ 单行翻历史·多行行间移动 / Backspace·Delete 删除 / 光标反色块显示
@@ -9,6 +10,8 @@ export function Input({
   disabled,
   placeholder,
   menuOpen,
+  completionRequest,
+  onCompletionApplied,
   onEditingChange,
 }: {
   onSend: (value: string) => void
@@ -16,6 +19,8 @@ export function Input({
   disabled: boolean
   placeholder?: string
   menuOpen?: boolean // 补全菜单打开时禁用 ↑↓ 历史导航（菜单用 ↑↓ 选择）
+  completionRequest?: CompletionRequest | null
+  onCompletionApplied?: () => void
   onEditingChange?: (editing: boolean) => void
 }) {
   const [value, setValue] = useState('')
@@ -39,6 +44,14 @@ export function Input({
     }
     setValue(next)
   }
+
+  useEffect(() => {
+    if (!completionRequest) return
+    updateValue(completionRequest.value)
+    setCursor(completionRequest.value.length)
+    histIdxRef.current = -1
+    onCompletionApplied?.()
+  }, [completionRequest])
 
   const insert = (ch: string): void => {
     updateValue(value.slice(0, cursor) + ch + value.slice(cursor))

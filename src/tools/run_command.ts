@@ -3,6 +3,10 @@ import { guardCommand } from './types.ts'
 import type { Tool, ToolContext, ToolResult } from './types.ts'
 import { truncateOutput } from './types.ts'
 
+function displayArgument(value: string): string {
+  return /^[A-Za-z0-9_./:\\-]+$/.test(value) ? value : JSON.stringify(value)
+}
+
 export const runCommandTool: Tool = {
   name: 'run_command',
   description:
@@ -22,14 +26,16 @@ export const runCommandTool: Tool = {
     if (!command) return { success: false, output: '', error: '缺少参数 command' }
     const argList = Array.isArray(args.args) ? (args.args as string[]).map(String) : []
     const timeoutMs = typeof args.timeout === 'number' ? args.timeout : (ctx.timeoutMs ?? 30000)
-    const commandLine = [command, ...argList].join(' ')
-    const blocked = guardCommand(ctx, commandLine)
+    const commandLine = [command, ...argList.map(displayArgument)].join(' ')
+    const blocked = guardCommand(ctx, [command, ...argList].join(' '))
     if (blocked) return { success: false, output: '', error: blocked }
 
     return new Promise<ToolResult>((resolve) => {
-      const child = process.platform === 'win32'
-        ? spawn(process.env.ComSpec ?? 'cmd.exe', ['/d', '/s', '/c', commandLine], { cwd: ctx.cwd, shell: false })
-        : spawn(command, argList, { cwd: ctx.cwd, shell: false })
+      const child = argList.length > 0
+        ? spawn(command, argList, { cwd: ctx.cwd, shell: false, windowsHide: true })
+        : process.platform === 'win32'
+          ? spawn(process.env.ComSpec ?? 'cmd.exe', ['/d', '/s', '/c', command], { cwd: ctx.cwd, shell: false, windowsHide: true })
+          : spawn('/bin/sh', ['-c', command], { cwd: ctx.cwd, shell: false })
 
       let out = ''
       let killed = false

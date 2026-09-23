@@ -38,7 +38,7 @@ export class OpenAIProvider implements Provider {
             messages: toOpenAIMessages(messages),
             stream: true,
             // 输出上限：DeepSeek 默认 4K，长回答/写大文件会截断——显式 16K
-            max_tokens: 16384,
+            max_tokens: this.cfg.max_output_tokens ?? 16384,
             stream_options: { include_usage: true },
             ...(opts.tools && opts.tools.length > 0 ? { tools: opts.tools } : {}),
           }),

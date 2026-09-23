@@ -4,11 +4,11 @@ import type { HookAction } from './types.ts'
 const DEFAULT_TIMEOUT = 10000 // Hook 命令默认 10s 超时
 
 // 执行 command 动作；返回输出（用于日志）
-export function runCommandAction(command: string, cwd: string, timeoutMs: number): Promise<string> {
+export function runCommandAction(command: string, cwd: string, timeoutMs: number, env?: Record<string, string>): Promise<string> {
   return new Promise((resolve) => {
     const child = process.platform === 'win32'
-      ? spawn(process.env.ComSpec ?? 'cmd.exe', ['/d', '/s', '/c', command], { cwd, shell: false })
-      : spawn(command, { cwd, shell: true })
+      ? spawn(process.env.ComSpec ?? 'cmd.exe', ['/d', '/s', '/c', command], { cwd, shell: false, env: { ...process.env, ...env } })
+      : spawn(command, { cwd, shell: true, env: { ...process.env, ...env } })
     let out = ''
     const sink = (chunk: Buffer) => {
       out += chunk.toString('utf8')

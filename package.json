@@ -1,6 +1,6 @@
 {
   "name": "meicode",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "MeiCode — 终端命令行 AI 助手",
   "type": "module",
   "bin": {
@@ -20,13 +20,12 @@
     "prepack": "npm run build",
     "pack:check": "npm pack --dry-run",
     "package:smoke": "node scripts/package-smoke.mjs",
-    "pretest": "node --import tsx test/code_intel_test.ts && node --import tsx test/lazy_state_dirs_test.ts && node --import tsx test/member_history_test.ts && node --import tsx test/log_test.ts",
     "typecheck": "tsc --noEmit",
-    "test": "npm run typecheck && node --import tsx test/smoke.ts && node --import tsx test/tools_test.ts && node --import tsx test/loop_test.ts && node --import tsx test/permission_test.ts && node --import tsx test/mode_test.ts && node --import tsx test/mcp_test.ts && node --import tsx test/config_init_test.ts && node --import tsx test/a2a_protocol_test.ts && node --import tsx test/a2a_test.ts && node --import tsx test/a2a_tool_test.ts && node --import tsx test/a2a_limits_test.ts && node --import tsx test/acp_test.ts && node --import tsx test/context_test.ts && node --import tsx test/memory_test.ts && node --import tsx test/budget_evidence_test.ts && node --import tsx test/runtime_test.ts && node --import tsx test/report_evidence_test.ts && node --import tsx test/team_graph_test.ts && node --import tsx test/team_dag_test.ts && node --import tsx test/team_recovery_test.ts && node --import tsx test/team_retry_restore_test.ts && node --import tsx test/team_process_test.ts && node --import tsx test/commands_test.ts && node --import tsx test/skill_test.ts && node --import tsx test/frontmatter_crlf_test.ts && node --import tsx test/hook_test.ts && node --import tsx test/subagent_test.ts && node --import tsx test/subagent_persistence_test.ts && node --import tsx test/subagent_summary_test.ts && node --import tsx test/worktree_isolation_test.ts && node --import tsx test/worktree_test.ts && node --import tsx test/workflow_test.ts && node --import tsx test/team_test.ts && node --import tsx test/provider_stream_test.ts && node --import tsx test/provider_test.ts && node --import tsx test/provider_e2e_test.ts && node --import tsx test/audit_test.ts && node --import tsx test/sandbox_test.ts && node --import tsx test/approval_test.ts && node --import tsx test/tui_smoke.tsx"
+    "test": "npm run typecheck && node scripts/test.mjs",
+    "test:serial": "npm run typecheck && node scripts/test.mjs --workers 1"
   },
   "license": "MIT",
   "dependencies": {
-    "@alcalzone/ansi-tokenize": "^0.3.0",
     "@modelcontextprotocol/sdk": "^1.30.0",
     "eventsource-parser": "^3.1.0",
     "ink": "^7.1.1",
@@ -39,7 +38,6 @@
     "yaml": "^2.9.0"
   },
   "devDependencies": {
-    "@types/express": "^5.0.6",
     "@types/node": "^26.2.0",
     "@types/pngjs": "^6.0.5",
     "@types/react": "^19.2.18",
@@ -50,15 +48,14 @@
   "engines": {
     "node": ">=20.11"
   },
-  "main": "index.js",
-  "directories": {
-    "doc": "docs",
-    "test": "test"
-  },
   "repository": {
     "type": "git",
-    "url": "https://gh-proxy.com/https://github.com/wujizhesan/meicode.git"
+    "url": "git+https://github.com/wujizhesan/meicode.git"
   },
-  "keywords": [],
-  "author": ""
+  "homepage": "https://github.com/wujizhesan/meicode#readme",
+  "bugs": {
+    "url": "https://github.com/wujizhesan/meicode/issues"
+  },
+  "keywords": ["ai", "agent", "cli", "multi-agent", "mcp", "a2a"],
+  "author": "wujizhesan"
 }

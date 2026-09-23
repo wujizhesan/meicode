@@ -46,7 +46,7 @@ export async function summarize(
 ): Promise<string> {
   const msgs: ChatMessage[] = [{ role: 'system', content: SUMMARY_SYSTEM }, ...earlyMessages]
   const textParts: string[] = []
-  for await (const ev of provider.streamChat(msgs, { thinking: false })) {
+  for await (const ev of provider.streamChat(msgs, { thinking: false, signal: ctx.signal })) {
     if (ev.type === 'text') textParts.push(ev.text)
     else if (ev.type === 'error') throw new Error(`摘要请求失败: ${ev.message}`)
   }

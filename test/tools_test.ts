@@ -3,7 +3,7 @@ import { mkdirSync, rmSync, writeFileSync, readFileSync, existsSync } from 'node
 import { join } from 'node:path'
 import { createTools, ToolRegistry } from '../src/tools/index.ts'
 import type { ToolContext } from '../src/tools/index.ts'
-import { MAX_RESULT_BYTES, truncateOutput } from '../src/tools/types.ts'
+import { MAX_RESULT_BYTES, guardCommand, truncateOutput } from '../src/tools/types.ts'
 
 let passed = 0
 let failed = 0
@@ -58,6 +58,23 @@ async function main() {
     if (Buffer.byteLength(result.output, 'utf8') > MAX_RESULT_BYTES) throw new Error('截断结果超过字节上限')
     if (result.output.includes('\ufffd')) throw new Error('截断破坏了 UTF-8 字符边界')
     if (!result.output.endsWith('…[结果已截断]')) throw new Error('缺少截断标记')
+  })
+
+  await check('rootLock: Git 输出参数不能绕过写围栏', () => {
+    const lockedCtx: ToolContext = { ...ctx, rootLock: TMP }
+    for (const command of [
+      'git diff --output=C:\\outside\\leak.patch',
+      'git diff --output=..\\leak.patch',
+      'git log --output C:\\outside\\leak.txt',
+      'git diff --ext-diff',
+    ]) {
+      if (!guardCommand(lockedCtx, command)) throw new Error(`写围栏未拦截: ${command}`)
+    }
+  })
+  await check('run_command: args 形式的 Git 输出参数受写围栏保护', async () => {
+    const lockedCtx: ToolContext = { ...ctx, rootLock: TMP }
+    const result = await tools[3].execute({ command: 'git', args: ['diff', '--output=C:\\outside\\leak.patch'] }, lockedCtx)
+    if (result.success || !result.error?.includes('Git 输出')) throw new Error(`args 输出参数未拦截: ${JSON.stringify(result)}`)
   })
 
   // ---------- write_file ----------
@@ -146,6 +163,11 @@ async function main() {
   await check('run_command: 非零退出码', async () => {
     const r = await tools[3].execute({ command: 'node', args: ['-e', 'process.exit(3)'], timeout: 5000 }, ctx)
     if (r.success || !r.error!.includes('退出码 3')) throw new Error(`退出码错误: ${JSON.stringify(r)}`)
+  })
+  await check('run_command: args 保持参数边界且不经过 shell', async () => {
+    const marker = 'structured & literal'
+    const r = await tools[3].execute({ command: process.execPath, args: ['-e', 'process.stdout.write(process.argv[1])', marker] }, ctx)
+    if (!r.success || r.output !== marker) throw new Error(`参数边界丢失: ${JSON.stringify(r)}`)
   })
   await check('run_command: 命令不存在', async () => {
     // Windows cmd 对不存在命令返回「不是内部或外部命令」+ 退出码 1，非 spawn error 事件

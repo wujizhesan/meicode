@@ -1,9 +1,10 @@
-import { existsSync, readFileSync, appendFileSync, mkdirSync, readdirSync, statSync, watch, openSync, readSync, closeSync, type FSWatcher } from 'node:fs'
+import { existsSync, readFileSync, appendFileSync, mkdirSync, readdirSync, renameSync, statSync, watch, openSync, readSync, closeSync, type FSWatcher } from 'node:fs'
 import { join } from 'node:path'
 import type { MailMessage } from './types.ts'
 import { withLock } from './lock.ts'
 import { createRuntimeId } from '../runtime/index.ts'
 import { atomicWriteFile } from './atomic.ts'
+import { isTeamActorName, teamActorKey } from './validation.ts'
 
 const SUMMARY_LEN = 80
 
@@ -39,6 +40,25 @@ interface MailRegistryCache {
 const CACHE_TAIL_BYTES = 64
 const EMPTY_MAIL_MESSAGES: readonly MailMessage[] = Object.freeze([])
 
+function emptyRegistry(): Record<string, string> {
+  return Object.create(null) as Record<string, string>
+}
+
+function cloneRegistry(registry: Record<string, string>): Record<string, string> {
+  return Object.assign(emptyRegistry(), registry)
+}
+
+function isMailMessage(value: unknown): value is MailMessage {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  const message = value as Record<string, unknown>
+  if (typeof message.from !== 'string' || !message.from || typeof message.to !== 'string' || !message.to) return false
+  if (typeof message.body !== 'string' || typeof message.ts !== 'number' || !Number.isFinite(message.ts) || typeof message.read !== 'boolean') return false
+  for (const key of ['messageId', 'groupId', 'kind', 'taskId', 'correlationId', 'summary'] as const) {
+    if (message[key] !== undefined && typeof message[key] !== 'string') return false
+  }
+  return true
+}
+
 function parseMailBytes(bytes: Buffer): { messages: MailMessage[]; remainder: Buffer } {
   const messages: MailMessage[] = []
   let lineStart = 0
@@ -48,7 +68,8 @@ function parseMailBytes(bytes: Buffer): { messages: MailMessage[]; remainder: Bu
     lineStart = i + 1
     if (!line) continue
     try {
-      messages.push(JSON.parse(line) as MailMessage)
+      const message: unknown = JSON.parse(line)
+      if (isMailMessage(message)) messages.push(message)
     } catch {
     }
   }
@@ -170,15 +191,16 @@ export class TeamMail {
 
   // 注册表：name → 邮箱文件
   register(name: string): void {
-    if (!TeamMail.validName(name)) {
+    if (!isTeamActorName(name)) {
       console.warn(`[团队] 非法邮箱注册名，跳过: ${name}`)
       return
     }
     const mailbox = this.mailboxFile(name)
-    if (this.readRegistry()[name] === mailbox) return
     this.ensureMailDir()
     withLock(join(this.mailDir, 'registry.lock'), () => {
       const reg = this.readRegistry()
+      const conflict = Object.keys(reg).find((current) => teamActorKey(current) === teamActorKey(name) && current !== name)
+      if (conflict) throw new Error(`邮箱名大小写冲突: ${name} 与 ${conflict}`)
       if (reg[name] === mailbox) return
       reg[name] = mailbox
       atomicWriteFile(this.registryFile(), JSON.stringify(reg, null, 2))
@@ -191,36 +213,51 @@ export class TeamMail {
     let stats: ReturnType<typeof statSync>
     try {
       stats = statSync(file)
-    } catch {
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+        throw new Error(`无法读取邮箱注册表: ${file}: ${(error as Error).message}`)
+      }
       this.registryCache = undefined
-      return {}
+      return emptyRegistry()
     }
     const cached = this.registryCache
     if (cached && cached.size === stats.size && cached.mtimeMs === stats.mtimeMs && cached.ctimeMs === stats.ctimeMs && cached.ino === stats.ino) {
-      return { ...cached.registry }
+      return cloneRegistry(cached.registry)
     }
     try {
-      const registry = JSON.parse(readFileSync(file, 'utf8')) as Record<string, string>
+      const value: unknown = JSON.parse(readFileSync(file, 'utf8'))
+      if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('根节点不是对象')
+      const registry = emptyRegistry()
+      const names = new Map<string, string>()
+      for (const [name, mailbox] of Object.entries(value)) {
+        if (!isTeamActorName(name) || typeof mailbox !== 'string' || mailbox.length === 0) throw new Error(`非法邮箱记录: ${name}`)
+        const key = teamActorKey(name)
+        const existing = names.get(key)
+        if (existing && existing !== name) throw new Error(`邮箱名大小写冲突: ${name} 与 ${existing}`)
+        names.set(key, name)
+        registry[name] = mailbox
+      }
       this.registryCache = { size: stats.size, mtimeMs: stats.mtimeMs, ctimeMs: stats.ctimeMs, ino: stats.ino, registry }
-      return { ...registry }
-    } catch {
+      return cloneRegistry(registry)
+    } catch (error) {
       this.registryCache = undefined
-      return {}
+      const backup = `${file}.corrupt.${Date.now()}.${process.pid}.json`
+      try {
+        renameSync(file, backup)
+      } catch {
+      }
+      throw new Error(`邮箱注册表损坏，已拒绝覆盖并隔离到 ${backup}: ${(error as Error).message}`)
     }
   }
 
-  // 收件人名校验：防模型传 ..\ 路径注入（join 出 .mewcode 目录）
-  private static validName(name: string): boolean {
-    return /^[A-Za-z0-9_-]{1,64}$/.test(name)
-  }
-
+  // 收件人名校验：防模型传 ..\ 路径注入（join 出 .meicode 目录）
   // 发送：目标邮箱 append JSONL（to='*' → broadcast.mail）
   send(from: string, to: string, body: string, metadata: Pick<MailMessage, 'groupId' | 'kind' | 'taskId' | 'correlationId'> = {}): void {
-    if (to !== '*' && !TeamMail.validName(to)) {
+    if (to !== '*' && !isTeamActorName(to)) {
       console.warn(`[团队] 非法收件人名，丢弃: ${to}`)
       return
     }
-    if (!TeamMail.validName(from)) {
+    if (!isTeamActorName(from)) {
       console.warn(`[团队] 非法发件人名，丢弃: ${from}`)
       return
     }
@@ -243,7 +280,7 @@ export class TeamMail {
   }
 
   waitForMessage(name: string, predicate: (message: MailMessage) => boolean, timeoutMs = 0, signal?: AbortSignal): Promise<MailMessage | null> {
-    if (!TeamMail.validName(name)) return Promise.resolve(null)
+    if (!isTeamActorName(name)) return Promise.resolve(null)
     this.ensureMailDir()
     return new Promise((resolve) => {
       let timer: ReturnType<typeof setTimeout> | undefined
@@ -254,19 +291,44 @@ export class TeamMail {
       let directLength = 0
       let broadcastSource: readonly MailMessage[] = EMPTY_MAIL_MESSAGES
       let broadcastLength = 0
-      const check = (message?: MailMessage): void => {
+      let check: (message?: MailMessage) => void
+      const finish = (message: MailMessage | null): void => {
+        if (settled) return
+        settled = true
+        const listeners = this.waiters.get(name)
+        listeners?.delete(check)
+        if (listeners?.size === 0) this.waiters.delete(name)
+        if (this.waiters.size === 0) {
+          this.watcher?.close()
+          this.watcher = undefined
+        }
+        if (timer) clearTimeout(timer)
+        if (abortHandler) signal?.removeEventListener('abort', abortHandler)
+        resolve(message)
+      }
+      const matches = (candidate: MailMessage): boolean => {
+        try {
+          return predicate(candidate)
+        } catch (error) {
+          console.warn(`[团队] 邮件等待谓词异常: ${(error as Error).message}`)
+          finish(null)
+          return false
+        }
+      }
+      check = (message?: MailMessage): void => {
         if (message) {
           const candidate = { ...message }
-          if ((candidate.to === name || candidate.from === name || candidate.to === '*') && predicate(candidate)) finish(candidate)
+          if ((candidate.to === name || candidate.from === name || candidate.to === '*') && matches(candidate)) finish(candidate)
           return
         }
         if (!initialized) {
           for (const existing of this.readView(name)) {
             const candidate = { ...existing }
-            if (predicate(candidate)) {
+            if (matches(candidate)) {
               finish(candidate)
               return
             }
+            if (settled) return
           }
           directSource = this.readFileMessages(this.mailboxFile(name))
           directLength = directSource.length
@@ -283,22 +345,8 @@ export class TeamMail {
         directLength = nextDirect.length
         broadcastSource = nextBroadcast
         broadcastLength = nextBroadcast.length
-        const candidate = findNewMessage(nextDirect, directStart, nextBroadcast, broadcastStart, name, predicate)
+        const candidate = findNewMessage(nextDirect, directStart, nextBroadcast, broadcastStart, name, matches)
         if (candidate) finish(candidate)
-      }
-      const finish = (message: MailMessage | null): void => {
-        if (settled) return
-        settled = true
-        const listeners = this.waiters.get(name)
-        listeners?.delete(check)
-        if (listeners?.size === 0) this.waiters.delete(name)
-        if (this.waiters.size === 0) {
-          this.watcher?.close()
-          this.watcher = undefined
-        }
-        if (timer) clearTimeout(timer)
-        if (abortHandler) signal?.removeEventListener('abort', abortHandler)
-        resolve(message)
       }
       const listeners = this.waiters.get(name) ?? new Set<(message?: MailMessage) => void>()
       listeners.add(check)
@@ -328,12 +376,21 @@ export class TeamMail {
   }
 
   private notify(name: string, message?: MailMessage): void {
+    const notifyListeners = (listeners: Iterable<(message?: MailMessage) => void>): void => {
+      for (const listener of [...listeners]) {
+        try {
+          listener(message)
+        } catch (error) {
+          console.warn(`[团队] 邮件监听器异常: ${(error as Error).message}`)
+        }
+      }
+    }
     if (name === '*') {
-      for (const listeners of this.waiters.values()) for (const listener of listeners) listener(message)
+      for (const listeners of [...this.waiters.values()]) notifyListeners(listeners)
       return
     }
-    for (const listener of this.waiters.get(name) ?? []) listener(message)
-    for (const listener of this.waiters.get('*') ?? []) listener(message)
+    notifyListeners(this.waiters.get(name) ?? [])
+    notifyListeners(this.waiters.get('*') ?? [])
   }
 
   // 读取：自己邮箱 + 广播，过滤（to=自己/from=自己/广播），按 ts 排序
@@ -437,7 +494,7 @@ export class TeamMail {
   }
 
   read(name: string, markRead = false): MailMessage[] {
-    if (!TeamMail.validName(name)) return []
+    if (!isTeamActorName(name)) return []
     const out = this.readView(name).map((message) => ({ ...message }))
     if (markRead) {
       const unread = out.filter((message) => !message.read && (message.to === name || message.to === '*'))
@@ -463,7 +520,9 @@ export class TeamMail {
         const lines = readFileSync(file, 'utf8').split('\n').filter(Boolean)
         const updated = lines.map((line) => {
           try {
-            const msg = JSON.parse(line) as MailMessage
+            const parsed: unknown = JSON.parse(line)
+            if (!isMailMessage(parsed)) return line
+            const msg = parsed
             let lineChanged = false
             if (!msg.read && keys.has(keyFor(msg))) {
               msg.read = true

@@ -4,6 +4,7 @@ import { join, resolve } from 'node:path'
 
 const root = resolve(import.meta.dirname, '..')
 const dist = join(root, 'dist')
+const sourceMap = process.env.MEICODE_SOURCEMAP === 'true'
 
 rmSync(dist, { recursive: true, force: true })
 mkdirSync(dist, { recursive: true })
@@ -13,7 +14,7 @@ const common = {
   platform: 'node',
   format: 'esm',
   target: 'node20',
-  sourcemap: true,
+  sourcemap: sourceMap,
   minifySyntax: true,
   minifyWhitespace: true,
   minifyIdentifiers: true,

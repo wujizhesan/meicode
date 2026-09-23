@@ -6,6 +6,8 @@ export interface StreamBuffer {
 }
 
 export function streamFlushDelay(messageCount: number): number {
+  if (messageCount >= 1000) return 80
+  if (messageCount >= 500) return 50
   if (messageCount >= 200) return 32
   if (messageCount >= 50) return 24
   return 16

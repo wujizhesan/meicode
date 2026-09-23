@@ -1,10 +1,22 @@
-import { appendFileSync, readdirSync, readFileSync, rmSync, statSync, mkdirSync, existsSync, lstatSync } from 'node:fs'
+import { appendFileSync, readdirSync, readFileSync, renameSync, rmSync, statSync, mkdirSync, existsSync, lstatSync, writeFileSync } from 'node:fs'
 import { join, resolve, sep } from 'node:path'
 import type { ChatMessage } from '../provider/types.ts'
+import { assertChatMessages, isChatMessage } from '../provider/message.ts'
+import { withFileLock } from '../runtime/file-lock.ts'
 
 const HOUR = 3600 * 1000
 const DAY = 24 * HOUR
 const SESSION_ID_RE = /^[A-Za-z0-9_-]{1,128}$/
+
+export class SessionConflictError extends Error {
+  readonly sessionId: string
+
+  constructor(sessionId: string) {
+    super(`会话 ${sessionId} 已被其他进程更新，请先重新加载`)
+    this.name = 'SessionConflictError'
+    this.sessionId = sessionId
+  }
+}
 
 interface SessionFileMetadata {
   size: number
@@ -23,6 +35,11 @@ interface SessionFileInfo {
 
 function matchesSnapshot(snapshot: SessionCountSnapshot, stats: SessionFileMetadata): boolean {
   return snapshot.size === stats.size && snapshot.mtimeMs === stats.mtimeMs && snapshot.ctimeMs === stats.ctimeMs
+}
+
+function sameMetadata(left: SessionFileMetadata | null, right: SessionFileMetadata | null): boolean {
+  if (!left || !right) return left === right
+  return left.size === right.size && left.mtimeMs === right.mtimeMs && left.ctimeMs === right.ctimeMs
 }
 
 function countNonEmptyLines(content: Buffer): number {
@@ -56,6 +73,7 @@ export function sanitizeMessages(messages: readonly ChatMessage[]): ChatMessage[
         pendingIdx = -1
         pendingIds.clear()
       }
+      if (new Set(m.tool_calls.map((call) => call.id)).size !== m.tool_calls.length) continue
       out.push(m)
       pendingIdx = out.length - 1
       for (const t of m.tool_calls) pendingIds.add(t.id)
@@ -92,6 +110,7 @@ export function newSessionId(): string {
 export class SessionStore {
   private dir: string
   private countCache = new Map<string, SessionCountSnapshot>()
+  private writeSnapshots = new Map<string, SessionFileMetadata | null>()
   private dirReady = false
 
   constructor(dir: string) {
@@ -125,31 +144,76 @@ export class SessionStore {
 
   append(id: string, messages: ChatMessage[]): void {
     if (messages.length === 0) return
+    assertChatMessages(messages)
     const info = this.fileInfoFor(id)
     if (!info) throw new Error('非法会话 ID')
     const { file } = info
-    this.ensureDir()
-    let before: SessionFileMetadata | null = info.stats
-    const cached = this.countCache.get(file)
     const content = messages.map((message) => JSON.stringify(message)).join('\n') + '\n'
-    try {
+    this.ensureDir()
+    withFileLock(`${file}.lock`, () => {
+      const current = this.fileInfoFor(id)
+      if (!current) throw new Error('非法会话 ID')
+      const before = current.stats
+      if (this.writeSnapshots.has(file) && !sameMetadata(this.writeSnapshots.get(file) ?? null, before)) {
+        throw new SessionConflictError(id)
+      }
+      const cached = this.countCache.get(file)
       appendFileSync(file, content, 'utf8')
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
-      this.dirReady = false
-      this.countCache.delete(file)
-      this.ensureDir()
-      before = null
-      appendFileSync(file, content, 'utf8')
+      const after = statSync(file)
+      this.writeSnapshots.set(file, after)
+      if (!before) {
+        this.countCache.set(file, { size: after.size, mtimeMs: after.mtimeMs, ctimeMs: after.ctimeMs, count: messages.length })
+      } else if (cached && matchesSnapshot(cached, before)) {
+        this.countCache.set(file, { size: after.size, mtimeMs: after.mtimeMs, ctimeMs: after.ctimeMs, count: cached.count + messages.length })
+      } else {
+        this.countCache.delete(file)
+      }
+    })
+  }
+
+  replace(id: string, messages: ChatMessage[]): void {
+    assertChatMessages(messages)
+    const info = this.fileInfoFor(id)
+    if (!info) throw new Error('非法会话 ID')
+    this.ensureDir()
+    const content = messages.length > 0 ? `${messages.map((message) => JSON.stringify(message)).join('\n')}\n` : ''
+    withFileLock(`${info.file}.lock`, () => {
+      const current = this.fileInfoFor(id)
+      if (!current) throw new Error('非法会话 ID')
+      if (this.writeSnapshots.has(info.file) && !sameMetadata(this.writeSnapshots.get(info.file) ?? null, current.stats)) {
+        throw new SessionConflictError(id)
+      }
+      const temp = `${info.file}.${process.pid}.${Date.now()}.tmp`
+      try {
+        writeFileSync(temp, content, 'utf8')
+        try {
+          renameSync(temp, info.file)
+        } catch {
+          writeFileSync(info.file, content, 'utf8')
+          rmSync(temp, { force: true })
+        }
+      } catch (error) {
+        rmSync(temp, { force: true })
+        throw error
+      }
+      const stats = statSync(info.file)
+      this.writeSnapshots.set(info.file, stats)
+      this.countCache.set(info.file, { size: stats.size, mtimeMs: stats.mtimeMs, ctimeMs: stats.ctimeMs, count: messages.length })
+    })
+  }
+
+  saveConflictCopy(sourceId: string, messages: ChatMessage[]): string {
+    assertChatMessages(messages)
+    const prefix = SESSION_ID_RE.test(sourceId) ? sourceId.slice(0, 72) : 'session'
+    for (let attempt = 0; attempt < 10; attempt++) {
+      const suffix = `${Date.now().toString(36)}-${process.pid.toString(36)}-${Math.random().toString(36).slice(2, 8)}`
+      const id = `${prefix}-conflict-${suffix}`.slice(0, 128)
+      const file = this.fileFor(id)
+      if (!file || existsSync(file)) continue
+      new SessionStore(this.dir).replace(id, messages)
+      return id
     }
-    const after = statSync(file)
-    if (!before) {
-      this.countCache.set(file, { size: after.size, mtimeMs: after.mtimeMs, ctimeMs: after.ctimeMs, count: messages.length })
-    } else if (cached && matchesSnapshot(cached, before)) {
-      this.countCache.set(file, { size: after.size, mtimeMs: after.mtimeMs, ctimeMs: after.ctimeMs, count: cached.count + messages.length })
-    } else {
-      this.countCache.delete(file)
-    }
+    throw new Error(`无法为会话 ${sourceId} 创建冲突副本`)
   }
 
   // 恢复：坏行跳过、工具调用无结果截断
@@ -174,8 +238,8 @@ export class SessionStore {
     } catch {
       return null
     }
+    this.writeSnapshots.set(file, stats)
     const messages: ChatMessage[] = []
-    let lineCount = 0
     let needsSanitization = false
     let lineStart = 0
     while (lineStart < raw.length) {
@@ -184,42 +248,23 @@ export class SessionStore {
       const line = raw.slice(lineStart, lineEnd)
       lineStart = lineEnd + 1
       if (!line.trim()) continue
-      lineCount++
       try {
-        const message = JSON.parse(line) as ChatMessage
+        const message: unknown = JSON.parse(line)
+        if (!isChatMessage(message)) continue
         messages.push(message)
         if (message.role === 'tool' || (message.role === 'assistant' && message.tool_calls?.length)) needsSanitization = true
       } catch {
         continue // 坏行跳过
       }
     }
-    this.countCache.set(file, { size: stats.size, mtimeMs: stats.mtimeMs, ctimeMs: stats.ctimeMs, count: lineCount })
-    if (!needsSanitization) return { id, messages }
-
-    // 截断：从尾部回溯，找到最后一个完整的「assistant(tool_calls) → tool 结果」轮
-    let cut = messages.length
-    for (let i = messages.length - 1; i >= 0; i--) {
-      const m = messages[i]
-      if (m.role === 'tool') {
-        // tool 消息需要前驱 assistant(tool_calls) 配对
-        const prev = messages[i - 1]
-        if (!prev || prev.role !== 'assistant' || !prev.tool_calls?.some((t) => t.id === m.tool_call_id)) {
-          cut = i
-        }
-      } else if (m.role === 'assistant' && m.tool_calls?.length) {
-        // assistant 带 tool_calls 但后续没有 tool 结果 → 截断
-        const next = messages[i + 1]
-        if (!next || next.role !== 'tool') {
-          cut = i
-        }
-      }
-    }
-    // 只截断到最后一个不完整轮之前（保留前面的完整轮）
-    while (cut > 0 && cut < messages.length && messages[cut - 1].role === 'tool') {
-      cut--
+    if (!needsSanitization) {
+      this.countCache.set(file, { size: stats.size, mtimeMs: stats.mtimeMs, ctimeMs: stats.ctimeMs, count: messages.length })
+      return { id, messages }
     }
 
-    return { id, messages: sanitizeMessages(messages.slice(0, cut)) }
+    const sanitized = sanitizeMessages(messages)
+    this.countCache.set(file, { size: stats.size, mtimeMs: stats.mtimeMs, ctimeMs: stats.ctimeMs, count: sanitized.length })
+    return { id, messages: sanitized }
   }
 
   listSessions(limit = 5): { id: string; count: number; mtime: number }[] {
@@ -250,10 +295,16 @@ export class SessionStore {
   // 删除单个会话（当前会话由调用方防护）
   removeById(id: string): boolean {
     const file = this.fileFor(id)
-    if (!file || !existsSync(file)) return false
-    rmSync(file, { force: true })
-    this.countCache.delete(file)
-    return true
+    if (!file) return false
+    let removed = false
+    withFileLock(`${file}.lock`, () => {
+      if (!existsSync(file)) return
+      rmSync(file, { force: true })
+      this.countCache.delete(file)
+      this.writeSnapshots.delete(file)
+      removed = true
+    })
+    return removed
   }
 
   // 距上次活动 >24h 的提醒消息
@@ -282,12 +333,15 @@ export class SessionStore {
       if (!f.endsWith('.jsonl') || !SESSION_ID_RE.test(f.slice(0, -'.jsonl'.length))) continue
       const file = this.fileFor(f.slice(0, -'.jsonl'.length))
       if (!file) continue
-      const age = Date.now() - statSync(file).mtimeMs
-      if (age > olderThanDays * DAY) {
+      withFileLock(`${file}.lock`, () => {
+        if (!existsSync(file)) return
+        const age = Date.now() - statSync(file).mtimeMs
+        if (age <= olderThanDays * DAY) return
         rmSync(file, { force: true })
         this.countCache.delete(file)
+        this.writeSnapshots.delete(file)
         removed++
-      }
+      })
     }
     return removed
   }

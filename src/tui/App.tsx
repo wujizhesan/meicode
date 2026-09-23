@@ -1,37 +1,37 @@
-import { useState } from 'react'
-import { Box, Text, useInput } from 'ink'
+import { useEffect, useMemo, useState } from 'react'
+import { Box, Text, useApp, useInput } from 'ink'
 import { ChatView } from './ChatView.tsx'
 import { Input } from './Input.tsx'
 import { useStreamingChat } from './useStream.ts'
-import type { MemoryContext } from './useStream.ts'
+import type { MemoryContext } from '../memory/index.ts'
 import type { SkillManager } from '../skill/index.ts'
 import type { HookEngine } from '../hook/engine.ts'
 import type { SubAgentManager } from '../subagent/index.ts'
 import type { TeamManager } from '../team/index.ts'
-import { CommandRegistry, BUILTIN_COMMANDS, createDispatcher } from '../commands/index.ts'
-import type { CommandDef, UiController } from '../commands/index.ts'
+import { createDispatcher } from '../commands/index.ts'
+import type { UiController } from '../commands/index.ts'
 import type { Provider } from '../provider/types.ts'
 import type { History } from '../session/history.ts'
 import type { ToolRegistry } from '../tools/index.ts'
-import type { AskResult, PermissionMode, ToolCallInfo } from '../permission/types.ts'
+import type { RuntimeEvent } from '../runtime/index.ts'
+import type { AskResult, ToolCallInfo } from '../permission/types.ts'
 import type { RuleEngine } from '../permission/index.ts'
 import type { McpClientManager } from '../mcp/index.ts'
-import { readdirSync, existsSync, writeFileSync } from 'node:fs'
-import { join } from 'node:path'
-import { listWorkflows, ensureWorkflowDirs, loadWorkflow, WORKFLOW_TEMPLATE } from '../workflow/index.ts'
-import { validateWorkflowMeta, runWorkflow } from '../workflow/index.ts'
-import { saveRun, listRuns, loadRun } from '../workflow/index.ts'
+import { readdirSync, existsSync } from 'node:fs'
+import { createAppCommandRegistry } from './command-registry.ts'
+import { createTeamAction, createWorkflowAction } from './command-actions.ts'
+import { InteractionQueue } from './interaction-queue.ts'
+import { moveCompletionIndex, selectedCompletion } from './completion.ts'
+import type { CompletionRequest } from './completion.ts'
 
 interface PendingAsk {
   call: ToolCallInfo
   reason?: string
-  resolve: (r: AskResult) => void
 }
 
 interface PendingElicit {
   question: string
   options: string[]
-  resolve: (a: string | null) => void
 }
 
 export function App({
@@ -46,6 +46,7 @@ export function App({
   hooks,
   subAgentManager,
   teamManager,
+  onSessionChange,
 }: {
   provider: Provider
   history: History
@@ -58,50 +59,44 @@ export function App({
   hooks?: HookEngine | null
   subAgentManager?: SubAgentManager | null
   teamManager?: TeamManager | null
+  onSessionChange?: (sessionId: string) => void
 }) {
+  const { exit } = useApp()
+  const askQueue = useMemo(() => new InteractionQueue<PendingAsk, AskResult>(), [])
+  const elicitQueue = useMemo(() => new InteractionQueue<PendingElicit, string | null>(), [])
   const [pendingAsks, setPendingAsks] = useState<PendingAsk[]>([])
+  const [pendingElicits, setPendingElicits] = useState<PendingElicit[]>([])
   const [compactMsg, setCompactMsg] = useState<string | null>(null)
   const [completeCandidates, setCompleteCandidates] = useState<string[]>([])
   const [completeIdx, setCompleteIdx] = useState(0)
+  const [completionRequest, setCompletionRequest] = useState<CompletionRequest | null>(null)
   const [inputEditing, setInputEditing] = useState(false)
 
-  // 权限询问队列：并发工具调用可能同时触发多个 ask，逐个确认（单槽位会覆盖丢失）
-  const ask = (call: ToolCallInfo) =>
-    new Promise<AskResult>((resolve) => {
-      setPendingAsks((prev) => [...prev, { call, reason: call.reason, resolve }])
-    })
+  useEffect(() => {
+    const unsubscribeAsk = askQueue.subscribe(setPendingAsks)
+    const unsubscribeElicit = elicitQueue.subscribe(setPendingElicits)
+    return () => {
+      unsubscribeAsk()
+      unsubscribeElicit()
+      askQueue.resolveAll('deny')
+      elicitQueue.resolveAll(null)
+    }
+  }, [askQueue, elicitQueue])
 
-  // Elicitation 队列(对齐 Claude Code):agent 提问 → 用户回答注入
-  const [pendingElicits, setPendingElicits] = useState<PendingElicit[]>([])
-  const elicit = (question: string, options: string[] = []) =>
-    new Promise<string | null>((resolve) => {
-      setPendingElicits((prev) => [...prev, { question, options, resolve }])
-    })
+  const ask = (call: ToolCallInfo, signal?: AbortSignal) => askQueue.request(
+    { call, reason: call.reason },
+    signal ? { signal, response: 'deny' } : undefined,
+  )
+  const elicit = (question: string, options: string[] = [], signal?: AbortSignal) => elicitQueue.request(
+    { question, options },
+    signal ? { signal, response: null } : undefined,
+  )
 
-  const stream = useStreamingChat(provider, history, registry, engine, ask, elicit, mcpManager, contextWindow, memory, skillManager, hooks, subAgentManager, teamManager)
+  const stream = useStreamingChat(provider, history, registry, engine, ask, elicit, mcpManager, contextWindow, memory, skillManager, hooks, subAgentManager, teamManager, onSessionChange)
   const { messages, mode, error, roundInfo, totalTokens, cacheRate, isRunning, isPlan, userMode } = stream
 
   // ---------- UiController 实现（命令与渲染解耦） ----------
-  const commandRegistry = new CommandRegistry()
-  for (const cmd of BUILTIN_COMMANDS) commandRegistry.register(cmd)
-
-  // P10：所有 Skill 启动时直接注册斜杠短命令（执行时自动激活，无需先 /skill 激活）
-  for (const s of skillManager?.list() ?? []) {
-    try {
-      commandRegistry.register({
-        name: s.name,
-        description: s.description,
-        usage: `/${s.name}`,
-        type: 'prompt',
-        handler: (args, ui) => {
-          ui.skillActivate(s.name)
-          ui.sendUserMessage(args.length > 0 ? `执行 Skill ${s.name}：${args.join(' ')}` : `执行 Skill ${s.name}`)
-        },
-      })
-    } catch {
-      // 命令名冲突跳过（已存在的命令优先）
-    }
-  }
+  const commandRegistry = useMemo(() => createAppCommandRegistry(skillManager), [skillManager])
 
   const ui: UiController = {
     showMessage: (text) => setCompactMsg(text),
@@ -147,7 +142,7 @@ export function App({
       return lines.length > 0 ? lines.join('\n') : '暂无笔记'
     },
     permissionSummary: () => {
-      return `当前模式: ${userMode}\n规则文件: ~/.mewcode/rules.yaml, .mewcode/rules.yaml, .mewcode/rules.local.yaml`
+      return `当前模式: ${userMode}\n规则文件: ~/.meicode/rules.yaml, .meicode/rules.yaml, .meicode/rules.local.yaml`
     },
     getStatus: () => {
       const parts = [`模式: ${userMode}`, `Token: ${totalTokens}t`]
@@ -158,29 +153,31 @@ export function App({
       return parts.join('\n')
     },
     auditAction: (args) => {
-      const events = memory?.runtimeEvents?.read(memory.sessionId ?? '', { type: 'audit' }) ?? []
-      if (events.length === 0) return '暂无审计事件'
-      let filtered = events
+      const rawLimit = args.at(-1)
+      const limit = rawLimit && /^\d+$/.test(rawLimit) ? Math.min(100, Math.max(1, Number(rawLimit))) : 20
       let filterLabel = ''
+      let predicate: ((event: RuntimeEvent) => boolean) | undefined
       if (args[0] === 'task' || args[0] === 'request') {
         const value = args[1]
         if (!value) return '用法: /audit task <taskId> [limit] 或 /audit request <requestId> [limit]'
-        filtered = filtered.filter((event) => args[0] === 'task' ? event.taskId === value : event.correlationId === value || event.payload?.requestId === value)
+        predicate = args[0] === 'task'
+          ? (event) => event.taskId === value
+          : (event) => event.correlationId === value || event.payload?.requestId === value
         filterLabel = `${args[0]}=${value}`
       } else if (args[0] && !/^\d+$/.test(args[0])) {
-        filtered = filtered.filter((event) => event.payload?.kind === args[0])
+        predicate = (event) => event.payload?.kind === args[0]
         filterLabel = `kind=${args[0]}`
       }
-      const rawLimit = args.at(-1)
-      const limit = rawLimit && /^\d+$/.test(rawLimit) ? Math.min(100, Math.max(1, Number(rawLimit))) : 20
-      const lines = filtered.slice(-limit).map((event) => {
+      const events = memory?.runtimeEvents?.tail(memory.sessionId ?? '', { type: 'audit', limit, predicate }) ?? []
+      if (events.length === 0) return '暂无审计事件'
+      const lines = events.map((event) => {
         const payload = event.payload ?? {}
         const kind = String(payload.kind ?? event.type)
         const links = [event.taskId ? `task=${event.taskId}` : '', event.correlationId ? `request=${event.correlationId}` : '', event.agentId ? `agent=${event.agentId}` : ''].filter(Boolean).join(' ')
         const details = JSON.stringify(payload)
         return `${event.seq} ${new Date(event.ts).toLocaleTimeString()} ${kind}${links ? ` ${links}` : ''}${details !== '{}' ? ` ${details.slice(0, 240)}` : ''}`
       })
-      return `审计事件${filterLabel ? `（${filterLabel}）` : ''}，共 ${filtered.length} 条：\n${lines.join('\n')}`
+      return `审计事件${filterLabel ? `（${filterLabel}）` : ''}，最近 ${events.length} 条：\n${lines.join('\n')}`
     },
     listCommands: (includeHidden) => commandRegistry.list(includeHidden),
     skillList: () => {
@@ -195,140 +192,16 @@ export function App({
       skillManager.deactivate(name)
       return `已停用 Skill: ${name}`
     },
-    teamAction: (action, args) => {
-      if (!teamManager) return '团队系统未启用'
-      try {
-        if (action === 'list') {
-          const groups = teamManager.listGroups()
-          return groups.length ? `小组: ${groups.join(', ')}` : '暂无小组'
-        }
-        if (action === 'create') {
-          const name = args[0]
-          if (!name) return '用法: /team create <组名>'
-          teamManager.createGroup(name, 'lead')
-          return `已创建小组: ${name}`
-        }
-        if (action === 'spawn') {
-          const [group, member, role] = args
-          if (!group || !member || !role) return '用法: /team spawn <组> <成员> <角色>'
-          const g = teamManager.loadGroup(group)
-          if (!g) return `小组不存在: ${group}`
-          void teamManager.spawnMember(g, member, role).then(() => {
-            setCompactMsg(`已派生成员 ${member}（角色: ${role}）加入小组 ${group}`)
-          })
-          return `正在派生成员 ${member}（角色: ${role}）...`
-        }
-        if (action === 'tasks') {
-          const group = args[0]
-          if (!group) return '用法: /team tasks <组>'
-          const tasks = teamManager.listTasks(group)
-          return tasks.length ? tasks.map((t) => `  ${t.id} [${t.status}] ${t.title}${t.assignee ? ` → ${t.assignee}` : ''}`).join('\n') : '（无任务）'
-        }
-        if (action === 'assign') {
-          if (args.length < 3) return '用法: /team assign <组> <任务描述> <成员>'
-          const [group, member] = [args[0], args[args.length - 1]]
-          const title = args.slice(1, -1).join(' ')
-          const g = teamManager.loadGroup(group)
-          if (!g) return `小组不存在: ${group}`
-          const task = teamManager.addTask(group, title, member)
-          void teamManager.assignTask(g, task, member).then((r) => setCompactMsg(r))
-          return `已创建任务 ${task.id} 并指派 ${member}`
-        }
-        if (action === 'merge') {
-          const group = args[0]
-          if (!group) return '用法: /team merge <组>'
-          const g = teamManager.loadGroup(group)
-          if (!g) return `小组不存在: ${group}`
-          void teamManager.mergeAll(g).then((r) => setCompactMsg(r))
-          return '开始合并成员 worktree...'
-        }
-        return `未知操作: ${action}`
-      } catch (e) {
-        return `团队操作失败: ${(e as Error).message}`
-      }
-    },
-    workflowAction: (action, args) => {
-      if (!subAgentManager) return 'Workflow 需要子 agent 系统'
-      try {
-        const cwd = process.cwd()
-        if (action === 'list') {
-          const wf = listWorkflows(cwd)
-          return wf.length ? `workflows: ${wf.join(', ')}` : '暂无 workflow（/workflow create <名称> 创建）'
-        }
-        if (action === 'create') {
-          const name = args[0]
-          if (!name) return '用法: /workflow create <名称>'
-          const { project } = ensureWorkflowDirs(cwd)
-          const file = join(project, `${name}.workflow.js`)
-          if (existsSync(file)) return `已存在: ${file}`
-          writeFileSync(file, WORKFLOW_TEMPLATE.replace('NAME', name).replace('DESC', `${name} workflow`), 'utf8')
-          return `已创建: ${file}\n编辑后 /workflow validate ${name} 校验`
-        }
-        if (action === 'validate') {
-          const name = args[0]
-          if (!name) return '用法: /workflow validate <名称>'
-          const p = (async () => {
-            try {
-              const meta = await loadWorkflow(cwd, name)
-              const issues = validateWorkflowMeta(meta)
-              setCompactMsg(
-                issues.length === 0
-                  ? `校验通过: ${meta.name} (${meta.phases.length} phases)`
-                  : `校验失败:\n${issues.map((i) => `  ${i.path}: ${i.message}`).join('\n')}`,
-              )
-            } catch (e) {
-              setCompactMsg(`校验失败: ${(e as Error).message}`)
-            }
-          })()
-          void p
-          return `正在校验 ${name}...`
-        }
-        if (action === 'run') {
-          const name = args[0]
-          if (!name) return '用法: /workflow run <名称>'
-          const p = (async () => {
-            try {
-              const meta = await loadWorkflow(cwd, name)
-              const record = await runWorkflow(meta, {
-                provider,
-                registry,
-                ctx: { cwd },
-                subagents: subAgentManager!,
-                onProgress: (msg) => setCompactMsg(msg),
-              })
-              saveRun(cwd, record)
-              setCompactMsg(`[workflow] ${meta.name}: ${record.status} — /workflows 查看`)
-            } catch (e) {
-              setCompactMsg(`[workflow] 运行失败: ${(e as Error).message}`)
-            }
-          })()
-          void p
-          return `已启动 workflow ${name}（后台执行，进度见提示）`
-        }
-        if (action === 'runs') {
-          const runs = listRuns(cwd)
-          if (!runs.length) return '暂无运行记录'
-          return runs
-            .map((r) => {
-              const done = r.phases.filter((p) => p.status === 'completed').length
-              return `  ${r.runId.slice(0, 8)} ${r.workflow.padEnd(16)} ${r.status.padEnd(9)} ${done}/${r.phases.length} ${new Date(r.createdAt).toLocaleTimeString()}`
-            })
-            .join('\n')
-        }
-        if (action === 'run-info') {
-          const runId = args[0]
-          if (!runId) return '用法: /workflows <runId>'
-          const rec = loadRun(cwd, runId)
-          if (!rec) return `运行不存在: ${runId}`
-          return rec.phases
-            .map((p) => `  ${p.status.padEnd(9)} ${p.title}${p.artifactPath ? ` → ${p.artifactPath}` : ''}${p.error ? ` (${p.error})` : ''}`)
-            .join('\n')
-        }
-        return '用法: /workflow create|validate|run <名称>'
-      } catch (e) {
-        return `workflow 操作失败: ${(e as Error).message}`
-      }
-    },
+    teamAction: createTeamAction(teamManager, setCompactMsg),
+    workflowAction: createWorkflowAction({
+      cwd: process.cwd(),
+      provider,
+      registry,
+      subAgentManager,
+      teamManager,
+      getContext: stream.getToolContext,
+      notify: setCompactMsg,
+    }),
   }
 
   const dispatcher = createDispatcher(commandRegistry, ui)
@@ -343,8 +216,7 @@ export function App({
       // 选项快速选择:输入数字或直接匹配选项
       const idx = /^\d+$/.test(trimmed) ? Number(trimmed) - 1 : -1
       const answer = idx >= 0 && idx < current.options.length ? current.options[idx] : trimmed
-      current.resolve(answer)
-      setPendingElicits((prev) => prev.slice(1))
+      elicitQueue.resolveNext(answer)
       return
     }
     // Skill 名引导：输入 /review 但它是 Skill 不是命令 → 提示激活方式
@@ -373,29 +245,38 @@ export function App({
 
   useInput(
     (input, key) => {
+      if (key.ctrl && input.toLowerCase() === 'c') {
+        if (isRunning) {
+          stream.cancel()
+          askQueue.resolveAll('deny')
+          elicitQueue.resolveAll(null)
+        } else {
+          exit()
+        }
+        return
+      }
       if (pendingAsks.length > 0) {
-        const current = pendingAsks[0]
         const done = (r: AskResult) => {
-          current.resolve(r)
-          setPendingAsks((prev) => prev.slice(1))
+          askQueue.resolveNext(r)
         }
         if (key.return) done('once')
         else if (input.toLowerCase() === 's') done('session')
         else if (input.toLowerCase() === 'p') done('forever')
-        else if (key.escape || (key.ctrl && input.toLowerCase() === 'c')) done('deny')
+        else if (key.escape) done('deny')
         return
       }
       // 补全菜单导航
       if (completeCandidates.length > 0) {
         if (key.upArrow) {
-          setCompleteIdx((i) => (i - 1 + completeCandidates.length) % completeCandidates.length)
+          setCompleteIdx((index) => moveCompletionIndex(index, completeCandidates.length, -1))
           return
         }
         if (key.downArrow) {
-          setCompleteIdx((i) => (i + 1) % completeCandidates.length)
+          setCompleteIdx((index) => moveCompletionIndex(index, completeCandidates.length, 1))
           return
         }
         if (key.return || input === ' ') {
+          setCompletionRequest(selectedCompletion(completeCandidates, completeIdx))
           setCompleteCandidates([])
           return
         }
@@ -403,10 +284,6 @@ export function App({
           setCompleteCandidates([])
           return
         }
-      }
-      if (key.ctrl && input.toLowerCase() === 'c') {
-        if (isRunning) stream.cancel()
-        else Promise.allSettled([teamManager?.close(), subAgentManager?.close(), mcpManager?.closeAll()]).finally(() => process.exit(0))
       }
     },
     { isActive: process.stdin.isTTY === true },
@@ -457,6 +334,8 @@ export function App({
           onTabComplete={handleTabComplete}
           disabled={isRunning}
           menuOpen={completeCandidates.length > 0}
+          completionRequest={completionRequest}
+          onCompletionApplied={() => setCompletionRequest(null)}
           onEditingChange={setInputEditing}
           placeholder={isRunning ? '执行中…（Ctrl+C 取消）' : undefined}
         />

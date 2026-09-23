@@ -52,7 +52,16 @@ export interface A2APushNotificationConfig {
   authentication?: { scheme: string; credentials: string }
 }
 
+export interface A2APushOutboxEntry {
+  deliveryId: string
+  config: A2APushNotificationConfig
+  event: { kind: 'artifact'; artifactId: string; append: boolean; lastChunk: boolean } | { kind: 'terminal'; status: A2AStatus }
+  attempts: number
+  nextAttemptAt: number
+}
+
 export interface A2AStoredTask {
   task: A2ATask
   pushNotificationConfigs: A2APushNotificationConfig[]
+  pendingPushDeliveries: A2APushOutboxEntry[]
 }

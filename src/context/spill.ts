@@ -1,5 +1,6 @@
 import { mkdir, writeFile } from 'node:fs/promises'
 import { join, relative, isAbsolute } from 'node:path'
+import { projectStatePath } from '../state-paths.ts'
 
 // 对齐 Claude Code(>50KB 写盘留引用)：4KB 太激进——4-8KB 的普通结果
 // 被替换成 [已存盘] 预览,模型看不到完整内容还得再读文件
@@ -9,7 +10,7 @@ export const PREVIEW_LEN = 200
 
 // 写存盘文件，返回相对 cwd 路径（对话内展示用）
 export async function spillContent(content: string, cwd: string, seq: number): Promise<string> {
-  const dir = join(cwd, '.mewcode', 'artifacts')
+  const dir = projectStatePath(cwd, 'artifacts')
   await mkdir(dir, { recursive: true })
   const file = join(dir, `spill_${Date.now()}_${seq}.txt`)
   await writeFile(file, content, 'utf8')

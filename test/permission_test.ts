@@ -1,7 +1,9 @@
 // 权限系统测试：黑名单/沙箱/规则/优先级/模式/人在回路
 import { mkdirSync, rmSync, writeFileSync, symlinkSync, existsSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
+import { spawn } from 'node:child_process'
 import { checkPermission, RuleEngine, matchBlacklist, isPathAllowed } from '../src/permission/index.ts'
+import { isReadOnlyCommand } from '../src/permission/command-policy.ts'
 import type { PermissionMode, Rule, ToolCallInfo } from '../src/permission/types.ts'
 
 let passed = 0
@@ -154,6 +156,30 @@ async function main() {
     const r = engine2.match(call('read_file', { path: 'src/index.ts' }))
     if (!r || r.action !== 'allow') throw new Error('重载后规则未生效')
   })
+  await check('规则: 多进程并发追加不丢失且自动去重', async () => {
+    const projectFile = join(TMP, 'rules-concurrent.yaml')
+    rmSync(projectFile, { force: true })
+    const child = `import { RuleEngine } from './src/permission/rules.ts'; const [file, index] = process.argv.slice(1); const engine = new RuleEngine('', file, ''); engine.loadAll(); engine.appendProjectRule({ tool: 'read_file', pattern: 'parallel/' + index + '/**', action: 'allow' }); engine.appendProjectRule({ tool: 'read_file', pattern: 'parallel/' + index + '/**', action: 'allow' });`
+    const writers = Array.from({ length: 16 }, (_, index) => new Promise<void>((resolve, reject) => {
+      const processHandle = spawn(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', child, projectFile, String(index)], {
+        cwd: join(import.meta.dirname, '..'),
+        windowsHide: true,
+        stdio: ['ignore', 'ignore', 'pipe'],
+      })
+      let stderr = ''
+      processHandle.stderr.on('data', (chunk) => { stderr += String(chunk) })
+      processHandle.on('error', reject)
+      processHandle.on('exit', (code) => code === 0 ? resolve() : reject(new Error(`规则写入子进程失败 ${code}: ${stderr}`)))
+    }))
+    await Promise.all(writers)
+    const reloaded = new RuleEngine('', projectFile, '')
+    reloaded.loadAll()
+    for (let index = 0; index < 16; index++) {
+      if (!reloaded.match(call('read_file', { path: `parallel/${index}/file.ts` }))) throw new Error(`并发规则 ${index} 丢失`)
+    }
+    const count = ((reloaded as unknown as { rulesBySource: { project: Rule[] } }).rulesBySource.project).length
+    if (count !== 16) throw new Error(`并发规则未去重: ${count}`)
+  })
 
   // ---------- 裁决链 ----------
   await check('裁决: 黑名单优先（permissive 也拦截）', async () => {
@@ -224,6 +250,57 @@ async function main() {
     }
   })
 
+  await check('权限: 黑名单不能通过命令链或 Shell 包装绕过', async () => {
+    const engine = new RuleEngine('', '', '')
+    for (const args of [
+      { command: 'echo ok & shutdown /s' },
+      { command: 'echo ok && cmd /c shutdown /s' },
+      { command: 'cmd /c shutdown /s' },
+      { command: 'cmd', args: ['/c', 'shutdown', '/s'] },
+      { command: 'powershell -Command "shutdown /s"' },
+    ]) {
+      const decision = await checkPermission(call('run_command', args), { cwd: TMP, mode: 'unattended', engine })
+      if (decision.type !== 'deny') throw new Error(`高危命令未拒绝: ${JSON.stringify(args)} => ${decision.type}`)
+    }
+  })
+
+  await check('权限: 审批 argv 只授权完整调用', async () => {
+    const engine = new RuleEngine('', '', '')
+    const approved = call('run_command', { command: 'git', args: ['push', '--force'] })
+    engine.addSessionRule({ tool: 'run_command', pattern: 'argv:["git","push","--force"]', action: 'allow' }, 'argv-scope')
+    if (engine.match(approved, 'argv-scope')?.action !== 'allow') throw new Error('原调用未获授权')
+    for (const args of [
+      { command: 'git', args: ['clean', '-fdx'] },
+      { command: 'git', args: ['push --force'] },
+      { command: 'git', args: ['push', '--force', 'origin'] },
+    ]) {
+      if (engine.match(call('run_command', args), 'argv-scope')) throw new Error(`授权泄漏: ${JSON.stringify(args)}`)
+    }
+    engine.addSessionRule({ tool: 'run_command', pattern: `argv:${JSON.stringify(['tool', 'a\\b'])}`, action: 'allow' }, 'path-scope')
+    if (engine.match(call('run_command', { command: 'tool', args: ['a/b'] }), 'path-scope')) {
+      throw new Error('argv 授权错误地合并了斜杠与反斜杠')
+    }
+  })
+
+  await check('权限: 只读分类不误放行状态变更命令', () => {
+    for (const command of ['git status', 'git log -3', 'git remote -v', 'git remote get-url origin']) {
+      if (!isReadOnlyCommand(command)) throw new Error(`只读命令未识别: ${command}`)
+    }
+    for (const command of ['git fetch origin', 'git branch new-branch', 'git remote set-url origin https://example.com/x.git', 'git config --global user.name changed', 'git diff --output=out.patch']) {
+      if (isReadOnlyCommand(command)) throw new Error(`状态变更命令被标为只读: ${command}`)
+    }
+  })
+
+  await check('裁决: unattended 放行普通工具但拒绝危险命令', async () => {
+    const engine = makeEngine()
+    const ordinary = await checkPermission(call('run_command', { command: 'npm test' }), { cwd: TMP, mode: 'unattended', engine })
+    if (ordinary.type !== 'allow') throw new Error(`普通命令未放行: ${JSON.stringify(ordinary)}`)
+    for (const command of ['git config --global user.name changed', 'git remote set-url origin https://example.com/x.git', 'git reset --hard']) {
+      const decision = await checkPermission(call('run_command', { command }), { cwd: TMP, mode: 'unattended', engine })
+      if (decision.type !== 'deny') throw new Error(`危险命令未拒绝: ${command} => ${JSON.stringify(decision)}`)
+    }
+  })
+
   await check('规则: loadAll 幂等且不重复加载', () => {
     const projectFile = join(TMP, 'rules-idempotent.yaml')
     writeFileSync(projectFile, JSON.stringify({ rules: [{ tool: 'read_file', pattern: 'src/**', action: 'allow' }] }), 'utf8')
@@ -243,6 +320,35 @@ async function main() {
     const reloaded = new RuleEngine('', projectFile, '')
     reloaded.loadAll()
     if (!reloaded.match(call('read_file', { path: 'src/index.ts' }))) throw new Error('坏配置追加后规则未生效')
+  })
+
+  await check('session rules are isolated by session id', () => {
+    const engine = makeEngine()
+    engine.addSessionRule({ tool: 'run_command', pattern: 'npm install', action: 'allow' }, 'session-a')
+    if (engine.match(call('run_command', { command: 'npm install' }), 'session-a')?.action !== 'allow') {
+      throw new Error('original session grant did not match')
+    }
+    if (engine.match(call('run_command', { command: 'npm install' }), 'session-b')) {
+      throw new Error('session grant leaked into another session')
+    }
+  })
+
+  await check('session rules are removed when a session ends', () => {
+    const engine = makeEngine()
+    const rule = { tool: 'run_command', pattern: 'npm install', action: 'allow' as const }
+    engine.addSessionRule(rule, 'session-a')
+    engine.addSessionRule(rule, 'session-b')
+    engine.clearSessionRules('session-a')
+    if (engine.match(call('run_command', { command: 'npm install' }), 'session-a')) {
+      throw new Error('ended session grant was retained')
+    }
+    if (engine.match(call('run_command', { command: 'npm install' }), 'session-b')?.action !== 'allow') {
+      throw new Error('clearing one session removed another session grant')
+    }
+    engine.clearSessionRules()
+    if (engine.match(call('run_command', { command: 'npm install' }), 'session-b')) {
+      throw new Error('global session rule cleanup failed')
+    }
   })
 
   rmSync(TMP, { recursive: true, force: true })

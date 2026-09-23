@@ -2,12 +2,14 @@ import { createServer } from 'node:http'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { Provider } from './provider/types.ts'
 import { History } from './session/history.ts'
-import type { ToolRegistry, ToolContext } from './tools/index.ts'
+import type { ToolRegistry } from './tools/index.ts'
 import type { RuleEngine } from './permission/index.ts'
+import type { PermissionMode } from './permission/types.ts'
 import { runAgent } from './agent/loop.ts'
 import { buildPrompt } from './agent/prompt/index.ts'
-import { createRuntimeId, recordAudit } from './runtime/index.ts'
+import { createAgentRuntimeContext, createRuntimeId, recordAudit } from './runtime/index.ts'
 import type { RuntimeEventLog } from './runtime/index.ts'
+import type { HookEngine } from './hook/engine.ts'
 
 // ACP(Agent Client Protocol)服务端——MeiCode 的编程入口:
 // 脚本/其他工具通过标准 HTTP+SSE 协议驱动 agent(流式事件/多会话/取消)
@@ -15,13 +17,17 @@ import type { RuntimeEventLog } from './runtime/index.ts'
 //   POST /session/new                    → {sessionId}
 //   POST /session/:id/prompt {text}      → SSE 事件流(text/tool_call/done/error)
 //   POST /session/:id/cancel             → 取消当前执行
+//   POST /session/:id/close              → 关闭会话并释放额度
 //   GET  /health                         → {ok}
 
 interface AcpSession {
   history: History
+  agentId: string
+  lastActivity: number
+  initializing: boolean
   agent?: ReturnType<typeof runAgent>
-  controller?: AbortController
   timer?: ReturnType<typeof setTimeout>
+  closing?: Promise<void>
 }
 
 export interface AcpOptions {
@@ -37,6 +43,9 @@ export interface AcpOptions {
   sessionTtlMs?: number
   runtimeEvents?: RuntimeEventLog
   sessionId?: string
+  contextWindow?: number
+  permissionMode?: PermissionMode
+  hooks?: HookEngine
 }
 
 export function createAcpServer(opts: AcpOptions): ReturnType<typeof createServer> {
@@ -46,6 +55,9 @@ export function createAcpServer(opts: AcpOptions): ReturnType<typeof createServe
   const maxConcurrentAgents = opts.maxConcurrentAgents ?? 4
   const sessionTtlMs = opts.sessionTtlMs ?? 24 * 60 * 60 * 1000
   let activeAgents = 0
+  let closed = false
+  let activityCounter = 0
+  const scopeSessionId = (id: string): string => opts.sessionId ?? id
 
   const sendJson = (res: ServerResponse, code: number, body: unknown) => {
     res.writeHead(code, { 'content-type': 'application/json' })
@@ -65,7 +77,6 @@ export function createAcpServer(opts: AcpOptions): ReturnType<typeof createServe
           const error = new Error('请求体过大') as Error & { statusCode?: number }
           error.statusCode = 413
           reject(error)
-          req.destroy()
           return
         }
         raw += c
@@ -82,20 +93,48 @@ export function createAcpServer(opts: AcpOptions): ReturnType<typeof createServe
       req.on('error', reject)
     })
 
+  const finishSession = async (id: string, session: AcpSession): Promise<void> => {
+    if (session.closing) return session.closing
+    if (session.timer) clearTimeout(session.timer)
+    sessions.delete(id)
+    const scopedId = scopeSessionId(id)
+    const agent = session.agent
+    agent?.cancel()
+    session.closing = (async () => {
+      try {
+        await agent?.done.catch(() => undefined)
+        await opts.hooks?.fire('session_end', { cwd: opts.cwd, sessionId: scopedId })
+      } finally {
+        opts.hooks?.clearSession(scopedId)
+        opts.engine.clearSessionRules(scopedId)
+        if (scopedId !== id) {
+          opts.hooks?.clearSession(id)
+          opts.engine.clearSessionRules(id)
+        }
+      }
+    })()
+    return session.closing
+  }
+
   const touch = (id: string, session: AcpSession): void => {
+    if (closed || sessions.get(id) !== session) return
+    session.lastActivity = ++activityCounter
     if (session.timer) clearTimeout(session.timer)
     session.timer = setTimeout(() => {
       if (session.agent) {
-        session.controller?.abort()
+        session.agent.cancel()
         touch(id, session)
         return
       }
-      sessions.delete(id)
+      void finishSession(id, session)
     }, sessionTtlMs)
   }
 
   const authorized = (req: IncomingMessage): boolean => {
-    if (!opts.authToken) return true
+    if (!opts.authToken) {
+      const address = req.socket.remoteAddress ?? ''
+      return address === '::1' || /^127\./.test(address) || /^::ffff:127\./i.test(address)
+    }
     return req.headers.authorization === `Bearer ${opts.authToken}`
   }
 
@@ -116,13 +155,31 @@ export function createAcpServer(opts: AcpOptions): ReturnType<typeof createServe
 
       // POST /session/new
       if (req.method === 'POST' && parts[0] === 'session' && parts[1] === 'new') {
-        if (sessions.size >= maxSessions) return sendJson(res, 429, { error: '会话数量已达上限' })
+        let evicted: Promise<void> | undefined
+        if (sessions.size >= maxSessions) {
+          let oldest: [string, AcpSession] | undefined
+          for (const entry of sessions) {
+            if (entry[1].agent || entry[1].closing || entry[1].initializing) continue
+            if (!oldest || entry[1].lastActivity < oldest[1].lastActivity) oldest = entry
+          }
+          if (!oldest) return sendJson(res, 429, { error: '会话数量已达上限，且没有可回收的空闲会话' })
+          evicted = finishSession(...oldest)
+        }
         const id = `acp-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`
-        const session: AcpSession = { history: new History(), controller: new AbortController() }
+        const session: AcpSession = { history: new History(), agentId: createRuntimeId('agent'), lastActivity: 0, initializing: true }
         sessions.set(id, session)
         touch(id, session)
-        recordAudit(opts.runtimeEvents, { kind: 'acp_session_created', sessionId: opts.sessionId ?? id, taskId: id, requestId, payload: { protocol: 'acp' } })
-        return sendJson(res, 200, { sessionId: id })
+        try {
+          await evicted?.catch((error: unknown) => console.warn(`[ACP] 回收空闲会话失败: ${(error as Error).message}`))
+          await opts.hooks?.fire('session_start', { cwd: opts.cwd, sessionId: scopeSessionId(id) })
+          recordAudit(opts.runtimeEvents, { kind: 'acp_session_created', sessionId: opts.sessionId ?? id, taskId: id, requestId, payload: { protocol: 'acp' } })
+          sendJson(res, 200, { sessionId: id })
+          session.initializing = false
+          return
+        } catch (error) {
+          void finishSession(id, session).catch((cleanupError: unknown) => console.warn(`[ACP] 清理创建失败会话异常: ${(cleanupError as Error).message}`))
+          throw error
+        }
       }
 
       // GET /health
@@ -133,8 +190,21 @@ export function createAcpServer(opts: AcpOptions): ReturnType<typeof createServe
       // POST /session/:id/cancel
       if (req.method === 'POST' && parts[0] === 'session' && parts[2] === 'cancel') {
         const s = sessions.get(parts[1])
-        if (s) s.controller?.abort()
+        s?.agent?.cancel()
         recordAudit(opts.runtimeEvents, { kind: 'acp_cancel_requested', sessionId: opts.sessionId ?? parts[1], taskId: parts[1], requestId, payload: { found: Boolean(s) } })
+        return sendJson(res, 200, { ok: true })
+      }
+
+      if (req.method === 'POST' && parts[0] === 'session' && parts[2] === 'close') {
+        const session = sessions.get(parts[1])
+        if (!session) return sendJson(res, 404, { error: '会话不存在' })
+        const active = Boolean(session.agent)
+        const closing = finishSession(parts[1], session)
+        if (active) {
+          void closing.catch((error: unknown) => console.warn(`[ACP] 关闭会话失败: ${(error as Error).message}`))
+          return sendJson(res, 202, { ok: true, closing: true })
+        }
+        await closing
         return sendJson(res, 200, { ok: true })
       }
 
@@ -152,7 +222,7 @@ export function createAcpServer(opts: AcpOptions): ReturnType<typeof createServe
         const text = String(body.text ?? '')
         if (!text) return sendJson(res, 400, { error: '缺少 text' })
 
-        const agentId = createRuntimeId('agent')
+        const agentId = s.agentId
         const auditSessionId = opts.sessionId ?? parts[1]
         const startedAt = Date.now()
         recordAudit(opts.runtimeEvents, { kind: 'acp_prompt_started', sessionId: auditSessionId, agentId, taskId: parts[1], requestId, payload: { textLength: text.length } })
@@ -165,16 +235,18 @@ export function createAcpServer(opts: AcpOptions): ReturnType<typeof createServe
         const send = (type: string, data: unknown) => res.write(`event: ${type}\ndata: ${JSON.stringify(data)}\n\n`)
 
         s.history.push({ role: 'user', content: text })
-        const ctx: ToolContext = {
+        const ctx = createAgentRuntimeContext({
+          provider: opts.provider,
+          history: s.history,
+          engine: opts.engine,
           cwd: opts.cwd,
           sessionId: auditSessionId,
           agentId,
           runtimeEvents: opts.runtimeEvents,
-          timeoutMs: 30000,
-          permission: { mode: 'permissive', engine: opts.engine, autoAcceptEdits: true },
-        }
-        const controller = new AbortController()
-        s.controller = controller
+          contextWindow: opts.contextWindow,
+          permissionMode: opts.permissionMode,
+          hooks: opts.hooks,
+        })
         activeAgents++
         try {
           s.agent = runAgent({
@@ -209,7 +281,6 @@ export function createAcpServer(opts: AcpOptions): ReturnType<typeof createServe
             send('error', { message: (e as Error).message })
           } finally {
             s.agent = undefined
-            s.controller = undefined
             activeAgents = Math.max(0, activeAgents - 1)
             touch(parts[1], s)
             res.end()
@@ -217,8 +288,8 @@ export function createAcpServer(opts: AcpOptions): ReturnType<typeof createServe
         })()
 
         // 客户端断开时取消
-        req.on('close', () => {
-          if (!res.writableEnded) controller.abort()
+        res.on('close', () => {
+          if (!res.writableEnded) s.agent?.cancel()
         })
         return
       }
@@ -231,11 +302,10 @@ export function createAcpServer(opts: AcpOptions): ReturnType<typeof createServe
   })
 
   server.on('close', () => {
-    for (const session of sessions.values()) {
-      session.controller?.abort()
-      if (session.timer) clearTimeout(session.timer)
+    closed = true
+    for (const [id, session] of sessions) {
+      void finishSession(id, session)
     }
-    sessions.clear()
     activeAgents = 0
   })
 

@@ -43,6 +43,10 @@ export interface SubAgentRecord {
   startedAt: number
   updatedAt?: number
   finishedAt?: number
+  ownerId?: string
+  leaseExpiresAt?: number
+  cancelRequestedAt?: number
+  cancelReason?: string
   tokens?: number
   reportId?: string
   result?: string

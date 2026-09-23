@@ -7,10 +7,12 @@ const root = join(import.meta.dirname, 'fixtures_team_process')
 rmSync(root, { recursive: true, force: true })
 mkdirSync(root, { recursive: true })
 
-function worker(mode: 'claim' | 'member', name: string): Promise<string> {
+function worker(mode: 'claim' | 'member' | 'group', name: string): Promise<string> {
   const script = mode === 'claim'
     ? `import { TeamGroupStore } from './src/team/group.ts'; const store = new TeamGroupStore(process.env.TEAM_ROOT); const result = store.claimTask('claim', 'shared', { status: 'in_progress', assignee: process.env.WORKER }); process.stdout.write(result ? 'won' : 'lost')`
-    : `import { TeamGroupStore } from './src/team/group.ts'; const store = new TeamGroupStore(process.env.TEAM_ROOT); const group = store.loadGroup('members'); if (!group) process.exit(2); store.addMember(group, { name: process.env.WORKER, role: 'worker', workdir: process.cwd(), backend: 'coroutine', needsApproval: false, status: 'idle' }); process.stdout.write('ok')`
+    : mode === 'member'
+      ? `import { TeamGroupStore } from './src/team/group.ts'; const store = new TeamGroupStore(process.env.TEAM_ROOT); const group = store.loadGroup('members'); if (!group) process.exit(2); store.addMember(group, { name: process.env.WORKER, role: 'worker', workdir: process.cwd(), backend: 'coroutine', needsApproval: false, status: 'idle' }); process.stdout.write('ok')`
+      : `import { TeamGroupStore } from './src/team/group.ts'; const store = new TeamGroupStore(process.env.TEAM_ROOT); store.createGroup('members', 'lead'); process.stdout.write('ok')`
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, ['--import', 'tsx', '--eval', script], {
       cwd: join(import.meta.dirname, '..'),
@@ -38,6 +40,10 @@ const members = await Promise.all(Array.from({ length: 8 }, (_, i) => worker('me
 if (members.some((result) => result !== 'ok')) throw new Error('跨进程成员注册失败')
 const registered = store.loadGroup('members')?.members ?? []
 if (registered.length !== 8 || new Set(registered.map((member) => member.name)).size !== 8) throw new Error(`跨进程成员注册丢失: ${registered.map((member) => member.name).join(',')}`)
+const duplicateCreates = await Promise.all(Array.from({ length: 8 }, (_, i) => worker('group', `creator-${i}`)))
+if (duplicateCreates.some((result) => result !== 'ok')) throw new Error('跨进程重复建组失败')
+const afterDuplicateCreate = store.loadGroup('members')?.members ?? []
+if (afterDuplicateCreate.length !== 8) throw new Error(`跨进程重复建组覆盖成员: ${afterDuplicateCreate.length}`)
 
 rmSync(root, { recursive: true, force: true })
 console.log('team_process_test passed')

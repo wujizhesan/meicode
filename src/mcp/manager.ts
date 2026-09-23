@@ -4,6 +4,7 @@ import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/
 import type { McpServerConfig } from './config.ts'
 import type { ToolResult } from '../tools/index.ts'
 import { withIdleTimeout } from '../provider/timeout.ts'
+import { MEICODE_VERSION } from '../version.ts'
 
 export interface RemoteToolInfo {
   name: string
@@ -32,7 +33,7 @@ export class McpClientManager {
   }
 
   private async connect(server: McpServerConfig): Promise<Client> {
-    const client = new Client({ name: 'meicode', version: '0.1.0' }, { capabilities: {} })
+    const client = new Client({ name: 'meicode', version: MEICODE_VERSION }, { capabilities: {} })
     let transport
     if (server.type === 'stdio') {
       const env: Record<string, string> = {}

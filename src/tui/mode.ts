@@ -1,5 +1,5 @@
 import type { PermissionMode } from '../permission/types.ts'
-import type { AgentMode, UserMode } from './useStream.ts'
+import type { AgentMode, UserMode } from './types.ts'
 
 export interface ModeConfig {
   agentMode: AgentMode

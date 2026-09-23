@@ -33,6 +33,7 @@ export interface ToolEvidence {
 import type { AskResult, PermissionContext, ToolCallInfo } from '../permission/types.ts'
 import { basename, dirname, join, resolve, sep } from 'node:path'
 import { existsSync, realpathSync } from 'node:fs'
+import { hasGitWriteOption, isReadOnlyCommand } from '../permission/command-policy.ts'
 
 export interface ToolContext {
   sessionId?: string
@@ -43,14 +44,14 @@ export interface ToolContext {
   contextBudget?: () => import('../context/manager.ts').ContextBudgetSnapshot
   // 路径围栏：非空时文件工具禁止写入该根目录之外（团队成员 worktree 隔离）
   rootLock?: string
-  // 额外允许写路径（rootLock 外,如报告产出目录 .mewcode/artifacts——专家的产出物契约）
+  // 额外允许写路径（rootLock 外,如报告产出目录 .meicode/artifacts——专家的产出物契约）
   rootLockExtra?: string[]
   timeoutMs?: number
   signal?: AbortSignal
   permission?: PermissionContext
-  ask?: (call: ToolCallInfo) => Promise<AskResult>
+  ask?: (call: ToolCallInfo, signal?: AbortSignal) => Promise<AskResult>
   // Elicitation(对齐 Claude Code):agent 主动反问用户,拿自由文本回答继续
-  elicit?: (question: string, options?: string[]) => Promise<string | null>
+  elicit?: (question: string, options?: string[], signal?: AbortSignal) => Promise<string | null>
   // P7 上下文管理挂钩
   spill?: (results: { content: string }[]) => Promise<{ content: string }[]>
   beforeRequest?: (mode: 'auto' | 'manual') => Promise<void>
@@ -100,25 +101,15 @@ const ABS_PATH_RE = /(?<![A-Za-z0-9_\\/.:-])[A-Za-z]:[\\/][^\s'"`<>|&;()]*/g
 // lookbehind 必须是 token 边界/分隔符（空白/引号/符号/\ /）——排除 '.' 与字母，
 // 否则 .\.. 前缀（'..' 前是 '\'）绕过、句尾省略号（hello... 的 .. 后是行尾）误杀
 // 无 g 标志：test() 有 lastIndex 状态，交替调用会漏检
-const DOTDOT_RE = /(?<=^|[\s"'&|;()\\/])\.\.(?=[\\/\s"'&|;()]|$)/
+const DOTDOT_RE = /(?<=^|[\s"'&|;()\\/=])\.\.(?=[\\/\s"'&|;()]|$)/
 
-// 只读命令(同 permission): 侦察/查看外部目标目录需要,不做路径围栏(它们不改文件)
-// 白名单只放纯只读无副作用命令;sed(-i 写文件)/find(-exec/-delete)/node(-e 任意执行)不放
-// Windows 原生只读命令(finder/more/findstr)与 Unix 常用(ls/cat/head 等,成员在 cmd 里易混用,放行由模型自行适配)
-const READONLY_CMD_RE =
-  /^\s*(ls|dir|type|cat|where|head|tail|wc|file|stat|du|strings|xxd|od|grep|findstr|more|git\s+(status|log|diff|show|branch|remote|fetch|ls-files|rev-parse)|node\s+-v|npm\s+(ls|view))\b/i
-
-const SHELL_OPERATOR_RE = /[&;<>\r\n]/
-
-export function isReadOnlyCommand(command: string): boolean {
-  if (SHELL_OPERATOR_RE.test(command) || /\|\|/.test(command)) return false
-  return command.split('|').every((part) => READONLY_CMD_RE.test(part.trim()))
-}
+export { isReadOnlyCommand } from '../permission/command-policy.ts'
 
 export function guardCommand(ctx: ToolContext, command: string): string | null {
   if (!ctx.rootLock) return null
+  if (hasGitWriteOption(command)) return `命令可能将 Git 输出写入工作目录外: ${command}`
   // 只读命令豁免——调研/经理要查看外部目标目录(核心需求),只读不改文件
-  if (isReadOnlyCommand(command)) return null
+  if (isReadOnlyCommand(command, { allowPipelines: true })) return null
   if (DOTDOT_RE.test(command)) {
     return `命令包含相对路径穿越（..），只能在工作目录 ${ctx.rootLock} 内操作。读取外部目标文件请改用 read_file 工具——它不受目录限制`
   }

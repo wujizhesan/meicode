@@ -1,9 +1,9 @@
-// MewCode 冒烟验证脚本：node test/smoke.ts 运行
+// MeiCode 冒烟验证脚本：node test/smoke.ts 运行
 import { writeFileSync, mkdirSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import http from 'node:http'
 import type { AddressInfo } from 'node:net'
-import { loadConfig } from '../src/config/loader.ts'
+import { loadConfig, loadConfigWithMcp } from '../src/config/loader.ts'
 import { History } from '../src/session/history.ts'
 import { createProvider } from '../src/provider/index.ts'
 import type { ChatMessage, StreamEvent } from '../src/provider/types.ts'
@@ -182,6 +182,41 @@ thinking: true
   await expectThrow('config: 缺 api_key 报错', () => loadConfig(fixture('missing.yaml', 'name: x\nprotocol: openai\nmodel: gpt-5\nbase_url: https://api.openai.com\n')), 'api_key')
   await expectThrow('config: 非法 protocol 报错', () => loadConfig(fixture('badproto.yaml', 'name: x\nprotocol: gemini\nmodel: x\nbase_url: x\napi_key: x\n')), '不支持的 protocol')
   await expectThrow('config: 文件不存在报错', () => loadConfig(join(FIXTURE_DIR, 'nope.yaml')), '配置文件不存在')
+  await check('config: 从环境变量读取 API key', () => {
+    process.env.MEICODE_TEST_API_KEY = 'secret-from-env'
+    try {
+      const envCfg = loadConfig(fixture('env-key.yaml', 'name: x\nprotocol: openai\nmodel: m\nbase_url: https://example.com\napi_key_env: MEICODE_TEST_API_KEY\n'))
+      if (envCfg.api_key !== 'secret-from-env') throw new Error('环境变量密钥未解析')
+    } finally {
+      delete process.env.MEICODE_TEST_API_KEY
+    }
+  })
+  await check('config: 模型目录下传上下文与输出预算', () => {
+    const catalogCfg = loadConfig(fixture('catalog.yaml', 'provider: bigmodel\napi_key: x\n'))
+    if (catalogCfg.context_window !== 200000 || catalogCfg.max_output_tokens !== 64000) {
+      throw new Error(`模型预算未下传: ${JSON.stringify(catalogCfg)}`)
+    }
+  })
+  await expectThrow('config: 非法模型预算报错', () => loadConfig(fixture('bad-budget.yaml', 'name: x\nprotocol: openai\nmodel: m\nbase_url: https://example.com\napi_key: x\ncontext_window: 0\n')), 'context_window')
+  await check('config: 显式配置文件同时加载 MCP/A2A', () => {
+    const explicit = fixture('explicit-services.yaml', `
+name: explicit
+protocol: openai
+model: m
+base_url: https://example.com
+api_key: x
+mcpServers:
+  explicit-mcp:
+    type: http
+    url: https://mcp.example.com
+a2aAgents:
+  explicit-a2a:
+    url: https://a2a.example.com
+`)
+    const loaded = loadConfigWithMcp(explicit)
+    if (!loaded.mcpServers.some((server) => server.name === 'explicit-mcp')) throw new Error('显式 MCP 配置被忽略')
+    if (!loaded.a2aAgents.some((agent) => agent.name === 'explicit-a2a')) throw new Error('显式 A2A 配置被忽略')
+  })
 
   // ---------- provider 工厂 ----------
   await check('工厂: anthropic 分派', () => {
@@ -246,6 +281,13 @@ thinking: true
     const body = JSON.parse(req.body)
     if (body.stream !== true) throw new Error('未开流式')
     if (body.messages[0].role !== 'user' || body.messages[0].content !== '你好') throw new Error('消息不符')
+  })
+  await check('openai: 配置输出预算进入请求体', async () => {
+    const server = await fakeServer(OPENAI_SSE)
+    const p = createProvider({ ...makeCfg('openai', server.url), max_output_tokens: 4096 })
+    await collect(p.streamChat(history, {}))
+    if (JSON.parse(server.requests[0].body).max_tokens !== 4096) throw new Error('max_output_tokens 未生效')
+    server.close()
   })
   oai.close()
 

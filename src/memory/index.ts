@@ -1,3 +1,5 @@
 export { loadInstructions } from './instructions.ts'
-export { SessionStore, newSessionId, sanitizeMessages } from './session.ts'
+export { SessionConflictError, SessionStore, newSessionId, sanitizeMessages } from './session.ts'
+export { createSessionPersistenceCursor, persistSessionHistory, persistSessionHistoryWithConflictCopy, tryPersistSessionHistory, type SessionPersistenceCursor } from './persistence.ts'
 export { updateNotes, buildNotesIndex, type NoteCategory } from './notes.ts'
+export { buildMemoryTail, type MemoryContext } from './context.ts'

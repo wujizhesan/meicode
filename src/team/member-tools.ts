@@ -1,11 +1,13 @@
 import type { Tool, ToolContext, ToolResult } from '../tools/index.ts'
 import type { TeamGroup, TeamMember, TeamTask } from './types.ts'
+import { isTeamActorName } from './validation.ts'
 
 export interface MemberToolServices {
-  resolveMemberByCwd: (cwd: string) => { group: TeamGroup; member: TeamMember } | null
+  resolveMember: (context: Pick<ToolContext, 'cwd' | 'agentId'>) => { group: TeamGroup; member: TeamMember } | null
+  isLeadContext: (context: Pick<ToolContext, 'cwd' | 'agentId'>) => boolean
   listTasks: (groupName: string) => TeamTask[]
   addTask: (groupName: string, title: string, assignee?: string, dependencies?: string[], maxAttempts?: number) => TeamTask
-  updateTask: (groupName: string, taskId: string, patch: Record<string, unknown>) => TeamTask | null
+  updateTask: (groupName: string, memberName: string, taskId: string, patch: Record<string, unknown>) => TeamTask | null
   sendMail: (from: string, to: string, body: string) => void
 }
 
@@ -30,8 +32,8 @@ export function createMemberTools(services: MemberToolServices): Tool[] {
         required: ['action'],
       },
       execute: async (args: Record<string, unknown>, context: ToolContext): Promise<ToolResult> => {
-        const identity = services.resolveMemberByCwd(context.cwd)
-        if (!identity) return { success: false, output: '', error: '无法识别成员身份（ctx.cwd 不在任何成员 workdir）' }
+        const identity = services.resolveMember(context)
+        if (!identity) return { success: false, output: '', error: '无法唯一识别成员身份' }
         const groupName = identity.group.name
         const memberName = identity.member.name
         const action = String(args.action ?? '')
@@ -64,9 +66,13 @@ export function createMemberTools(services: MemberToolServices): Tool[] {
           const update: Record<string, unknown> = {}
           if (typeof args.status === 'string') update.status = args.status
           if (typeof args.result === 'string') update.result = args.result
-          const task = services.updateTask(groupName, taskId, update)
-          if (!task) return { success: false, output: '', error: `任务不存在: ${taskId}` }
-          return { success: true, output: `任务 ${taskId} 已更新: ${task.status}` }
+          try {
+            const task = services.updateTask(groupName, memberName, taskId, update)
+            if (!task) return { success: false, output: '', error: `任务不存在: ${taskId}` }
+            return { success: true, output: `任务 ${taskId} 已更新: ${task.status}` }
+          } catch (error) {
+            return { success: false, output: '', error: (error as Error).message }
+          }
         }
         return { success: false, output: '', error: `未知 action: ${action}` }
       },
@@ -84,11 +90,16 @@ export function createMemberTools(services: MemberToolServices): Tool[] {
         required: ['to', 'body'],
       },
       execute: async (args: Record<string, unknown>, context: ToolContext): Promise<ToolResult> => {
-        const identity = services.resolveMemberByCwd(context.cwd)
+        const identity = services.resolveMember(context)
+        if (!identity && !services.isLeadContext(context)) {
+          return { success: false, output: '', error: '无法识别消息发送者身份' }
+        }
         const from = identity ? identity.member.name : 'lead'
-        const to = String(args.to ?? '')
+        const requestedTo = String(args.to ?? '')
+        const to = requestedTo.toLowerCase() === 'lead' ? (identity?.group.lead ?? 'lead') : requestedTo
         const body = String(args.body ?? '')
         if (!to || !body) return { success: false, output: '', error: '缺少 to/body' }
+        if (to !== '*' && !isTeamActorName(to)) return { success: false, output: '', error: `非法收件人: ${to}` }
         services.sendMail(from, to, body)
         return { success: true, output: `已发送消息给 ${to}` }
       },

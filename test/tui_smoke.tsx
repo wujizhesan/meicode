@@ -97,7 +97,13 @@ if (batches.length !== 1 || batches[0].text !== '你好' || batches[0].thinking 
 streamBuffer.dispose()
 console.log('  ✓ 流式片段按帧合并刷新')
 
-if (streamFlushDelay(0) !== 16 || streamFlushDelay(50) !== 24 || streamFlushDelay(200) !== 32) {
+if (
+  streamFlushDelay(0) !== 16
+  || streamFlushDelay(50) !== 24
+  || streamFlushDelay(200) !== 32
+  || streamFlushDelay(500) !== 50
+  || streamFlushDelay(1000) !== 80
+) {
   throw new Error('流式刷新间隔未按历史长度调整')
 }
 console.log('  ✓ 长历史自适应降低刷新频率')

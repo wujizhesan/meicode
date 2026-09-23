@@ -9,11 +9,11 @@ import { TeamMail } from '../src/team/mail.ts'
 
 const root = mkdtempSync(join(tmpdir(), 'meicode-lazy-state-'))
 try {
-  const sessionDir = join(root, '.mewcode', 'sessions')
-  const runtimeDir = join(root, '.mewcode', 'runtime-events')
-  const worktreeDir = join(root, '.mewcode', 'worktrees')
-  const subagentDir = join(root, '.mewcode', 'subagents')
-  const mailDir = join(root, '.mewcode', 'team', '_shared', 'mail')
+  const sessionDir = join(root, '.meicode', 'sessions')
+  const runtimeDir = join(root, '.meicode', 'runtime-events')
+  const worktreeDir = join(root, '.meicode', 'worktrees')
+  const subagentDir = join(root, '.meicode', 'subagents')
+  const mailDir = join(root, '.meicode', 'team', '_shared', 'mail')
 
   const sessions = new SessionStore(sessionDir)
   const runtime = new RuntimeEventLog(runtimeDir)

@@ -2,6 +2,7 @@ import { existsSync, readFileSync, writeFileSync, rmSync, mkdirSync } from 'node
 import { join } from 'node:path'
 import { execFileSync } from 'node:child_process'
 import type { Tool, ToolContext, ToolResult } from './types.ts'
+import { projectStatePath, projectStateRoot } from '../state-paths.ts'
 
 // 快照/回滚工具(对齐 opencode git 快照 + 三阶段 revert):
 // snapshot  = 当前工作区状态存为 git commit + tag(snap-<ts>)
@@ -21,7 +22,7 @@ function git(args: string[], cwd: string): { code: number; out: string } {
 }
 
 function rollbackStateFile(cwd: string): string {
-  return join(cwd, '.mewcode', 'rollback-state.json')
+  return projectStatePath(cwd, 'rollback-state.json')
 }
 
 export const snapshotTool: Tool = {
@@ -49,7 +50,7 @@ export const snapshotTool: Tool = {
 export const rollbackTool: Tool = {
   name: 'rollback',
   description:
-    '回滚到快照(三阶段): stage=恢复文件到快照状态(当前未提交修改存 .mewcode/rollback.patch 可找回); clear=取消回滚(恢复 stage 前状态); commit=确认回滚。tag=快照名(如 snap-xxx)。',
+    '回滚到快照(三阶段): stage=恢复文件到快照状态(当前未提交修改存 .meicode/rollback.patch 可找回); clear=取消回滚(恢复 stage 前状态); commit=确认回滚。tag=快照名(如 snap-xxx)。',
   parameters: {
     type: 'object',
     properties: {
@@ -67,8 +68,8 @@ export const rollbackTool: Tool = {
       return { success: false, output: '', error: 'action 必须是 stage / clear / commit' }
     }
     const stateFile = rollbackStateFile(ctx.cwd)
-    const patchFile = join(ctx.cwd, '.mewcode', 'rollback.patch')
-    mkdirSync(join(ctx.cwd, '.mewcode'), { recursive: true })
+    const patchFile = projectStatePath(ctx.cwd, 'rollback.patch')
+    mkdirSync(projectStateRoot(ctx.cwd), { recursive: true })
 
     if (action === 'stage') {
       // 锚点 = 当前 HEAD;未提交修改存 patch(可找回);恢复文件到快照

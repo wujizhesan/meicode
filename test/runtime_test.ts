@@ -8,6 +8,11 @@ mkdirSync(tmp, { recursive: true })
 
 const id = createRuntimeId('session')
 const log = new RuntimeEventLog(tmp)
+const longSessionId = `a2a:${'外部上下文'.repeat(80)}`
+const longSessionEvent = log.append({ sessionId: longSessionId, type: 'audit', payload: { source: 'long-id' } })
+if (longSessionEvent.seq !== 1 || log.read(longSessionId)[0]?.payload?.source !== 'long-id') {
+  throw new Error('超长外部会话 ID 未稳定映射到事件日志文件')
+}
 const first = log.append({ sessionId: id, type: 'run_started', payload: { mode: 'full' } })
 const second = log.append({ sessionId: id, type: 'run_finished', payload: { reason: 'complete' } })
 const events = log.read(id)
@@ -106,6 +111,18 @@ if (unterminatedEvents.length !== 1 || unterminatedEvents[0].eventId !== 'event_
   throw new Error('事件读取未正确处理空行、坏行或无换行尾行')
 }
 
+const invalidShapeId = createRuntimeId('session')
+const validShapeEvent = { sessionId: invalidShapeId, type: 'audit' as const, eventId: 'event_valid_shape', seq: 1, ts: Date.now() }
+writeFileSync(
+  join(tmp, `${invalidShapeId}.jsonl`),
+  `null\n42\n{}\n${JSON.stringify({ ...validShapeEvent, seq: 'wrong' })}\n${JSON.stringify(validShapeEvent)}\n`,
+  'utf8',
+)
+const shapeLog = new RuntimeEventLog(tmp)
+if (shapeLog.read(invalidShapeId).map((event) => event.eventId).join(',') !== 'event_valid_shape') throw new Error('错误事件结构未被读取过滤')
+if (shapeLog.tail(invalidShapeId, { limit: 5 }).map((event) => event.eventId).join(',') !== 'event_valid_shape') throw new Error('错误事件结构未被尾查过滤')
+if (shapeLog.append({ sessionId: invalidShapeId, type: 'run_finished' }).seq !== 2) throw new Error('错误事件结构污染了序号恢复')
+
 const filteredId = createRuntimeId('session')
 const auditLine = JSON.stringify({ sessionId: filteredId, type: 'audit', eventId: 'event_audit', seq: 1, ts: Date.now() })
 const spacedAuditLine = JSON.stringify({ sessionId: filteredId, type: 'audit', eventId: 'event_spaced_audit', seq: 2, ts: Date.now() }).replace('"type":"audit"', '"type" : "audit"')
@@ -115,6 +132,30 @@ const filteredEvents = new RuntimeEventLog(tmp).read(filteredId, { type: 'audit'
 if (filteredEvents.map((event) => event.eventId).join(',') !== 'event_audit,event_spaced_audit') {
   throw new Error('事件类型预过滤发生漏读或误收')
 }
+const filteredTail = new RuntimeEventLog(tmp).tail(filteredId, { type: 'audit', limit: 1 })
+if (filteredTail.length !== 1 || filteredTail[0].eventId !== 'event_spaced_audit') throw new Error('事件尾查未返回最新匹配项')
+
+const predicateTailId = createRuntimeId('session')
+const predicateTailLog = new RuntimeEventLog(tmp, { maxBytes: 1024 })
+for (let i = 1; i <= 6; i++) {
+  predicateTailLog.append({
+    sessionId: predicateTailId,
+    type: i % 2 === 0 ? 'audit' : 'tool_result',
+    payload: { kind: i === 2 || i === 6 ? 'target' : 'other', text: 'x'.repeat(600) },
+  })
+}
+let predicateCalls = 0
+const predicateTail = predicateTailLog.tail(predicateTailId, {
+  type: 'audit',
+  limit: 1,
+  predicate: (event) => {
+    predicateCalls++
+    return event.payload?.kind === 'target'
+  },
+})
+if (predicateTail.length !== 1 || predicateTail[0].seq !== 6) throw new Error('事件尾查谓词未返回最新匹配项')
+if (predicateCalls !== 1) throw new Error('事件尾查达到 limit 后仍扫描旧事件')
+if (predicateTailLog.tail(predicateTailId, { limit: 0 }).length !== 0) throw new Error('事件尾查未处理零 limit')
 
 const chunkedReadId = createRuntimeId('session')
 const chunkedText = '中'.repeat(400000)
@@ -140,6 +181,17 @@ const collisionLog = new RuntimeEventLog(tmp)
 collisionLog.append({ sessionId: 'a/b', type: 'message_sent', payload: { source: 'slash' } })
 collisionLog.append({ sessionId: 'a_b', type: 'message_sent', payload: { source: 'underscore' } })
 if (collisionLog.read('a/b').length !== 1 || collisionLog.read('a_b').length !== 1) throw new Error('不同 session id 发生文件碰撞')
+
+const lockOwnerId = createRuntimeId('session')
+const lockOwnerFile = join(tmp, `${lockOwnerId}.lock`)
+const lockOwnerLog = new RuntimeEventLog(tmp, { checkpointInterval: 1 })
+Object.defineProperty(lockOwnerLog, 'writeIndex', {
+  value: () => writeFileSync(lockOwnerFile, JSON.stringify({ owner: 'replacement-owner', ts: Date.now() }), 'utf8'),
+})
+lockOwnerLog.append({ sessionId: lockOwnerId, type: 'run_finished' })
+const replacementLock = JSON.parse(readFileSync(lockOwnerFile, 'utf8')) as { owner?: string }
+if (replacementLock.owner !== 'replacement-owner') throw new Error('旧事件锁释放误删了替代锁')
+rmSync(lockOwnerFile, { force: true })
 
 const recreatedRoot = join(tmp, 'recreated-root')
 const recreatedLog = new RuntimeEventLog(recreatedRoot)

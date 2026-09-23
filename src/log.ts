@@ -1,7 +1,8 @@
 import { closeSync, mkdirSync, openSync, writeSync } from 'node:fs'
 import { join } from 'node:path'
+import { projectStateRoot } from './state-paths.ts'
 
-// 轻量文件日志：文件 <cwd>/.mewcode/meicode.log，追加写，磁盘满/权限错静默
+// 轻量文件日志：文件 <cwd>/.meicode/meicode.log，追加写，磁盘满/权限错静默
 // 分级：error（异常）/ warn（可恢复问题）/ info（请求·工具·会话关键事件，频率低无性能问题）
 // 环境变量 MEICODE_LOG_LEVEL=error 可关闭 info（默认全开）
 let logFile: string | null = null
@@ -20,7 +21,7 @@ export function closeLogger(): void {
 export function initLogger(cwd: string): void {
   closeLogger()
   try {
-    const dir = join(cwd, '.mewcode')
+    const dir = projectStateRoot(cwd)
     mkdirSync(dir, { recursive: true })
     logFile = join(dir, 'meicode.log')
     logFd = openSync(logFile, 'a')

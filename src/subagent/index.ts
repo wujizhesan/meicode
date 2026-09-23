@@ -30,6 +30,7 @@ export function createSpawnAgentTool(manager: SubAgentManager, opts: { provider:
         async: args.async === true,
       }
       const result = await manager.spawn(req, { provider: opts.provider, registry: opts.registry, ctx })
+      if (result.error) return { success: false, output: result.syncResult ?? '', error: result.error }
       if (result.async) {
         return { success: true, output: `子任务已提交后台（任务ID: ${result.id}），完成后结果会回流到对话` }
       }

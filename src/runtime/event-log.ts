@@ -2,7 +2,45 @@ import { appendFileSync, closeSync, mkdirSync, openSync, readFileSync, readSync,
 import { createHash } from 'node:crypto'
 import { basename, join } from 'node:path'
 import { createRuntimeId } from './ids.ts'
+import { withFileLock } from './file-lock.ts'
 import type { RuntimeEvent, RuntimeEventInput } from './events.ts'
+
+const RUNTIME_EVENT_TYPES = new Set<RuntimeEvent['type']>([
+  'run_started',
+  'run_finished',
+  'turn_started',
+  'model_request',
+  'context_snapshot',
+  'tool_call',
+  'tool_result',
+  'turn_finished',
+  'subagent_started',
+  'subagent_finished',
+  'task_created',
+  'task_assigned',
+  'task_finished',
+  'message_sent',
+  'report_ready',
+  'report_acknowledged',
+  'audit',
+])
+
+function isRuntimeEvent(value: unknown): value is RuntimeEvent {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  const event = value as Record<string, unknown>
+  if (typeof event.type !== 'string' || !RUNTIME_EVENT_TYPES.has(event.type as RuntimeEvent['type'])) return false
+  if (typeof event.sessionId !== 'string' || !event.sessionId || typeof event.eventId !== 'string' || !event.eventId) return false
+  if (typeof event.seq !== 'number' || !Number.isSafeInteger(event.seq) || event.seq < 1) return false
+  if (typeof event.ts !== 'number' || !Number.isFinite(event.ts) || event.ts < 0) return false
+  for (const key of ['agentId', 'taskId', 'correlationId', 'causationId'] as const) {
+    if (event[key] !== undefined && typeof event[key] !== 'string') return false
+  }
+  for (const key of ['turn', 'step'] as const) {
+    if (event[key] !== undefined && (typeof event[key] !== 'number' || !Number.isSafeInteger(event[key]) || event[key] < 0)) return false
+  }
+  if (event.payload !== undefined && (!event.payload || typeof event.payload !== 'object' || Array.isArray(event.payload))) return false
+  return true
+}
 
 interface RuntimeEventIndex {
   lastSeq: number
@@ -26,6 +64,12 @@ interface RuntimeEventPaths {
 interface RuntimeReadCache {
   signature: string
   events: RuntimeEvent[]
+}
+
+export interface RuntimeTailOptions {
+  type?: RuntimeEvent['type']
+  limit?: number
+  predicate?: (event: RuntimeEvent) => boolean
 }
 
 function cloneRuntimeEvent(event: RuntimeEvent): RuntimeEvent {
@@ -58,9 +102,10 @@ export class RuntimeEventLog {
     const cached = this.paths.get(sessionId)
     if (cached) return cached
     const safe = sessionId.replace(/[^a-zA-Z0-9_.-]/g, '_')
-    const resolved = safe === sessionId
+    const hash = createHash('sha256').update(sessionId).digest('hex').slice(0, 16)
+    const resolved = safe === sessionId && safe.length <= 128
       ? safe
-      : `${safe || 'session'}-${createHash('sha256').update(sessionId).digest('hex').slice(0, 16)}`
+      : `${(safe || 'session').slice(0, 96)}-${hash}`
     const paths = {
       safe: resolved,
       file: join(this.root, `${resolved}.jsonl`),
@@ -149,8 +194,8 @@ export class RuntimeEventLog {
         for (let i = lines.length - 1; i >= firstComplete; i--) {
           if (!lines[i].trim()) continue
           try {
-            const event = JSON.parse(lines[i]) as RuntimeEvent
-            if (typeof event.seq === 'number' && Number.isFinite(event.seq)) return event.seq
+            const event: unknown = JSON.parse(lines[i])
+            if (isRuntimeEvent(event)) return event.seq
           } catch {
           }
         }
@@ -174,29 +219,55 @@ export class RuntimeEventLog {
     }).join('|')
   }
 
-  private acquireLock(sessionId: string): string {
-    const lock = this.lockFor(sessionId)
-    for (let attempt = 0; attempt < 1000; attempt++) {
-      try {
-        const fd = openSync(lock, 'wx')
-        closeSync(fd)
-        return lock
-      } catch (error) {
-        const code = (error as NodeJS.ErrnoException).code
-        if (code === 'ENOENT') {
-          this.rootReady = false
-          this.ensureRoot()
-          continue
-        }
-        if (code !== 'EEXIST') throw error
-        try {
-          if (Date.now() - statSync(lock).mtimeMs > 30000) unlinkSync(lock)
-        } catch {
-        }
-        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 2)
-      }
+  private readLinesReverse(file: string, accept: (line: Buffer) => boolean): boolean {
+    let size: number
+    try {
+      size = statSync(file).size
+    } catch {
+      return false
     }
-    throw new Error(`RuntimeEventLog 获取锁超时: ${sessionId}`)
+    if (size === 0) return false
+    const fd = openSync(file, 'r')
+    const chunk = Buffer.allocUnsafe(Math.min(1024 * 1024, size))
+    const fragments: Buffer[] = []
+    let fragmentBytes = 0
+    let position = size
+    try {
+      while (position > 0) {
+        const length = Math.min(chunk.length, position)
+        position -= length
+        let bytesRead = 0
+        while (bytesRead < length) {
+          const count = readSync(fd, chunk, bytesRead, length - bytesRead, position + bytesRead)
+          if (count === 0) break
+          bytesRead += count
+        }
+        if (bytesRead === 0) break
+        let lineEnd = bytesRead
+        for (let index = bytesRead - 1; index >= 0; index--) {
+          if (chunk[index] !== 10) continue
+          const segment = chunk.subarray(index + 1, lineEnd)
+          if (segment.length > 0 || fragmentBytes > 0) {
+            const line = fragments.length > 0
+              ? Buffer.concat([segment, ...fragments], segment.length + fragmentBytes)
+              : segment
+            if (accept(line)) return true
+          }
+          fragments.length = 0
+          fragmentBytes = 0
+          lineEnd = index
+        }
+        if (lineEnd > 0) {
+          const fragment = Buffer.from(chunk.subarray(0, lineEnd))
+          fragments.unshift(fragment)
+          fragmentBytes += fragment.length
+        }
+      }
+      if (fragmentBytes > 0) return accept(Buffer.concat(fragments, fragmentBytes))
+      return false
+    } finally {
+      closeSync(fd)
+    }
   }
 
   private writeIndex(sessionId: string, index: RuntimeEventIndex): void {
@@ -229,9 +300,8 @@ export class RuntimeEventLog {
     this.ensureRoot()
     const sessionId = inputs[0].sessionId
     if (inputs.some((input) => input.sessionId !== sessionId)) throw new Error('RuntimeEventLog 批量事件必须属于同一会话')
-    const lock = this.acquireLock(sessionId)
     let events: RuntimeEvent[] = []
-    try {
+    withFileLock(this.lockFor(sessionId), () => {
       const activeFile = this.fileFor(sessionId)
       let activeExists = true
       let activeBytes = 0
@@ -271,12 +341,7 @@ export class RuntimeEventLog {
         this.writeIndex(sessionId, state)
         state.pending = 0
       }
-    } finally {
-      try {
-        unlinkSync(lock)
-      } catch {
-      }
-    }
+    })
     const waiters = this.waiters.get(sessionId)
     if (waiters) {
       this.waiters.delete(sessionId)
@@ -344,8 +409,8 @@ export class RuntimeEventLog {
             lineStart = i + 1
             if (!line.trim()) continue
             try {
-              const event = JSON.parse(line) as RuntimeEvent
-              if (event.sessionId === sessionId) {
+              const event: unknown = JSON.parse(line)
+              if (isRuntimeEvent(event) && event.sessionId === sessionId) {
                 finish(event)
                 return
               }
@@ -386,7 +451,8 @@ export class RuntimeEventLog {
       if (line.length === 0) return
       if (typeMarker && !line.includes(typeMarker) && !typePattern!.test(line)) return
       try {
-        const event = JSON.parse(line) as RuntimeEvent
+        const event: unknown = JSON.parse(line)
+        if (!isRuntimeEvent(event) || event.sessionId !== sessionId) return
         if (options.type && event.type !== options.type) return
         if (event.seq < previousSeq) ordered = false
         previousSeq = event.seq
@@ -443,5 +509,38 @@ export class RuntimeEventLog {
     nextCache.set(typeKey, { signature, events: result })
     this.readCache.set(sessionId, nextCache)
     return result.map(cloneRuntimeEvent)
+  }
+
+  tail(sessionId: string, options: RuntimeTailOptions = {}): RuntimeEvent[] {
+    const requestedLimit = options.limit ?? 20
+    const limit = Number.isFinite(requestedLimit) ? Math.max(0, Math.floor(requestedLimit)) : 20
+    if (limit === 0) return []
+    const events: RuntimeEvent[] = []
+    const typeMarker = options.type ? `"type":"${options.type}"` : undefined
+    const typePattern = options.type ? new RegExp(`"type"\\s*:\\s*"${options.type}"`) : undefined
+    const accept = (line: Buffer): boolean => {
+      if (line.length === 0) return false
+      const text = line.toString('utf8')
+      if (typeMarker && !text.includes(typeMarker) && !typePattern!.test(text)) return false
+      let event: unknown
+      try {
+        event = JSON.parse(text)
+      } catch {
+        return false
+      }
+      if (!isRuntimeEvent(event) || event.sessionId !== sessionId) return false
+      if (options.type && event.type !== options.type) return false
+      if (options.predicate && !options.predicate(event)) return false
+      events.push(event)
+      return events.length >= limit
+    }
+    const files = this.segmentFiles(sessionId)
+      .map((file) => ({ file, lastSeq: this.lastSeq(file) }))
+      .sort((left, right) => right.lastSeq - left.lastSeq || right.file.localeCompare(left.file))
+    for (const { file } of files) {
+      if (this.readLinesReverse(file, accept)) break
+    }
+    events.sort((left, right) => left.seq - right.seq)
+    return events.map(cloneRuntimeEvent)
   }
 }

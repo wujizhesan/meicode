@@ -4,10 +4,10 @@ const WORKFLOW_COMMANDS: CommandDef[] = [
   {
     name: 'workflow',
     aliases: ['wf'],
-    description: 'Workflow 编排：create 创建模板 / validate 校验 / run 执行（对齐 Zcode .workflow.js DSL）',
-    usage: '/workflow create|validate|run <名称>',
+    description: 'Workflow 编排：create 创建 / validate 校验 / run 执行 / resume 恢复 / cancel 取消',
+    usage: '/workflow create|validate|run <名称> [--team|--subagent] | resume|cancel <runId>',
     type: 'local',
-    paramHint: '操作: create|validate|run + 名称',
+    paramHint: '操作: create|validate|run + 名称，或 resume|cancel + runId',
     handler: (args, ui) => {
       const action = args[0] ?? ''
       if (action === 'list') {
@@ -16,10 +16,10 @@ const WORKFLOW_COMMANDS: CommandDef[] = [
       }
       const name = args[1] ?? ''
       if (!name && action !== 'list') {
-        ui.showMessage('用法: /workflow create|validate|run <名称>')
+        ui.showMessage('用法: /workflow create|validate|run <名称> [--team|--subagent] | resume|cancel <runId>')
         return
       }
-      ui.showMessage(ui.workflowAction(action, [name]))
+      ui.showMessage(ui.workflowAction(action, args.slice(1)))
     },
   },
   {

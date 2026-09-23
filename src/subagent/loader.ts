@@ -1,8 +1,8 @@
 import { closeSync, existsSync, fstatSync, openSync, readdirSync, readFileSync, statSync, type Dirent } from 'node:fs'
-import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { parseFrontmatter } from '../frontmatter.ts'
 import type { AgentRole, AgentRoleSource } from './types.ts'
+import { userStatePath } from '../state-paths.ts'
 
 interface Frontmatter {
   name?: string
@@ -13,6 +13,7 @@ interface Frontmatter {
   model?: string
   max_rounds?: number
   permission?: string
+  isolation?: string
 }
 
 interface CachedAgentRole {
@@ -20,6 +21,7 @@ interface CachedAgentRole {
   mtimeMs: number
   ctimeMs: number
   ino: number
+  raw: string
   role: AgentRole | null
 }
 
@@ -44,12 +46,13 @@ function loadCachedAgentRole(file: string, source: AgentRoleSource): AgentRole |
   }
   try {
     const stats = fstatSync(fd)
+    const raw = readFileSync(fd, 'utf8')
     const cached = agentRoleCache.get(key)
-    if (cached && cached.size === stats.size && cached.mtimeMs === stats.mtimeMs && cached.ctimeMs === stats.ctimeMs && cached.ino === stats.ino) {
+    if (cached && cached.size === stats.size && cached.mtimeMs === stats.mtimeMs && cached.ctimeMs === stats.ctimeMs && cached.ino === stats.ino && cached.raw === raw) {
       return cached.role ? cloneAgentRole(cached.role) : null
     }
-    const role = parseAgentContent(readFileSync(fd, 'utf8'), file, source)
-    agentRoleCache.set(key, { size: stats.size, mtimeMs: stats.mtimeMs, ctimeMs: stats.ctimeMs, ino: stats.ino, role })
+    const role = parseAgentContent(raw, file, source)
+    agentRoleCache.set(key, { size: stats.size, mtimeMs: stats.mtimeMs, ctimeMs: stats.ctimeMs, ino: stats.ino, raw, role })
     return role ? cloneAgentRole(role) : null
   } finally {
     closeSync(fd)
@@ -93,6 +96,7 @@ function parseAgentContent(raw: string, file: string, source: AgentRoleSource): 
     model: fm.model,
     maxRounds: fm.max_rounds,
     permission,
+    isolation: fm.isolation === 'worktree' ? 'worktree' : undefined,
     content: (m[2] ?? '').trim(),
     source,
   }
@@ -148,7 +152,7 @@ export function agentDirs(cwd: string): { builtin: string; user: string; project
   const source = join(import.meta.dirname, '..', 'agents')
   return {
     builtin: existsSync(packaged) ? packaged : source,
-    user: join(homedir(), '.mewcode', 'agents'),
+    user: userStatePath('agents'),
     project: join(cwd, 'agents'),
   }
 }

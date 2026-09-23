@@ -7,7 +7,7 @@ export interface A2aAgentConfig {
   binding?: 'http' | 'jsonrpc'
 }
 
-export function parseA2aAgents(rawUser: unknown, rawProject: unknown): { agents: A2aAgentConfig[]; skipped: string[] } {
+export function parseA2aAgents(...layers: unknown[]): { agents: A2aAgentConfig[]; skipped: string[] } {
   const merged: Record<string, Record<string, unknown>> = {}
 
   const absorb = (raw: unknown): void => {
@@ -26,8 +26,7 @@ export function parseA2aAgents(rawUser: unknown, rawProject: unknown): { agents:
     }
   }
 
-  absorb(rawUser)
-  absorb(rawProject)
+  for (const layer of layers) absorb(layer)
   const agents: A2aAgentConfig[] = []
   const skipped: string[] = []
   for (const [name, cfg] of Object.entries(merged)) {

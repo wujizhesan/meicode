@@ -1,8 +1,11 @@
 import { dirname } from 'node:path'
-import { mkdirSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
+import { copyFileSync, existsSync, mkdirSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
+import { randomUUID } from 'node:crypto'
 
 export function atomicWriteFile(file: string, content: string): void {
-  const temp = `${file}.${process.pid}.${Date.now()}.tmp`
+  const suffix = `${process.pid}.${randomUUID()}`
+  const temp = `${file}.${suffix}.tmp`
+  const backup = `${file}.${suffix}.bak`
   try {
     writeFileSync(temp, content, 'utf8')
   } catch (error) {
@@ -12,16 +15,48 @@ export function atomicWriteFile(file: string, content: string): void {
   }
   try {
     renameSync(temp, file)
-  } catch (error) {
-    try {
+    return
+  } catch {
+  }
+  let backupCreated = false
+  let originalRemoved = false
+  try {
+    if (existsSync(file)) {
+      copyFileSync(file, backup)
+      backupCreated = true
       unlinkSync(file)
-      renameSync(temp, file)
-    } catch {
+      originalRemoved = true
+    }
+    renameSync(temp, file)
+  } catch (replaceError) {
+    let restoreError: unknown
+    if (backupCreated && !existsSync(file)) {
       try {
-        unlinkSync(temp)
+        renameSync(backup, file)
+        backupCreated = false
+      } catch (error) {
+        restoreError = error
+      }
+    } else if (backupCreated && !originalRemoved) {
+      try {
+        unlinkSync(backup)
+        backupCreated = false
       } catch {
       }
-      throw error
+    }
+    try {
+      if (existsSync(temp)) unlinkSync(temp)
+    } catch {
+    }
+    if (restoreError) {
+      throw new AggregateError([replaceError, restoreError], `替换文件失败且原文件恢复失败，备份保留在: ${backup}`)
+    }
+    throw replaceError
+  }
+  if (backupCreated) {
+    try {
+      unlinkSync(backup)
+    } catch {
     }
   }
 }

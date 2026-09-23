@@ -59,7 +59,7 @@ export const snapshotTool: Tool = {
 export const rollbackTool: Tool = {
   name: 'rollback',
   description:
-    '回滚到快照(三阶段): stage=恢复文件到快照状态(当前未提交修改存 .mewcode/rollback.patch 可找回); clear=取消回滚(恢复 stage 前状态); commit=确认回滚。tag=快照名(如 snap-xxx)。',
+    '回滚到快照(三阶段): stage=恢复文件到快照状态(当前未提交修改存 .meicode/rollback.patch 可找回); clear=取消回滚(恢复 stage 前状态); commit=确认回滚。tag=快照名(如 snap-xxx)。',
   parameters: {
     type: 'object',
     properties: {

@@ -1,11 +1,15 @@
 // 团队系统测试：小组/邮箱锁/任务/成员/coordinator/协议
-import { mkdirSync, rmSync, writeFileSync, appendFileSync, existsSync, readFileSync, statSync, utimesSync } from 'node:fs'
+import { mkdirSync, rmSync, writeFileSync, appendFileSync, existsSync, readFileSync, readdirSync, statSync, utimesSync } from 'node:fs'
 import { join } from 'node:path'
 import { spawn } from 'node:child_process'
 import { TeamManager, TeamGroupStore, TeamMail } from '../src/team/index.ts'
+import { createLeadTools } from '../src/team/lead-tools.ts'
 import { withLock } from '../src/team/lock.ts'
+import { atomicWriteFile } from '../src/team/atomic.ts'
 import type { ChatMessage, Provider, StreamEvent } from '../src/provider/types.ts'
 import type { ToolContext } from '../src/tools/index.ts'
+import { ToolRegistry } from '../src/tools/index.ts'
+import { HookEngine } from '../src/hook/index.ts'
 
 let passed = 0
 let failed = 0
@@ -44,6 +48,46 @@ class ThrowingTeamProvider implements Provider {
   }
 }
 
+class DeferredTeamProvider implements Provider {
+  readonly protocol = 'openai' as const
+  readonly started: Promise<void>
+  private markStarted!: () => void
+  private finishRun!: () => void
+  private readonly gate: Promise<void>
+
+  constructor() {
+    this.started = new Promise((resolve) => { this.markStarted = resolve })
+    this.gate = new Promise((resolve) => { this.finishRun = resolve })
+  }
+
+  finish(): void {
+    this.finishRun()
+  }
+
+  async *streamChat(): AsyncGenerator<StreamEvent> {
+    this.markStarted()
+    await this.gate
+    yield { type: 'text', text: '延迟完成' }
+    yield { type: 'done' }
+  }
+}
+
+class ToolCallingTeamProvider implements Provider {
+  readonly protocol = 'openai' as const
+  private round = 0
+
+  async *streamChat(): AsyncGenerator<StreamEvent> {
+    this.round++
+    if (this.round === 1) {
+      yield { type: 'tool_call', id: 'member-read', name: 'read_file', arguments: { path: 'blocked.txt' } }
+      yield { type: 'done' }
+      return
+    }
+    yield { type: 'text', text: '成员完成' }
+    yield { type: 'done' }
+  }
+}
+
 const ctx: ToolContext = { cwd: REPO }
 
 async function main() {
@@ -52,6 +96,15 @@ async function main() {
     const store = new TeamGroupStore(TEAM_ROOT)
     const g = store.createGroup('dev', 'lead1')
     store.addMember(g, { name: 'alice', role: 'worker', workdir: REPO, backend: 'coroutine', needsApproval: false, status: 'idle' })
+    const idempotent = store.createGroup('dev', 'lead1')
+    if (idempotent.members.length !== 1 || idempotent.members[0]?.name !== 'alice') throw new Error('重复建组覆盖了已有成员')
+    let leadConflictRejected = false
+    try {
+      store.createGroup('dev', 'lead2')
+    } catch (error) {
+      leadConflictRejected = (error as Error).message.includes('负责人为 lead1')
+    }
+    if (!leadConflictRejected) throw new Error('重复建组接受了不同负责人')
     const loaded = store.loadGroup('dev')
     if (!loaded || loaded.lead !== 'lead1' || loaded.members.length !== 1) throw new Error('加载失败')
     loaded.members[0].status = 'offline'
@@ -125,6 +178,84 @@ async function main() {
     if (recovered.length !== 1 || afterRecovery.length !== 2 || afterRecovery.find((task) => task.id === 'fresh')?.status !== 'todo') throw new Error('过期任务恢复覆盖了其他任务')
     if (!firstClaim || secondClaim) throw new Error('任务条件领取未串行化')
   })
+  await check('小组: 损坏任务文件拒绝读取和覆盖', async () => {
+    const root = join(TMP, 'corrupt-tasks')
+    const store = new TeamGroupStore(root)
+    store.createGroup('broken', 'lead')
+    const file = join(root, 'broken', 'tasks.json')
+    const corrupted = '{"tasks":'
+    writeFileSync(file, corrupted, 'utf8')
+    let readRejected = false
+    let mutationRejected = false
+    try {
+      store.listTasks('broken')
+    } catch (error) {
+      readRejected = (error as Error).message.includes('任务文件损坏')
+    }
+    try {
+      store.updateTask('broken', 'missing', { status: 'done' })
+    } catch (error) {
+      mutationRejected = (error as Error).message.includes('任务文件损坏')
+    }
+    if (!readRejected || !mutationRejected || readFileSync(file, 'utf8') !== corrupted) throw new Error('损坏任务文件被静默接受或覆盖')
+    const manager = new TeamManager(root, REPO, {
+      provider: new FakeTeamProvider(),
+      registry: { toOpenAITools: () => [] } as never,
+      ctx,
+    })
+    await manager.restore()
+    if (readFileSync(file, 'utf8') !== corrupted) throw new Error('恢复流程覆盖了损坏任务文件')
+    await manager.close()
+  })
+  await check('小组: 合法 JSON 的错误任务结构拒绝读取', () => {
+    const root = join(TMP, 'invalid-task-shape')
+    const store = new TeamGroupStore(root)
+    store.createGroup('broken', 'lead')
+    const file = join(root, 'broken', 'tasks.json')
+    const invalid = JSON.stringify([null, { id: 'bad', title: 'bad', status: 'unknown' }])
+    writeFileSync(file, invalid, 'utf8')
+    let rejected = false
+    try {
+      store.listTasks('broken')
+    } catch (error) {
+      rejected = (error as Error).message.includes('第 1 项不是合法任务')
+    }
+    if (!rejected || readFileSync(file, 'utf8') !== invalid) throw new Error('错误任务结构被接受或覆盖')
+  })
+  await check('小组: 错误成员结构拒绝加载和覆盖', () => {
+    const root = join(TMP, 'invalid-group-shape')
+    const store = new TeamGroupStore(root)
+    store.createGroup('broken', 'lead')
+    const file = join(root, 'broken', 'group.yaml')
+    const invalid = 'name: broken\nlead: lead\nmembers:\n  - name: worker\n    backend: invalid\n'
+    writeFileSync(file, invalid, 'utf8')
+    if (store.loadGroup('broken') !== null) throw new Error('错误成员结构被加载')
+    let rejected = false
+    try {
+      store.createGroup('broken', 'lead')
+    } catch (error) {
+      rejected = (error as Error).message.includes('成员结构非法')
+    }
+    if (!rejected || readFileSync(file, 'utf8') !== invalid) throw new Error('错误成员结构被覆盖')
+  })
+  await check('持久化: 原子替换保留目标并清理临时文件', () => {
+    const dir = join(TMP, 'atomic-write')
+    const file = join(dir, 'state.json')
+    mkdirSync(dir, { recursive: true })
+    atomicWriteFile(file, 'old')
+    atomicWriteFile(file, 'new')
+    if (readFileSync(file, 'utf8') !== 'new') throw new Error('原子替换结果错误')
+    if (readdirSync(dir).some((name) => name.endsWith('.tmp') || name.endsWith('.bak'))) throw new Error('原子替换残留临时文件')
+    const directoryTarget = join(dir, 'directory-target')
+    mkdirSync(directoryTarget)
+    let rejected = false
+    try {
+      atomicWriteFile(directoryTarget, 'invalid')
+    } catch {
+      rejected = true
+    }
+    if (!rejected || !statSync(directoryTarget).isDirectory()) throw new Error('替换失败破坏了原目标')
+  })
 
   // ---------- 邮箱 ----------
   await check('邮箱: 点对点/已读/时间戳/摘要', () => {
@@ -163,6 +294,46 @@ async function main() {
     const appended = mail.read('alice')
     if (appended.length !== 3 || appended[2].body !== '已读后追加' || appended[2].read) throw new Error('已读缓存未识别后续追加')
     if (mail.read('../outside').length !== 0) throw new Error('非法邮箱名称未拒绝')
+  })
+  await check('邮箱: 跳过合法 JSON 的错误消息结构', () => {
+    const dir = join(TEAM_ROOT, 'invalid-mail-shape')
+    mkdirSync(dir, { recursive: true })
+    const file = join(dir, 'alice.mail')
+    const valid = { messageId: 'valid', from: 'lead', to: 'alice', body: 'ok', ts: 1, read: false }
+    writeFileSync(file, `null\n42\n{}\n${JSON.stringify(valid)}\n`, 'utf8')
+    const mail = new TeamMail(dir)
+    const messages = mail.read('alice', true)
+    if (messages.length !== 1 || messages[0].messageId !== 'valid') throw new Error('错误消息结构未被跳过')
+    const persisted = readFileSync(file, 'utf8')
+    if (!persisted.includes('null\n42\n{}\n') || !mail.read('alice')[0]?.read) throw new Error('标记已读破坏了错误行或有效消息')
+  })
+  await check('邮箱: 大小写冲突与损坏注册表拒绝覆盖', () => {
+    const caseDir = join(TMP, 'mail-case')
+    const caseMail = new TeamMail(caseDir)
+    caseMail.register('Alice')
+    let caseRejected = false
+    try {
+      caseMail.register('alice')
+    } catch (error) {
+      caseRejected = (error as Error).message.includes('大小写冲突')
+    }
+    if (!caseRejected) throw new Error('大小写不同的邮箱名发生文件碰撞')
+
+    const corruptDir = join(TMP, 'mail-corrupt')
+    mkdirSync(corruptDir, { recursive: true })
+    const registryFile = join(corruptDir, 'registry.json')
+    const corrupted = '{"Alice":'
+    writeFileSync(registryFile, corrupted, 'utf8')
+    let corruptRejected = false
+    try {
+      new TeamMail(corruptDir).register('bob')
+    } catch (error) {
+      corruptRejected = (error as Error).message.includes('邮箱注册表损坏')
+    }
+    const backup = readdirSync(corruptDir).find((name) => name.startsWith('registry.json.corrupt.'))
+    if (!corruptRejected || existsSync(registryFile) || !backup || readFileSync(join(corruptDir, backup), 'utf8') !== corrupted) {
+      throw new Error('损坏邮箱注册表被覆盖或未保留隔离副本')
+    }
   })
   await check('邮箱: 广播', () => {
     const mail = new TeamMail(join(TEAM_ROOT, 'mail'))
@@ -246,6 +417,17 @@ async function main() {
       throw new Error('多个邮件等待者未独立唤醒')
     }
   })
+  await check('邮箱: 谓词异常不阻断发送和其他等待者', async () => {
+    const mail = new TeamMail(join(TEAM_ROOT, 'predicate-error-mail'))
+    mail.register('alice')
+    const broken = mail.waitForMessage('alice', () => {
+      throw new Error('predicate failed')
+    }, 1000)
+    const healthy = mail.waitForMessage('alice', (message) => message.body === 'wake', 1000)
+    mail.send('lead', 'alice', 'wake')
+    const [brokenResult, healthyResult] = await Promise.all([broken, healthy])
+    if (brokenResult !== null || healthyResult?.body !== 'wake') throw new Error('谓词异常污染了消息发送或其他等待者')
+  })
   await check('邮件等待支持取消', async () => {
     const mail = new TeamMail(join(TEAM_ROOT, 'abort-mail'))
     mail.register('alice')
@@ -288,6 +470,12 @@ async function main() {
     withLock(waitLock, () => {})
     if (Date.now() - started < 300) throw new Error('锁竞争未等待')
     holder.kill()
+    const ownershipLock = join(TMP, 'ownership.lock')
+    withLock(ownershipLock, () => {
+      writeFileSync(ownershipLock, JSON.stringify({ owner: 'replacement-owner', ts: Date.now() }), 'utf8')
+    })
+    if (!existsSync(ownershipLock)) throw new Error('旧锁持有者删除了新的 owner 锁')
+    rmSync(ownershipLock, { force: true })
   })
   await check('邮箱: 协议解析', () => {
     const p1 = TeamMail.parseProtocol('APPROVE 计划可行')
@@ -307,10 +495,10 @@ async function main() {
       registry: { toOpenAITools: () => [] } as never,
       ctx,
     })
-    const group = manager.createGroup('dev', 'lead')
+    const group = manager.createGroup('dev-tools', 'lead')
     await manager.spawnMember(group, 'alice', 'worker')
-    // memberTools 按 ctx.cwd 解析身份——无 worktree 时成员 workdir = process.cwd()
-    const memberCtx = { ...ctx, cwd: process.cwd() }
+    // memberTools 按 ctx.cwd 解析身份——无 worktree 时成员 workdir = repoRoot
+    const memberCtx = { ...ctx, cwd: REPO }
     const tools = manager.memberTools()
     const taskTool = tools.find((t) => t.name === 'team_task')!
     const r1 = await taskTool.execute({ action: 'create', title: '写文档', assignee: 'alice' }, memberCtx)
@@ -329,17 +517,381 @@ async function main() {
     })
     const group = manager.createGroup('dev2', 'lead')
     await manager.spawnMember(group, 'alice', 'worker')
-    const memberCtx = { ...ctx, cwd: process.cwd() }
+    const memberCtx = { ...ctx, cwd: REPO }
     const tools = manager.memberTools()
     const sendTool = tools.find((t) => t.name === 'team_send')!
     const r = await sendTool.execute({ to: 'bob', body: 'APPROVE 可以' }, memberCtx)
     if (!r.success) throw new Error('发送失败')
+    const alias = await sendTool.execute({ to: 'Lead', body: 'IDLE 完成' }, memberCtx)
+    if (!alias.success) throw new Error(`Lead 别名发送失败: ${alias.error}`)
     const mail = new TeamMail(join(TEAM_ROOT, '_shared', 'mail'))
     const msgs = mail.read('bob')
     if (!msgs.some((m) => m.from === 'alice')) throw new Error('消息未落盘')
+    if (!mail.read('lead').some((m) => m.from === 'alice' && m.body === 'IDLE 完成')) throw new Error('Lead 别名未归一到小组邮箱')
   })
 
   // ---------- TeamManager ----------
+  await check('TeamManager: 默认工作目录和角色加载绑定 repoRoot', async () => {
+    const scopeRoot = join(TMP, 'team-repo-scope')
+    const agentsDir = join(REPO, 'agents')
+    mkdirSync(agentsDir, { recursive: true })
+    writeFileSync(join(agentsDir, 'repo-scoped-role.md'), `---
+name: repo-scoped-role
+description: repo scoped role
+tools_deny:
+  - run_command
+max_rounds: 7
+---
+repo scoped prompt
+`, 'utf8')
+    const manager = new TeamManager(scopeRoot, REPO, {
+      provider: new FakeTeamProvider(),
+      registry: { toOpenAITools: () => [] } as never,
+      ctx,
+    })
+    const group = manager.createGroup('scope', 'lead')
+    const host = await manager.spawnMember(group, 'scoped', 'repo-scoped-role')
+    if (group.members[0]?.workdir !== REPO) throw new Error('成员默认工作目录未使用 repoRoot')
+    if (host['rolePrompt'] !== 'repo scoped prompt' || host['roleMaxRounds'] !== 7) throw new Error('派生成员未从 repoRoot 加载角色')
+    await manager.close()
+
+    const restored = new TeamManager(scopeRoot, REPO, {
+      provider: new FakeTeamProvider(),
+      registry: { toOpenAITools: () => [] } as never,
+      ctx,
+    })
+    await restored.restore()
+    const restoredHost = restored.getMember('scoped')
+    if (restoredHost?.['rolePrompt'] !== 'repo scoped prompt' || restoredHost['roleMaxRounds'] !== 7) {
+      throw new Error('恢复成员未从 repoRoot 加载角色')
+    }
+    await restored.close()
+  })
+  await check('TeamManager: 拒绝跨小组同名成员和关闭后派生', async () => {
+    const ownershipRoot = join(TMP, 'team-member-ownership')
+    const manager = new TeamManager(ownershipRoot, REPO, {
+      provider: new FakeTeamProvider(),
+      registry: { toOpenAITools: () => [] } as never,
+      ctx,
+    })
+    const firstGroup = manager.createGroup('first', 'lead')
+    const secondGroup = manager.createGroup('second', 'lead')
+    const firstHost = await manager.spawnMember(firstGroup, 'shared-name', 'worker')
+    if (await manager.spawnMember(firstGroup, 'shared-name', 'worker') !== firstHost) throw new Error('同组成员幂等派生失效')
+    let crossGroupRejected = false
+    try {
+      await manager.spawnMember(secondGroup, 'shared-name', 'worker')
+    } catch (error) {
+      crossGroupRejected = (error as Error).message.includes('已属于小组 first')
+    }
+    if (!crossGroupRejected || secondGroup.members.length !== 0) throw new Error('跨小组同名成员未被拒绝')
+    let foreignTaskRejected = false
+    try {
+      manager.addTask(secondGroup.name, 'foreign assignment', 'shared-name')
+    } catch (error) {
+      foreignTaskRejected = (error as Error).message.includes('不属于小组 second')
+    }
+    if (!foreignTaskRejected || manager.listTasks(secondGroup.name).length !== 0) throw new Error('跨小组负责人任务未拒绝')
+    if (!manager.respondApproval(secondGroup.name, 'shared-name', true).includes('不属于小组 second')) {
+      throw new Error('跨小组审批未被拒绝')
+    }
+    await manager.close()
+    let closedRejected = false
+    try {
+      await manager.spawnMember(firstGroup, 'after-close', 'worker')
+    } catch (error) {
+      closedRejected = (error as Error).message.includes('已关闭')
+    }
+    if (!closedRejected || manager.getMember('after-close')) throw new Error('关闭后仍可派生成员')
+  })
+  await check('TeamManager: 非法成员名在写入前拒绝', async () => {
+    const validationRoot = join(TMP, 'team-member-validation')
+    const manager = new TeamManager(validationRoot, REPO, {
+      provider: new FakeTeamProvider(),
+      registry: { toOpenAITools: () => [] } as never,
+      ctx,
+    })
+    const group = manager.createGroup('validation', 'lead')
+    let rejected = false
+    try {
+      await manager.spawnMember(group, '../../escape', 'worker')
+    } catch (error) {
+      rejected = (error as Error).message.includes('成员名只能包含')
+    }
+    if (!rejected || group.members.length !== 0 || manager.getMember('../../escape')) throw new Error('非法成员名产生了部分状态')
+    let reservedRejected = false
+    try {
+      await manager.spawnMember(group, 'Lead', 'worker')
+    } catch (error) {
+      reservedRejected = (error as Error).message.includes('不能与负责人')
+    }
+    if (!reservedRejected || group.members.length !== 0) throw new Error('负责人保留名称可被成员占用')
+    await manager.close()
+  })
+  await check('TeamManager: 成员名大小写冲突在创建资源前拒绝', async () => {
+    const validationRoot = join(TMP, 'team-member-case')
+    const created: string[] = []
+    const worktrees = {
+      create: async (name: string) => {
+        created.push(name)
+        const path = join(TMP, name)
+        mkdirSync(path, { recursive: true })
+        return { name, path, branch: `wt-${name}`, createdAt: Date.now(), dirty: false }
+      },
+      remove: async (name: string) => `已删除 worktree: ${name}`,
+    }
+    const manager = new TeamManager(validationRoot, REPO, {
+      provider: new FakeTeamProvider(),
+      registry: { toOpenAITools: () => [] } as never,
+      ctx,
+    }, worktrees as never)
+    const group = manager.createGroup('case-members', 'lead')
+    await manager.spawnMember(group, 'Alice', 'worker')
+    let rejected = false
+    try {
+      await manager.spawnMember(group, 'alice', 'worker')
+    } catch (error) {
+      rejected = (error as Error).message.includes('大小写冲突')
+    }
+    if (!rejected || created.includes('member-alice') || group.members.length !== 1) {
+      throw new Error('大小写冲突成员在资源创建后才被拒绝')
+    }
+    const store = new TeamGroupStore(validationRoot)
+    const snapshot = store.loadGroup(group.name)!
+    let storeRejected = false
+    try {
+      store.addMember(snapshot, { name: 'alice', role: 'worker', workdir: REPO, backend: 'coroutine', needsApproval: false, status: 'idle' })
+    } catch (error) {
+      storeRejected = (error as Error).message.includes('大小写冲突')
+    }
+    if (!storeRejected || store.loadGroup(group.name)?.members.length !== 1) throw new Error('持久化层接受了大小写冲突成员')
+    await manager.close()
+  })
+  await check('TeamManager: 派生前校验 agentId 并回滚失败 worktree', async () => {
+    const validationRoot = join(TMP, 'team-spawn-transaction')
+    const repo = join(TMP, 'team-spawn-transaction-repo')
+    mkdirSync(repo, { recursive: true })
+    const created: string[] = []
+    const removed: string[] = []
+    const worktrees = {
+      create: async (name: string) => {
+        created.push(name)
+        const path = join(repo, name)
+        mkdirSync(path, { recursive: true })
+        return { name, path, branch: `wt-${name}`, createdAt: Date.now(), dirty: false }
+      },
+      remove: async (name: string) => {
+        removed.push(name)
+        return `已删除 worktree: ${name}`
+      },
+    }
+    const manager = new TeamManager(validationRoot, repo, {
+      provider: new FakeTeamProvider(),
+      registry: { toOpenAITools: () => [] } as never,
+      ctx: { cwd: repo },
+    }, worktrees as never)
+    const first = manager.createGroup('first', 'lead')
+    const second = manager.createGroup('second', 'lead')
+    await manager.spawnMember(first, 'alice', 'worker', { agentId: 'agent_shared' })
+    let duplicateRejected = false
+    try {
+      await manager.spawnMember(second, 'bob', 'worker', { agentId: 'agent_shared' })
+    } catch (error) {
+      duplicateRejected = (error as Error).message.includes('已属于成员 alice')
+    }
+    if (!duplicateRejected || created.includes('member-bob')) throw new Error('重复 agentId 在创建 worktree 后才被拒绝')
+
+    const rollbackGroup = manager.createGroup('rollback', 'lead')
+    const rollbackFile = join(validationRoot, rollbackGroup.name, 'group.yaml')
+    worktrees.create = async (name: string) => {
+      created.push(name)
+      rmSync(rollbackFile, { force: true })
+      const path = join(repo, name)
+      mkdirSync(path, { recursive: true })
+      return { name, path, branch: `wt-${name}`, createdAt: Date.now(), dirty: false }
+    }
+    let persistenceRejected = false
+    try {
+      await manager.spawnMember(rollbackGroup, 'carol', 'worker')
+    } catch (error) {
+      persistenceRejected = (error as Error).message.includes('不存在或文件损坏')
+    }
+    if (!persistenceRejected || !removed.includes('member-carol') || manager.getMember('carol')) {
+      throw new Error('成员持久化失败后未回滚新 worktree 或仍注册 Host')
+    }
+    await manager.close()
+  })
+  await check('TeamManager: 成员状态更新不覆盖并发花名册', async () => {
+    const stateRoot = join(TMP, 'team-member-state')
+    const store = new TeamGroupStore(stateRoot)
+    const initial = store.createGroup('state', 'lead')
+    store.addMember(initial, {
+      name: 'alice',
+      agentId: 'agent_state_alice',
+      role: 'worker',
+      workdir: REPO,
+      backend: 'coroutine',
+      needsApproval: false,
+      status: 'busy',
+    })
+    const manager = new TeamManager(stateRoot, REPO, {
+      provider: new FakeTeamProvider(),
+      registry: { toOpenAITools: () => [] } as never,
+      ctx,
+    })
+    await manager.restore()
+    const stale = manager.loadGroup('state')!
+    const peer = new TeamGroupStore(stateRoot)
+    const peerGroup = peer.loadGroup('state')!
+    peer.addMember(peerGroup, {
+      name: 'bob',
+      agentId: 'agent_state_bob',
+      role: 'worker',
+      workdir: REPO,
+      backend: 'coroutine',
+      needsApproval: false,
+      status: 'idle',
+    })
+    manager.markMemberIdle(stale, 'alice')
+    const members = store.loadGroup('state')?.members ?? []
+    if (!members.some((member) => member.name === 'bob') || members.find((member) => member.name === 'alice')?.status !== 'idle') {
+      throw new Error('成员状态更新覆盖了并发新增成员')
+    }
+    await manager.close()
+  })
+  await check('TeamManager: 同目录成员按 agentId 识别身份', async () => {
+    const identityRoot = join(TMP, 'team-member-identity')
+    const manager = new TeamManager(identityRoot, REPO, {
+      provider: new FakeTeamProvider(),
+      registry: { toOpenAITools: () => [] } as never,
+      ctx,
+    })
+    const group = manager.createGroup('identity', 'lead')
+    await manager.spawnMember(group, 'alpha', 'worker')
+    await manager.spawnMember(group, 'beta', 'worker')
+    const alpha = group.members.find((member) => member.name === 'alpha')
+    const beta = group.members.find((member) => member.name === 'beta')
+    if (!alpha?.agentId || !beta?.agentId || alpha.workdir !== beta.workdir) throw new Error('同目录成员测试准备失败')
+    const tools = manager.memberTools()
+    const taskTool = tools.find((tool) => tool.name === 'team_task')!
+    const ambiguous = await taskTool.execute({ action: 'list' }, { cwd: REPO })
+    if (ambiguous.success || !ambiguous.error?.includes('无法唯一识别')) throw new Error('共享 cwd 被错误解析为首个成员')
+    const sendTool = tools.find((tool) => tool.name === 'team_send')!
+    const sent = await sendTool.execute({ to: 'identity-target', body: 'from beta' }, { cwd: REPO, agentId: beta.agentId })
+    if (!sent.success) throw new Error(`agentId 身份发送失败: ${sent.error}`)
+    const unknown = await sendTool.execute({ to: 'lead', body: 'forged lead' }, { cwd: REPO, agentId: 'agent_unknown' })
+    if (unknown.success || !unknown.error?.includes('无法识别消息发送者')) throw new Error('未知 agentId 被降级为 Lead 身份')
+    const ambiguousSender = await sendTool.execute({ to: 'lead', body: 'ambiguous sender' }, { cwd: REPO })
+    if (ambiguousSender.success) throw new Error('共享 cwd 的模糊身份被降级为 Lead')
+    const messages = new TeamMail(join(identityRoot, '_shared', 'mail')).read('identity-target')
+    if (!messages.some((message) => message.from === 'beta')) throw new Error('agentId 未解析到正确成员')
+    if (new TeamMail(join(identityRoot, '_shared', 'mail')).read('lead').some((message) => message.body.includes('sender'))) {
+      throw new Error('身份拒绝后仍写入了 Lead 邮箱')
+    }
+    await manager.close()
+  })
+  await check('MemberHost: Hook 使用稳定 agentId', async () => {
+    const hookRoot = join(TMP, 'team-member-hook-id')
+    const events: Array<{ event: string; agentId?: string }> = []
+    const manager = new TeamManager(hookRoot, REPO, {
+      provider: new FakeTeamProvider(),
+      registry: { toOpenAITools: () => [] } as never,
+      ctx: {
+        cwd: REPO,
+        hooks: {
+          fire: async (event: string, payload: { agentId?: string }) => {
+            events.push({ event, agentId: payload.agentId })
+          },
+        } as never,
+      },
+    })
+    const group = manager.createGroup('hook-id', 'lead')
+    const host = await manager.spawnMember(group, 'alice', 'worker', { agentId: 'agent_hook_alice' })
+    await host.execute('hook identity', 'task-hook-id')
+    for (const event of ['subagent_start', 'subagent_stop', 'teammate_idle']) {
+      if (!events.some((item) => item.event === event && item.agentId === 'agent_hook_alice')) {
+        throw new Error(`${event} 未使用稳定 agentId`)
+      }
+    }
+    await manager.close()
+  })
+  await check('MemberHost: 工具调用不会绕过 Hook 拦截', async () => {
+    const hookRoot = join(TMP, 'team-member-hook-block')
+    let executions = 0
+    const registry = new ToolRegistry()
+    registry.register({
+      name: 'read_file',
+      description: 'read',
+      parameters: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] },
+      async execute() {
+        executions++
+        return { success: true, output: 'unexpected' }
+      },
+    })
+    const hooks = new HookEngine([
+      {
+        event: 'tool_before',
+        if: { all: [{ match: 'name', pattern: 'read_file' }] },
+        action: { type: 'command', command: 'echo blocked' },
+      },
+    ])
+    const manager = new TeamManager(hookRoot, REPO, {
+      provider: new ToolCallingTeamProvider(),
+      registry,
+      ctx: { cwd: REPO, sessionId: 'member-hook-session', agentId: 'lead-agent', hooks },
+    })
+    const group = manager.createGroup('hook-block', 'lead')
+    const host = await manager.spawnMember(group, 'alice', 'worker', { agentId: 'agent_hook_block' })
+    const outcome = await host.execute('blocked tool', 'task-hook-block')
+    if (executions !== 0 || outcome.status !== 'done') {
+      throw new Error(`团队成员绕过 Hook: executions=${executions} status=${outcome.status}`)
+    }
+    if (!host.history.view().some((message) => message.role === 'tool' && message.content.includes('[Hook 拦截]'))) {
+      throw new Error('团队成员历史未记录 Hook 拦截结果')
+    }
+    await manager.close()
+  })
+  await check('Lead 工具: 派发状态不误报完成', async () => {
+    const leadRoot = join(TMP, 'team-lead-result')
+    const manager = new TeamManager(leadRoot, REPO, {
+      provider: new FakeTeamProvider(),
+      registry: { toOpenAITools: () => [] } as never,
+      ctx,
+    })
+    const group = manager.createGroup('lead-result', 'lead')
+    const assign = createLeadTools(manager).find((tool) => tool.name === 'team_assign')!
+    const missing = await assign.execute({ group: group.name, task: 'missing member task', member: 'missing' }, ctx)
+    if (missing.success || manager.listTasks(group.name).length !== 0) throw new Error('不存在成员仍创建了孤儿任务')
+    const host = await manager.spawnMember(group, 'alice', 'worker')
+    host['member'].status = 'busy'
+    const queued = await assign.execute({ group: group.name, task: 'queued task', member: 'alice' }, ctx)
+    if (!queued.success || !queued.output.includes('已进入队列') || queued.output.includes('已完成')) throw new Error('排队任务被误报为完成')
+    host['member'].status = 'idle'
+    const completed = await assign.execute({ group: group.name, task: 'completed task', member: 'alice' }, ctx)
+    if (!completed.success || !completed.output.includes('已完成')) throw new Error('完成任务状态反馈错误')
+    await manager.close()
+  })
+  await check('TeamManager: 合并拒绝运行中成员和未完成任务', async () => {
+    const mergeRoot = join(TMP, 'team-merge-preflight')
+    const manager = new TeamManager(mergeRoot, REPO, {
+      provider: new FakeTeamProvider(),
+      registry: { toOpenAITools: () => [] } as never,
+      ctx,
+    })
+    const group = manager.createGroup('merge-preflight', 'lead')
+    const host = await manager.spawnMember(group, 'alice', 'worker')
+    host['member'].status = 'busy'
+    const busy = await manager.mergeAll(group)
+    if (busy.success || !busy.output.includes('成员仍在执行任务')) throw new Error('运行中成员未阻止合并')
+    host['member'].status = 'idle'
+    manager.addTask(group.name, 'pending merge task', 'alice')
+    const pending = await manager.mergeAll(group)
+    if (pending.success || !pending.output.includes('仍有未完成任务')) throw new Error('未完成任务未阻止合并')
+    const mergeTool = createLeadTools(manager).find((tool) => tool.name === 'team_merge')!
+    const toolResult = await mergeTool.execute({ group: group.name }, ctx)
+    if (toolResult.success || !toolResult.error?.includes('仍有未完成任务')) throw new Error('team_merge 拒绝结果仍被报告为成功')
+    await manager.close()
+  })
   await check('coordinator: 双锁缺一不生效', () => {
     const makeMgr = () =>
       new TeamManager(TEAM_ROOT, REPO, {
@@ -380,7 +932,7 @@ async function main() {
     } as never
     const manager = new TeamManager(TEAM_ROOT, REPO, { provider: new FakeTeamProvider(), registry, ctx })
     // 共享产物区已创建（成员中间产物互通）
-    if (!existsSync(join(REPO, '.mewcode', 'artifacts'))) throw new Error('共享产物区未创建')
+    if (!existsSync(join(REPO, '.meicode', 'artifacts'))) throw new Error('共享产物区未创建')
     const group = manager.createGroup('build', 'lead')
     await manager.spawnMember(group, 'alice', 'worker')
     const tasks = manager.listTasks('build')
@@ -423,6 +975,40 @@ async function main() {
     await manager.close()
     const result = await pending
     if (!manager.isClosed() || manager.getMember('alice')?.isBusy() || !result.includes('关闭')) throw new Error('TeamManager close 未取消成员执行')
+  })
+  await check('TeamManager: 关闭超时后在成员真正空闲时延迟释放 worktree', async () => {
+    const provider = new DeferredTeamProvider()
+    const released: string[] = []
+    const worktreePath = join(REPO, 'deferred-member')
+    const worktrees = {
+      create: async (name: string) => {
+        mkdirSync(worktreePath, { recursive: true })
+        return { name, path: worktreePath, branch: `wt-${name}`, createdAt: Date.now(), dirty: false }
+      },
+      release: (name: string) => { released.push(name) },
+      remove: async (name: string) => `已删除 worktree: ${name}`,
+    }
+    const sessionCtx: ToolContext = { cwd: REPO, sessionId: 'session-old' }
+    const manager = new TeamManager(join(TMP, 'deferred-close-team'), REPO, {
+      provider,
+      registry: { toOpenAITools: () => [] } as never,
+      ctx: sessionCtx,
+    }, worktrees as never)
+    const group = manager.createGroup('deferred-close', 'lead')
+    const host = await manager.spawnMember(group, 'slow', 'worker')
+    const task = manager.addTask(group.name, '忽略取消的慢任务', 'slow')
+    await manager.assignTask(group, task, 'slow')
+    await provider.started
+    manager.setSessionId('session-new')
+    if (host['ctx'].sessionId !== 'session-old') throw new Error('活动成员上下文被迁移到新会话')
+    await manager.close(0)
+    if (released.length !== 0) throw new Error('忙碌成员的 worktree 被提前释放')
+    provider.finish()
+    await host.whenIdle()
+    await new Promise<void>((resolve) => setImmediate(resolve))
+    const releasesAfterIdle = [...released]
+    if (releasesAfterIdle.length !== 1 || releasesAfterIdle[0] !== 'member-slow') throw new Error('成员空闲后未延迟释放 worktree')
+    if (String(host['ctx'].sessionId) !== 'session-new') throw new Error('成员结束后未切换到新会话上下文')
   })
 
   rmSync(TMP, { recursive: true, force: true })

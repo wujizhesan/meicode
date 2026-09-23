@@ -82,17 +82,23 @@ await check('审批: planTs 时效——历史 APPROVE 不被后续任务复用'
   const t1 = manager.addTask(group.name, '任务1', 'alice')
   const p1 = manager.assignTask(group, t1, 'alice')
   await new Promise((r) => setTimeout(r, 1600))
-  manager.respondApproval(group.name, 'alice', true, 'ok')
+  const plan1 = manager.readLeadMail().find((message) => message.kind === 'approval_plan' && message.taskId === t1.id)
+  assert(plan1?.correlationId, '任务1 PLAN 缺少审批关联')
+  manager.respondApproval(group.name, 'alice', true, 'ok', t1.id, plan1?.correlationId)
   await p1
   await new Promise((r) => setTimeout(r, 1400))
   // 任务 2：不审批，历史 APPROVE 不应被复用 → 等超时(60s 太长，缩短验证：确认 2s 后仍是 in_progress)
   const t2 = manager.addTask(group.name, '任务2', 'alice')
   const p2 = manager.assignTask(group, t2, 'alice')
   await new Promise((r) => setTimeout(r, 1600))
+  const stale = manager.respondApproval(group.name, 'alice', true, '迟到批准', t1.id, plan1?.correlationId)
+  assert(stale.startsWith('审批失败:'), `旧任务审批未被拒绝: ${stale}`)
   const st = manager.listTasks(group.name).find((x) => x.id === t2.id)?.status
   assert(st === 'in_progress', `历史 APPROVE 被误复用(任务2 提前完成),状态 ${st}`)
   // 清理：审批让它完成
-  manager.respondApproval(group.name, 'alice', true, '现在批准')
+  const plan2 = manager.readLeadMail().find((message) => message.kind === 'approval_plan' && message.taskId === t2.id)
+  assert(plan2?.correlationId && plan2.correlationId !== plan1?.correlationId, '任务2 未生成独立审批关联')
+  manager.respondApproval(group.name, 'alice', true, '现在批准', t2.id, plan2?.correlationId)
   await p2
 })
 

@@ -43,7 +43,11 @@ export function createLeadTools(team: TeamManager): Tool[] {
         const member = String(args.member ?? '')
         if (!member) return { success: false, output: '', error: '缺少参数 member' }
         const role = String(args.role ?? 'general-purpose')
-        await team.spawnMember(g, member, role, { needsApproval: args.needs_approval === true })
+        try {
+          await team.spawnMember(g, member, role, { needsApproval: args.needs_approval === true })
+        } catch (error) {
+          return { success: false, output: '', error: (error as Error).message }
+        }
         return {
           success: true,
           output: `已派生成员 ${member}（角色: ${role}${args.needs_approval === true ? '，需审批' : ''}）加入小组 ${g.name}，随时可指派任务`,
@@ -52,12 +56,14 @@ export function createLeadTools(team: TeamManager): Tool[] {
     },
     {
       name: 'team_approve',
-      description: '批准成员的审批请求（needsApproval 成员执行前会发 PLAN 等审批）。group=组名 member=成员名 note=备注（可选）。',
+      description: '批准成员的审批请求。优先传入 PLAN 邮件中的 task_id 与 correlation_id，避免审批串到其他任务。',
       parameters: {
         type: 'object',
         properties: {
           group: { type: 'string', description: '组名' },
           member: { type: 'string', description: '成员名' },
+          task_id: { type: 'string', description: 'PLAN 中的任务 ID（推荐）' },
+          correlation_id: { type: 'string', description: 'PLAN 中的审批关联 ID（推荐）' },
           note: { type: 'string', description: '审批备注（可选）' },
         },
         required: ['group', 'member'],
@@ -67,17 +73,27 @@ export function createLeadTools(team: TeamManager): Tool[] {
         if (!g) return { success: false, output: '', error: `小组不存在: ${args.group}` }
         const member = String(args.member ?? '')
         const note = typeof args.note === 'string' ? args.note : undefined
-        return { success: true, output: team.respondApproval(g.name, member, true, note) }
+        const output = team.respondApproval(
+          g.name,
+          member,
+          true,
+          note,
+          typeof args.task_id === 'string' ? args.task_id : undefined,
+          typeof args.correlation_id === 'string' ? args.correlation_id : undefined,
+        )
+        return output.startsWith('审批失败:') ? { success: false, output: '', error: output } : { success: true, output }
       },
     },
     {
       name: 'team_deny',
-      description: '拒绝成员的审批请求。group=组名 member=成员名 note=拒绝原因（可选）。',
+      description: '拒绝成员的审批请求。优先传入 PLAN 邮件中的 task_id 与 correlation_id，note 可填写拒绝原因。',
       parameters: {
         type: 'object',
         properties: {
           group: { type: 'string', description: '组名' },
           member: { type: 'string', description: '成员名' },
+          task_id: { type: 'string', description: 'PLAN 中的任务 ID（推荐）' },
+          correlation_id: { type: 'string', description: 'PLAN 中的审批关联 ID（推荐）' },
           note: { type: 'string', description: '拒绝原因（可选）' },
         },
         required: ['group', 'member'],
@@ -87,7 +103,15 @@ export function createLeadTools(team: TeamManager): Tool[] {
         if (!g) return { success: false, output: '', error: `小组不存在: ${args.group}` }
         const member = String(args.member ?? '')
         const note = typeof args.note === 'string' ? args.note : undefined
-        return { success: true, output: team.respondApproval(g.name, member, false, note) }
+        const output = team.respondApproval(
+          g.name,
+          member,
+          false,
+          note,
+          typeof args.task_id === 'string' ? args.task_id : undefined,
+          typeof args.correlation_id === 'string' ? args.correlation_id : undefined,
+        )
+        return output.startsWith('审批失败:') ? { success: false, output: '', error: output } : { success: true, output }
       },
     },
     {
@@ -109,6 +133,7 @@ export function createLeadTools(team: TeamManager): Tool[] {
         const g = loadGroup(String(args.group ?? ''))
         if (!g) return { success: false, output: '', error: `小组不存在: ${args.group}（先 team_create）` }
         const member = String(args.member ?? '')
+        if (!member) return { success: false, output: '', error: '缺少参数 member' }
         const dependsOn = Array.isArray(args.depends_on) ? args.depends_on.filter((v): v is string => typeof v === 'string') : []
         const maxAttempts = typeof args.max_attempts === 'number' && args.max_attempts > 0 ? Math.floor(args.max_attempts) : 1
         let task
@@ -118,7 +143,30 @@ export function createLeadTools(team: TeamManager): Tool[] {
           return { success: false, output: '', error: (e as Error).message }
         }
         const result = await team.runTask(g, task, member)
-        return { success: true, output: `任务 ${task.id} 已完成\n${result.slice(0, 4000)}` }
+        const current = team.listTasks(g.name).find((item) => item.id === task.id)
+        if (!current) return { success: false, output: '', error: `任务 ${task.id} 执行后丢失` }
+        if (current.status === 'done') {
+          return { success: true, output: `任务 ${task.id} 已完成\n${result.slice(0, 4000)}` }
+        }
+        if (current.status === 'failed') {
+          return { success: false, output: '', error: `任务 ${task.id} 执行失败\n${result.slice(0, 4000)}` }
+        }
+        if (current.status === 'cancelled') {
+          return { success: false, output: '', error: `任务 ${task.id} 已取消` }
+        }
+        if (current.status === 'in_progress') {
+          return { success: true, output: `任务 ${task.id} 仍在执行中\n${result.slice(0, 4000)}` }
+        }
+        if (current.nextRetryAt) {
+          return { success: true, output: `任务 ${task.id} 执行失败，已安排重试\n${result.slice(0, 4000)}` }
+        }
+        const blockers = team.taskBlockers(g.name, current)
+        return {
+          success: true,
+          output: blockers.length > 0
+            ? `任务 ${task.id} 已创建，等待依赖完成: ${blockers.join(', ')}`
+            : `任务 ${task.id} 已进入队列\n${result.slice(0, 4000)}`,
+        }
       },
     },
     {
@@ -173,7 +221,8 @@ export function createLeadTools(team: TeamManager): Tool[] {
         if (shown.length === 0) return { success: true, output: '（无未读邮件）' }
         const lines = shown.map((m) => {
           const proto = TeamMail.parseProtocol(m.body).type
-          return `[${proto}] ${new Date(m.ts).toLocaleTimeString()} ${m.from} → ${m.to}: ${m.summary ?? m.body.slice(0, 80)}`
+          const ids = [m.taskId ? `task=${m.taskId}` : '', m.correlationId ? `correlation=${m.correlationId}` : ''].filter(Boolean).join(' ')
+          return `[${proto}] ${new Date(m.ts).toLocaleTimeString()} ${m.from} → ${m.to}${ids ? ` (${ids})` : ''}: ${m.summary ?? m.body.slice(0, 80)}`
         })
         const note = action === 'list' && unread.length > 0 ? `（共 ${unread.length} 封未读，read 查看详情并标记已读）` : ''
         return { success: true, output: lines.join('\n') + note }
@@ -192,7 +241,7 @@ export function createLeadTools(team: TeamManager): Tool[] {
         const g = loadGroup(String(args.group ?? ''))
         if (!g) return { success: false, output: '', error: `小组不存在: ${args.group}（先 team_create）` }
         const result = await team.mergeAll(g)
-        return { success: true, output: result }
+        return result.success ? { success: true, output: result.output } : { success: false, output: result.output, error: result.output }
       },
     },
   ]

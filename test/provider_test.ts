@@ -161,6 +161,12 @@ await check('anthropic: thinking 参数', () => {
   assert(body.max_tokens === 32000, 'thinking 时 max_tokens 应 32000')
 })
 
+await check('anthropic: 配置输出预算限制 thinking budget', () => {
+  const body = toAnthropicBody([{ role: 'user', content: 'x' }], 'm', true, undefined, 4096)
+  assert(body.max_tokens === 4096, '自定义 max_tokens 未生效')
+  assert((body.thinking as { budget_tokens: number }).budget_tokens === 4095, 'thinking budget 未限制在输出预算内')
+})
+
 await check('provider: 预取消信号会传递到请求', async () => {
   const originalFetch = globalThis.fetch
   const seen: boolean[] = []

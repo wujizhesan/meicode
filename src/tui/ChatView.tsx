@@ -1,6 +1,6 @@
 import { Box, Text } from 'ink'
 import { memo, useRef, type ReactElement } from 'react'
-import type { Mode, UIMessage } from './useStream.ts'
+import type { Mode, UIMessage } from './types.ts'
 
 const STREAMING_HISTORY_LIMIT = 200
 const STREAMING_HISTORY_CHAR_LIMIT = 50_000

@@ -61,7 +61,7 @@ export class AnthropicProvider implements Provider {
     const endpoint = /\/messages$/i.test(base) ? base : `${base}/v1/messages`
     const request = linkAbortSignal(opts.signal)
 
-    const body = toAnthropicBody(messages, this.cfg.model, thinking, opts.tools)
+    const body = toAnthropicBody(messages, this.cfg.model, thinking, opts.tools, this.cfg.max_output_tokens)
 
     let res: Response
     try {
@@ -190,6 +190,7 @@ export function toAnthropicBody(
   model: string,
   thinking: boolean,
   tools?: ProviderTool[],
+  maxOutputTokens?: number,
 ): Record<string, unknown> {
   const systemParts: string[] = []
   const converted: AnthropicMessage[] = []
@@ -235,11 +236,13 @@ export function toAnthropicBody(
     previousMergeable = !m.tool_calls
   }
 
+  const maxTokens = Math.max(2, Math.floor(maxOutputTokens ?? (thinking ? 32000 : 16384)))
+  const thinkingBudget = Math.min(16000, maxTokens - 1)
   const body: Record<string, unknown> = {
     model,
-    max_tokens: thinking ? 32000 : 16384,
+    max_tokens: maxTokens,
     stream: true,
-    ...(thinking ? { thinking: { type: 'enabled' as const, budget_tokens: 16000 } } : {}),
+    ...(thinking ? { thinking: { type: 'enabled' as const, budget_tokens: thinkingBudget } } : {}),
     messages: converted,
   }
   if (systemParts.length > 0) body.system = systemParts.join('\n\n')

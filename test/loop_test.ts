@@ -10,6 +10,7 @@ import { RuleEngine } from '../src/permission/index.ts'
 import type { ChatMessage, Provider, StreamEvent } from '../src/provider/types.ts'
 import type { ToolContext } from '../src/tools/index.ts'
 import { RuntimeEventLog } from '../src/runtime/index.ts'
+import { HookEngine } from '../src/hook/index.ts'
 
 let passed = 0
 let failed = 0
@@ -99,6 +100,25 @@ async function main() {
     if (result.rounds !== 1) throw new Error(`rounds=${result.rounds}`)
     if (history.all().length !== 2) throw new Error(`历史段数 ${history.all().length}`)
   })
+  await check('usage: 输出增量不会用零值覆盖输入 token 锚点', async () => {
+    const p = new FakeAgentProvider(() => ({
+      events: [
+        { type: 'usage', inputTokens: 321, outputTokens: 0 },
+        { type: 'usage', inputTokens: 0, outputTokens: 45 },
+        { type: 'text', text: '完成' },
+        { type: 'done' },
+      ],
+    }))
+    const history = new History()
+    history.push({ role: 'user', content: 'usage' })
+    const anchors: number[] = []
+    const { result } = await consume(runAgent({
+      ...baseOpts(p, history),
+      ctx: { ...ctx, afterRequest: (inputTokens) => anchors.push(inputTokens) },
+    }))
+    if (anchors.join(',') !== '321') throw new Error(`上下文锚点错误: ${anchors.join(',')}`)
+    if (result.totalTokens !== 366) throw new Error(`总 token 错误: ${result.totalTokens}`)
+  })
   await check('事件队列: 高频文本流保持完整顺序', async () => {
     const chunks = Array.from({ length: 3000 }, (_, index) => String(index % 10))
     const p = new FakeAgentProvider(() => ({
@@ -165,7 +185,7 @@ async function main() {
   })
 
   await check('max_iterations: 每轮调工具 → 15 轮停止', async () => {
-    // 每轮参数不同——避免触发重复调用检测(同参数 ≥3 次会先停)
+    // 每轮参数不同——避免触发重复调用检测(同参数 ≥5 次会先停)
     let pround = 0
     const p = new FakeAgentProvider(() => {
       pround++
@@ -211,6 +231,34 @@ async function main() {
     const { result } = await consume(agent)
     if (result.reason !== 'cancelled') throw new Error(`reason=${result.reason}`)
     if (Date.now() - started > 3000) throw new Error('取消后命令仍等待到超时')
+  })
+
+  await check('cancelled: cancel 会释放等待中的权限询问', async () => {
+    const p = new FakeAgentProvider(() => ({
+      events: [{ type: 'tool_call', id: 'call_permission_cancel', name: 'write_file', arguments: { path: 'cancelled.txt', content: 'x' } }, { type: 'done' }],
+    }))
+    const history = new History()
+    history.push({ role: 'user', content: '取消权限询问' })
+    const engine = new RuleEngine('', '', '')
+    const agent = runAgent({
+      ...baseOpts(p, history),
+      ctx: {
+        ...ctx,
+        permission: { mode: 'default', engine },
+        ask: async () => new Promise(() => {}),
+      },
+    })
+    setTimeout(() => agent.cancel(), 30)
+    let timer: ReturnType<typeof setTimeout> | undefined
+    try {
+      const consumed = await Promise.race([
+        consume(agent),
+        new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error('权限询问取消后仍悬挂')), 1000) }),
+      ])
+      if (consumed.result.reason !== 'cancelled') throw new Error(`reason=${consumed.result.reason}`)
+    } finally {
+      if (timer) clearTimeout(timer)
+    }
   })
 
   await check('unknown_tool: 连续 2 次未知工具停止', async () => {
@@ -279,6 +327,108 @@ async function main() {
     history.push({ role: 'user', content: '出错' })
     const { result } = await consume(runAgent(baseOpts(p, history)))
     if (result.reason !== 'error') throw new Error(`reason=${result.reason}`)
+  })
+
+  await check('error: 重复工具调用 ID 在执行前拒绝', async () => {
+    let executions = 0
+    const localRegistry = new ToolRegistry()
+    localRegistry.register({
+      name: 'probe',
+      description: 'probe',
+      parameters: { type: 'object', properties: {} },
+      async execute() {
+        executions++
+        return { success: true, output: 'executed' }
+      },
+    })
+    const p = new FakeAgentProvider(() => ({
+      events: [
+        { type: 'tool_call', id: 'duplicate-id', name: 'probe', arguments: {} },
+        { type: 'tool_call', id: 'duplicate-id', name: 'probe', arguments: {} },
+        { type: 'done' },
+      ],
+    }))
+    const history = new History()
+    history.push({ role: 'user', content: 'duplicate id' })
+    const { result } = await consume(runAgent({ ...baseOpts(p, history), registry: localRegistry }))
+    if (result.reason !== 'error' || executions !== 0 || history.length !== 1) {
+      throw new Error(`重复 ID 未在执行前拒绝: reason=${result.reason} executions=${executions} history=${history.length}`)
+    }
+  })
+
+  await check('Hook: pre_compact 注入进入同一次模型请求', async () => {
+    const hooks = new HookEngine([
+      { event: 'pre_compact', action: { type: 'inject_prompt', content: '压缩前提示' } },
+    ])
+    const p = new FakeAgentProvider(() => ({ events: [{ type: 'text', text: '完成' }, { type: 'done' }] }))
+    const history = new History()
+    history.push({ role: 'user', content: 'compact hook' })
+    const hookCtx: ToolContext = {
+      ...ctx,
+      sessionId: 'compact-session',
+      agentId: 'compact-agent',
+      hooks,
+      beforeRequest: async () => {
+        await hooks.fire('pre_compact', {
+          cwd: ctx.cwd,
+          sessionId: 'compact-session',
+          agentId: 'compact-agent',
+        })
+      },
+    }
+    await consume(runAgent({ ...baseOpts(p, history), ctx: hookCtx }))
+    if (!p.capturedMessages.some((message) => message.role === 'system' && message.content === '压缩前提示')) {
+      throw new Error('pre_compact 注入未进入当前模型请求')
+    }
+  })
+
+  await check('Hook: 每轮注入只投递一次且不累积', async () => {
+    const hooks = new HookEngine([
+      { event: 'round_start', action: { type: 'inject_prompt', content: '单轮提示' } },
+    ])
+    const localRegistry = new ToolRegistry()
+    localRegistry.register({
+      name: 'probe',
+      description: 'probe',
+      parameters: { type: 'object', properties: {} },
+      async execute() {
+        return { success: true, output: 'ok' }
+      },
+    })
+    let round = 0
+    const p = new FakeAgentProvider(() => {
+      round++
+      return round === 1
+        ? { events: [{ type: 'tool_call', id: 'probe-1', name: 'probe', arguments: {} }, { type: 'done' }] }
+        : { events: [{ type: 'text', text: '完成' }, { type: 'done' }] }
+    })
+    const history = new History()
+    history.push({ role: 'user', content: 'round hook' })
+    await consume(runAgent({
+      ...baseOpts(p, history),
+      registry: localRegistry,
+      ctx: { ...ctx, sessionId: 'round-session', agentId: 'round-agent', hooks },
+    }))
+    const counts = p.capturedAll.map((messages) => messages.filter((message) => message.content === '单轮提示').length)
+    if (counts.join(',') !== '1,1') throw new Error(`Hook 注入重复或累积: ${counts.join(',')}`)
+  })
+
+  await check('Hook: round_end 注入保留到下一次 Agent 请求', async () => {
+    const hooks = new HookEngine([
+      { event: 'round_end', action: { type: 'inject_prompt', content: '上次执行已结束' } },
+    ])
+    const scope = { ...ctx, sessionId: 'round-end-session', agentId: 'round-end-agent', hooks }
+    const firstProvider = new FakeAgentProvider(() => ({ events: [{ type: 'text', text: '第一次完成' }, { type: 'done' }] }))
+    const firstHistory = new History()
+    firstHistory.push({ role: 'user', content: 'first' })
+    await consume(runAgent({ ...baseOpts(firstProvider, firstHistory), ctx: scope }))
+
+    const secondProvider = new FakeAgentProvider(() => ({ events: [{ type: 'text', text: '第二次完成' }, { type: 'done' }] }))
+    const secondHistory = new History()
+    secondHistory.push({ role: 'user', content: 'second' })
+    await consume(runAgent({ ...baseOpts(secondProvider, secondHistory), ctx: scope }))
+    const injected = secondProvider.capturedMessages.filter((message) => message.content === '上次执行已结束')
+    if (injected.length !== 1) throw new Error(`round_end 注入未进入下一次请求: ${injected.length}`)
   })
 
   // ---------- 分批执行 ----------
@@ -652,10 +802,26 @@ async function main() {
   // ---------- buildPrompt ----------
   await check('buildPrompt: 三态内容正确', () => {
     if (!buildPrompt('plan').includes('计划模式')) throw new Error('plan prompt 缺关键词')
-    if (!buildPrompt('full').includes('MewCode')) throw new Error('full prompt 缺关键词')
+    if (!buildPrompt('full').includes('MeiCode')) throw new Error('full prompt 缺关键词')
     const withPlan = buildPrompt('full', '第一步：读文件')
     if (!withPlan.includes('你已制定的计划') || !withPlan.includes('第一步：读文件')) {
       throw new Error('planContext 注入失败')
+    }
+  })
+
+  await check('provider failure is preserved in result and done event', async () => {
+    const provider = new FakeAgentProvider(() => {
+      throw new Error('injected provider failure')
+    })
+    const history = new History()
+    history.push({ role: 'user', content: 'provider failure' })
+    const { events, result } = await consume(runAgent(baseOpts(provider, history)))
+    const done = events.find((event) => event.type === 'done')
+    if (result.reason !== 'error' || !result.errorMessage?.includes('injected provider failure')) {
+      throw new Error(`result lost provider failure: ${JSON.stringify(result)}`)
+    }
+    if (!done || done.type !== 'done' || !done.errorMessage?.includes('injected provider failure')) {
+      throw new Error(`done event lost provider failure: ${JSON.stringify(done)}`)
     }
   })
 

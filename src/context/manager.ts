@@ -13,6 +13,8 @@ export interface ContextManagerOptions {
   autoMargin?: number // 自动触发余量（默认 13000）
   manualMargin?: number // 手动触发余量（默认 3000）
   hooks?: HookEngine // pre/post_compact hook
+  sessionId?: string
+  agentId?: string
 }
 
 export interface ContextBudgetSnapshot {
@@ -34,6 +36,8 @@ export class ContextManager {
   private history: History
   private cwd: string
   private hooks: HookEngine | undefined
+  private sessionId: string | undefined
+  private agentId: string | undefined
   private window: number
   private autoMargin: number
   private manualMargin: number
@@ -52,6 +56,12 @@ export class ContextManager {
     this.autoMargin = opts.autoMargin ?? 13000
     this.manualMargin = opts.manualMargin ?? 3000
     this.hooks = opts.hooks
+    this.sessionId = opts.sessionId
+    this.agentId = opts.agentId
+  }
+
+  setSessionId(sessionId: string | undefined): void {
+    this.sessionId = sessionId
   }
 
   get breakerOpenState(): boolean {
@@ -109,6 +119,8 @@ export class ContextManager {
       // pre_compact hook：压缩前通知（存档关键信息/审计）
       await this.hooks?.fire('pre_compact', {
         cwd: this.cwd,
+        sessionId: this.sessionId,
+        agentId: this.agentId,
         stats: `drop=${drop.length}msgs keep=${keep.length}msgs`,
       })
       const summary = await summarize(this.provider, drop, { cwd: this.cwd, timeoutMs: 60000 })
@@ -121,6 +133,8 @@ export class ContextManager {
       // post_compact hook：压缩完成（校验/记录）
       await this.hooks?.fire('post_compact', {
         cwd: this.cwd,
+        sessionId: this.sessionId,
+        agentId: this.agentId,
         stats: `dropped=${drop.length}msgs → summary=${summary.length}chars`,
       })
     } catch (e) {

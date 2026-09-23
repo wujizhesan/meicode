@@ -2,54 +2,15 @@ import type { ChatMessage, Provider, StreamEvent } from '../provider/types.ts'
 import type { History } from '../session/history.ts'
 import { sanitizeMessages } from '../memory/session.ts'
 import { log } from '../log.ts'
-import type { ToolContext, ToolResult, ToolRegistry } from '../tools/index.ts'
+import type { ToolContext } from '../tools/index.ts'
 import type { AgentEvent, AgentHandle, AgentOptions, AgentResult, StopReason } from './events.ts'
 import { buildSystemPrompt, buildEnvironmentInfo, sessionDirective } from './prompt/index.ts'
-import { checkPermission } from '../permission/index.ts'
-import type { Rule } from '../permission/types.ts'
 import type { RuntimeEventInput } from '../runtime/index.ts'
 import { RuntimeEvidenceAccumulator } from '../runtime/index.ts'
-
-const READ_ONLY_TOOLS = new Set(['read_file', 'find_files', 'grep_code'])
-// 写类工具:重复检测阈值(5 次)——写死循环仍止损,但写同一文件迭代(报告草稿/读回再写)是合法场景,
-// 3 次误杀过主会话写报告(实战实锤)
-const WRITE_TOOLS = new Set(['write_file', 'edit_file'])
-const RUNTIME_STRING_LIMIT = 500
-const RUNTIME_COLLECTION_LIMIT = 20
-const RUNTIME_VALUE_DEPTH = 3
-
-interface RuntimeValueSummary {
-  value: unknown
-  truncated: boolean
-}
-
-function summarizeRuntimeValue(value: unknown, depth = 0): RuntimeValueSummary {
-  if (typeof value === 'string') {
-    if (value.length <= RUNTIME_STRING_LIMIT) return { value, truncated: false }
-    return {
-      value: `${value.slice(0, RUNTIME_STRING_LIMIT)}...[${value.length - RUNTIME_STRING_LIMIT} chars omitted]`,
-      truncated: true,
-    }
-  }
-  if (value === null || typeof value !== 'object') return { value, truncated: false }
-  if (depth >= RUNTIME_VALUE_DEPTH) return { value: '[nested value omitted]', truncated: true }
-  if (Array.isArray(value)) {
-    const summaries = value.slice(0, RUNTIME_COLLECTION_LIMIT).map((item) => summarizeRuntimeValue(item, depth + 1))
-    return {
-      value: summaries.map((summary) => summary.value),
-      truncated: value.length > RUNTIME_COLLECTION_LIMIT || summaries.some((summary) => summary.truncated),
-    }
-  }
-  const entries = Object.entries(value)
-  const selected = entries.slice(0, RUNTIME_COLLECTION_LIMIT).map(([key, item]) => {
-    const summary = summarizeRuntimeValue(item, depth + 1)
-    return { key, ...summary }
-  })
-  return {
-    value: Object.fromEntries(selected.map(({ key, value }) => [key, value])),
-    truncated: entries.length > RUNTIME_COLLECTION_LIMIT || selected.some((summary) => summary.truncated),
-  }
-}
+import { nextToolFailureStreak, nextUnknownToolStreak, READ_ONLY_TOOLS, RepeatedToolCallGuard } from './loop-guards.ts'
+import { summarizeRuntimeValue } from './runtime-summary.ts'
+import { executeToolBatch } from './tool-execution.ts'
+export { normalizeArgs } from './tool-execution.ts'
 
 function emitRuntimeEvent(ctx: ToolContext, input: Omit<RuntimeEventInput, 'sessionId'>): void {
   const sessionId = ctx.sessionId ?? ctx.agentId
@@ -143,9 +104,7 @@ export function runAgent(opts: AgentOptions): AgentHandle {
     const evidence = new RuntimeEvidenceAccumulator()
     let toolFailStreak = 0
     let compactRetries = 0 // 超限自动压缩重试计数(最多 2 次)
-    // 重复工具调用检测(对齐 Zcode):最近窗口内同一签名 ≥3 次 → 停止(防死循环烧 token)
-    const recentCallSigs: string[] = []
-    const REPEAT_WINDOW = 6
+    const repeatedToolCalls = new RepeatedToolCallGuard()
 
     emitRuntimeEvent(ctx, {
       type: 'run_started',
@@ -169,8 +128,8 @@ export function runAgent(opts: AgentOptions): AgentHandle {
       emit({ type: 'progress', round, max: maxIterations, status: mode === 'plan' ? '计划中' : '执行中' })
 
       // P11：round_start Hook（注入缓冲本轮生效）
-      await ctx.hooks?.fire('round_start', { cwd: ctx.cwd, round })
-      const hookInjections = ctx.hooks?.collectInjections() ?? []
+      await ctx.hooks?.fire('round_start', { cwd: ctx.cwd, sessionId: ctx.sessionId, agentId: ctx.agentId, round })
+      const hookScope = { sessionId: ctx.sessionId, agentId: ctx.agentId }
 
       const roundCalls: Extract<StreamEvent, { type: 'tool_call' }>[] = []
       const serializedArguments = new Map<Extract<StreamEvent, { type: 'tool_call' }>, string>()
@@ -192,6 +151,7 @@ export function runAgent(opts: AgentOptions): AgentHandle {
 
       // P7：请求前上下文检查（轻量预防 + 重量兜底）
       await ctx.beforeRequest?.('auto')
+      const hookInjections = ctx.hooks?.collectInjections(hookScope) ?? []
 
       log('info', `round ${round}/${maxIterations} 请求 model=${opts.systemPrompt ? 'custom' : mode} msgs=${history.length}`)
       const directive = sessionDirective(mode, round)
@@ -263,7 +223,7 @@ export function runAgent(opts: AgentOptions): AgentHandle {
             })
           } else if (ev.type === 'usage') {
             totalTokens += ev.inputTokens + ev.outputTokens
-            ctx.afterRequest?.(ev.inputTokens, history.length)
+            if (ev.inputTokens > 0) ctx.afterRequest?.(ev.inputTokens, history.length)
             emit({
               type: 'usage',
               round,
@@ -317,33 +277,21 @@ export function runAgent(opts: AgentOptions): AgentHandle {
         break
       }
 
-      const allUnknown = roundCalls.every((c) => !registry.get(c.name))
-      if (allUnknown) {
-        unknownStreak++
-      } else {
-        unknownStreak = 0
+      if (new Set(roundCalls.map((call) => call.id)).size !== roundCalls.length) {
+        reason = 'error'
+        roundErrorMessage = '模型返回了重复的工具调用 ID，已拒绝执行该轮工具'
+        break
       }
+
+      unknownStreak = nextUnknownToolStreak(roundCalls, (name) => !!registry.get(name), unknownStreak)
 
       // 重复工具调用检测:同一签名(工具+参数)窗口内 ≥N 次 → 停止(防死循环烧 token)
       // 未知工具跳过(走 unknownStreak);查询类工具豁免——轮询状态是合法行为
       // 写类工具严格(3 次即停,写死循环代价高);run_command 等放宽(5):调研命令密集合法(实战误伤)
-      const REPEAT_STOP = (name: string) => (WRITE_TOOLS.has(name) ? 5 : 5)
-      let repeatStop = false
-      for (const c of roundCalls) {
-        if (!registry.get(c.name)) continue
-        if (READ_ONLY_TOOLS.has(c.name) || c.name === 'team_tasks' || c.name === 'team_mail') continue
-        const sig = `${c.name}:${serializeArguments(c).slice(0, 100)}`
-        recentCallSigs.push(sig)
-        if (recentCallSigs.length > REPEAT_WINDOW) recentCallSigs.shift()
-        const count = recentCallSigs.filter((s) => s === sig).length
-        if (count >= REPEAT_STOP(c.name)) {
-          repeatStop = true
-          roundErrorMessage = `重复调用工具 ${c.name} ${count} 次(相同参数),已停止——换个方式或询问用户`
-          log('info', `重复工具调用 ${c.name} ×${count},停止`)
-          break
-        }
-      }
-      if (repeatStop) {
+      const repeated = repeatedToolCalls.inspect(roundCalls, (name) => !!registry.get(name), serializeArguments)
+      if (repeated) {
+        roundErrorMessage = `重复调用工具 ${repeated.name} ${repeated.count} 次(相同参数),已停止——换个方式或询问用户`
+        log('info', `重复工具调用 ${repeated.name} ×${repeated.count},停止`)
         reason = 'tool_repeat'
         break
       }
@@ -355,10 +303,10 @@ export function runAgent(opts: AgentOptions): AgentHandle {
       })
 
       const toolResultEvents: Omit<RuntimeEventInput, 'sessionId'>[] = []
-      const executed = await executeBatch(roundCalls, registry, toolCtx, (call, result) => {
+      const executed = await executeToolBatch(roundCalls, registry, toolCtx, async (call, result) => {
         evidence.add(result.evidence)
         // P11：tool_after Hook
-        void ctx.hooks?.fire('tool_after', { cwd: ctx.cwd, call: { name: call.name, args: call.arguments } })
+        await ctx.hooks?.fire('tool_after', { cwd: ctx.cwd, sessionId: ctx.sessionId, agentId: ctx.agentId, call: { name: call.name, args: call.arguments } })
         log('info', `tool ${call.name} ${result.success ? 'ok' : 'fail'}${result.error ? `: ${result.error.slice(0, 120)}` : ''}`)
         toolResultEvents.push({
           type: 'tool_result',
@@ -377,17 +325,11 @@ export function runAgent(opts: AgentOptions): AgentHandle {
       })
       emitRuntimeEvents(ctx, toolResultEvents)
       // 连续工具失败止损：≥3 轮全失败停止（防模型死磕烧 token）
-      const allFailed = executed.length > 0 && executed.every(({ result }) => !result.success)
-      let stopEarly = false
-      if (allFailed) {
-        toolFailStreak++
-        if (toolFailStreak >= 3) {
-          reason = 'tool_failures'
-          roundErrorMessage = '工具连续失败 3 轮，已停止（建议检查环境或换一种方式）'
-          stopEarly = true
-        }
-      } else {
-        toolFailStreak = 0
+      toolFailStreak = nextToolFailureStreak(executed.map(({ result }) => result.success), toolFailStreak)
+      const stopEarly = toolFailStreak >= 3
+      if (stopEarly) {
+        reason = 'tool_failures'
+        roundErrorMessage = '工具连续失败 3 轮，已停止（建议检查环境或换一种方式）'
       }
 
       // P7：大工具结果存盘（轻量预防）——回灌前处理；失败降级为原样保留，不阻塞主流程
@@ -423,29 +365,28 @@ export function runAgent(opts: AgentOptions): AgentHandle {
       reason = 'error'
       log('error', `agent loop fatal: ${(e as Error).message}`)
     }
-    log('info', `agent 结束 reason=${reason} rounds=${Math.min(round, maxIterations)} tokens=${totalTokens}`)
     if (round > maxIterations) reason = 'max_iterations'
-    // P11：round_end + 清注入缓冲（所有退出路径统一）
+    log('info', `agent 结束 reason=${reason} rounds=${Math.min(round, maxIterations)} tokens=${totalTokens}`)
+    // P11：round_end 注入保留到同一 Agent 的下一次运行
     try {
-      await ctx.hooks?.fire('round_end', { cwd: ctx.cwd, round: Math.min(round, maxIterations) })
+      await ctx.hooks?.fire('round_end', { cwd: ctx.cwd, sessionId: ctx.sessionId, agentId: ctx.agentId, round: Math.min(round, maxIterations) })
     } catch {
       // 忽略
     }
-    ctx.hooks?.resetRound()
+    const errorMessage = fatalError ?? roundErrorMessage ?? undefined
     emitRuntimeEvent(ctx, {
       type: 'run_finished',
       agentId: ctx.agentId,
-      payload: { reason, rounds: Math.min(round, maxIterations), totalTokens, error: roundErrorMessage ?? fatalError },
+      payload: { reason, rounds: Math.min(round, maxIterations), totalTokens, error: errorMessage },
     })
     emit({
       type: 'done',
       reason,
       rounds: Math.min(round, maxIterations),
       totalTokens,
-      ...(roundErrorMessage ? { errorMessage: roundErrorMessage } : {}),
-      ...(fatalError ? { errorMessage: fatalError } : {}),
+      ...(errorMessage ? { errorMessage } : {}),
     })
-    return { reason, rounds: Math.min(round, maxIterations), totalTokens, finalText, evidence: evidence.snapshot(), ...(roundErrorMessage ? { errorMessage: roundErrorMessage } : {}) }
+    return { reason, rounds: Math.min(round, maxIterations), totalTokens, finalText, evidence: evidence.snapshot(), ...(errorMessage ? { errorMessage } : {}) }
   })()
 
   return {
@@ -453,142 +394,4 @@ export function runAgent(opts: AgentOptions): AgentHandle {
     cancel: () => controller.abort(),
     done: donePromise,
   }
-}
-
-// ---------- 多工具分批执行：读并发 / 写串行 ----------
-async function executeBatch(
-  calls: Extract<StreamEvent, { type: 'tool_call' }>[],
-  registry: ToolRegistry,
-  ctx: ToolContext,
-  onResult: (call: Extract<StreamEvent, { type: 'tool_call' }>, result: ToolResult) => void,
-): Promise<{ call: Extract<StreamEvent, { type: 'tool_call' }>; result: ToolResult }[]> {
-  const byId = new Map<string, ToolResult>()
-  let pendingReads: Extract<StreamEvent, { type: 'tool_call' }>[] = []
-
-  const flushReads = async (): Promise<void> => {
-    const batch = pendingReads
-    pendingReads = []
-    await Promise.all(
-      batch.map(async (call) => {
-        const result = await executeOne(call, registry, ctx)
-        byId.set(call.id, result)
-        onResult(call, result)
-      }),
-    )
-  }
-
-  for (const call of calls) {
-    if (READ_ONLY_TOOLS.has(call.name)) {
-      pendingReads.push(call)
-      continue
-    }
-    await flushReads()
-    const result = await executeOne(call, registry, ctx)
-    byId.set(call.id, result)
-    onResult(call, result)
-  }
-  await flushReads()
-
-  return calls.map((call) => ({ call, result: byId.get(call.id)! }))
-}
-
-async function executeOne(
-  call: Extract<StreamEvent, { type: 'tool_call' }>,
-  registry: ToolRegistry,
-  ctx: ToolContext,
-): Promise<ToolResult> {
-  const tool = registry.get(call.name)
-  if (!tool) return { success: false, output: '', error: `未找到工具: ${call.name}` }
-
-  // 参数别名归一化（对齐 Qoder 三别名兼容）：不同模型对参数命名习惯不同
-  // （tool_name/toolName/name、file_path/filepath/path…），归一化后权限与工具共用
-  const args = normalizeArgs(call.arguments)
-
-  // 权限裁决（P5）：deny 结构化拒绝回灌，ask 交人在回路
-  if (ctx.permission) {
-    const decision = await checkPermission({ name: call.name, args }, {
-      cwd: ctx.cwd,
-      mode: ctx.permission.mode,
-      engine: ctx.permission.engine,
-      autoAcceptEdits: ctx.permission.autoAcceptEdits,
-      allowedWritePaths: [
-        ...(ctx.rootLock ? [ctx.rootLock] : []),
-        ...(ctx.rootLockExtra ?? []),
-      ],
-    })
-    if (decision.type === 'ask') {
-      // 权限请求 hook：弹确认前通知外部（审计/自动决策）
-      await ctx.hooks?.fire('permission_request', {
-        cwd: ctx.cwd,
-        call: { name: call.name, args },
-        decision: 'ask',
-      })
-      if (!ctx.ask) return { success: false, output: '', error: '[权限拒绝] 需要用户确认（无确认通道）' }
-      const askResult = await ctx.ask({ name: call.name, args, reason: decision.reason })
-      const allowRule: Omit<Rule, 'source'> = { tool: call.name, pattern: patternFor({ ...call, arguments: args }), action: 'allow' }
-      if (askResult === 'once') {
-        // 对齐 Codex 审批缓存：本次批准也进会话规则——同命令本会话免重复确认
-        ctx.permission.engine.addSessionRule(allowRule)
-      } else if (askResult === 'session') {
-        ctx.permission.engine.addSessionRule(allowRule)
-      } else if (askResult === 'forever') {
-        ctx.permission.engine.appendProjectRule(allowRule)
-      } else {
-        return { success: false, output: '', error: '[权限拒绝] 用户拒绝' }
-      }
-    } else if (decision.type === 'deny') {
-      // 权限拒绝 hook：审计记录/通知
-      await ctx.hooks?.fire('permission_denied', {
-        cwd: ctx.cwd,
-        call: { name: call.name, args },
-        decision: 'deny',
-        reason: decision.reason ?? '',
-      })
-      return { success: false, output: '', error: `[权限拒绝] ${decision.reason}` }
-    }
-  }
-
-  // P11：tool_before Hook 拦截（权限裁决之后）
-  const blocked = ctx.hooks ? await ctx.hooks.intercept({ name: call.name, args }, ctx.cwd) : null
-  if (blocked) return { success: false, output: '', error: blocked }
-
-  try {
-    return await tool.execute(args, ctx)
-  } catch (e) {
-    return { success: false, output: '', error: `工具执行异常: ${(e as Error).message}` }
-  }
-}
-
-function patternFor(call: Extract<StreamEvent, { type: 'tool_call' }>): string {
-  const v = call.arguments.command ?? call.arguments.path ?? call.arguments.pattern
-  if (typeof v !== 'string') return '*'
-  // 命令规范化：空白归一（rm  -rf x 与 rm -rf x 同一缓存键）；路径不规范化（含空格）
-  return call.name === 'run_command' ? v.replace(/\s+/g, ' ').trim() : v
-}
-
-// 工具参数别名归一化（对齐 Qoder 三别名兼容）：不同模型对参数命名习惯不同
-// （tool_name/toolName/name、file_path/filepath/path…），统一映射到规范名
-const ARG_ALIASES: Record<string, string[]> = {
-  path: ['file_path', 'filepath', 'target', 'file'],
-  name: ['tool_name', 'toolName', 'tool'],
-  command: ['cmd', 'command_line', 'shell_command'],
-  content: ['text', 'body', 'data'],
-  pattern: ['glob', 'search', 'query'],
-  args: ['arguments', 'params'],
-  old_text: ['old', 'oldText', 'old_content'],
-  new_text: ['new', 'newText', 'new_content'],
-}
-
-export function normalizeArgs(raw: Record<string, unknown>): Record<string, unknown> {
-  const out = { ...raw }
-  for (const [canonical, aliases] of Object.entries(ARG_ALIASES)) {
-    if (out[canonical] !== undefined) continue
-    for (const a of aliases) {
-      if (out[a] !== undefined) {
-        out[canonical] = out[a]
-        break
-      }
-    }
-  }
-  return out
 }

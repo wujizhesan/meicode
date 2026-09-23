@@ -15,8 +15,8 @@ try {
   log('warn', 'other-file')
   closeLogger()
 
-  const firstLog = readFileSync(join(first, '.mewcode', 'meicode.log'), 'utf8')
-  const secondLog = readFileSync(join(second, '.mewcode', 'meicode.log'), 'utf8')
+  const firstLog = readFileSync(join(first, '.meicode', 'meicode.log'), 'utf8')
+  const secondLog = readFileSync(join(second, '.meicode', 'meicode.log'), 'utf8')
   if (!firstLog.includes('first-line') || !firstLog.includes('second-line')) throw new Error('reused descriptor lost log lines')
   if (firstLog.includes('other-file') || !secondLog.includes('other-file')) throw new Error('logger reinitialization used stale descriptor')
 } finally {

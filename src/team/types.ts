@@ -15,7 +15,8 @@ export interface TeamTask {
   id: string
   title: string
   assignee?: string
-  status: 'todo' | 'in_progress' | 'done' | 'failed'
+  status: 'todo' | 'in_progress' | 'done' | 'failed' | 'cancelled'
+  dispatchId?: string
   depends_on?: string[]
   createdAt?: number
   updatedAt?: number
@@ -33,7 +34,7 @@ export interface TeamTask {
 
 export interface TeamTaskReport {
   reportId: string
-  status: 'done' | 'failed'
+  status: 'done' | 'failed' | 'cancelled'
   summary: string
   tokens?: number
   durationMs?: number

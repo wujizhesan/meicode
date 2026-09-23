@@ -8,21 +8,15 @@ import type { AgentRole } from '../subagent/types.ts'
 import { TeamGroupStore } from './group.ts'
 import { TeamMail } from './mail.ts'
 import { MemberHost } from './member.ts'
-import type { MailMessage, TeamGroup, TeamMember, TeamTask, TeamTaskReport } from './types.ts'
-import { log } from '../log.ts'
+import type { MailMessage, TeamGroup, TeamMember, TeamTask } from './types.ts'
 import { createRuntimeId } from '../runtime/index.ts'
-import type { RuntimeEventInput } from '../runtime/index.ts'
 import { readCoordinatorConfig } from './config.ts'
 import { createMemberTools } from './member-tools.ts'
 import { mergeTeamWorktrees } from './merge.ts'
-import { readyTasks, recoverExpiredTasks, taskBlockers, validateTaskDependencies } from './task-graph.ts'
-
-const TASK_LEASE_MS = 10 * 60 * 1000
-
-interface TaskExecutionClaim {
-  host: MemberHost
-  member?: TeamMember
-}
+import type { TeamMergeResult } from './merge.ts'
+import { projectStatePath } from '../state-paths.ts'
+import { TeamTaskScheduler } from './task-scheduler.ts'
+import { assertTeamActorName, teamActorKey } from './validation.ts'
 
 function sameTeamMember(left: TeamMember, right: TeamMember): boolean {
   return left.name === right.name
@@ -35,25 +29,17 @@ function sameTeamMember(left: TeamMember, right: TeamMember): boolean {
     && left.updatedAt === right.updatedAt
 }
 
-function emitRuntimeEvent(ctx: ToolContext, input: Omit<RuntimeEventInput, 'sessionId'>): void {
-  const sessionId = ctx.sessionId ?? ctx.agentId
-  if (!ctx.runtimeEvents || !sessionId) return
-  try {
-    ctx.runtimeEvents.append({ ...input, sessionId })
-  } catch {
-  }
-}
-
 export class TeamManager {
   private store: TeamGroupStore
   private mail: TeamMail
   private members = new Map<string, MemberHost>()
+  private memberGroups = new Map<string, string>()
+  private memberAgents = new Map<string, { groupName: string; memberName: string }>()
+  private memberWorktrees = new Map<string, string>()
   private repoRoot: string
   private cfgCoordinator: boolean
   private worktrees: WorktreeManager | null
-  private retryTimers = new Map<string, ReturnType<typeof setTimeout>>()
-  private activeRuns = new Set<Promise<unknown>>()
-  private closed = false
+  private scheduler: TeamTaskScheduler
 
   private opts: { provider: Provider; registry: ToolRegistry; ctx: ToolContext }
 
@@ -69,6 +55,13 @@ export class TeamManager {
     this.repoRoot = repoRoot
     this.cfgCoordinator = readCoordinatorConfig(root)
     this.worktrees = worktrees ?? null
+    this.scheduler = new TeamTaskScheduler({
+      store: this.store,
+      mail: this.mail,
+      members: this.members,
+      memberGroups: this.memberGroups,
+      ctx: opts.ctx,
+    })
   }
 
   // coordinator：配置开关 + 环境变量双锁
@@ -89,37 +82,44 @@ export class TeamManager {
   }
 
   isClosed(): boolean {
-    return this.closed
+    return this.scheduler.isClosed()
+  }
+
+  setSessionId(sessionId: string): void {
+    this.opts.ctx.sessionId = sessionId
+    this.scheduler.setSessionId(sessionId)
+    for (const member of this.members.values()) member.setSessionId(sessionId)
+  }
+
+  private releaseMemberWorktree(memberName: string, worktreeName: string): void {
+    if (!this.worktrees || this.memberWorktrees.get(memberName) !== worktreeName) return
+    this.worktrees.release?.(worktreeName)
+    this.memberWorktrees.delete(memberName)
   }
 
   async close(timeoutMs = 5000): Promise<void> {
-    if (!this.closed) {
-      this.closed = true
-      for (const timer of this.retryTimers.values()) clearTimeout(timer)
-      this.retryTimers.clear()
-      for (const member of this.members.values()) member.close()
-    }
-    if (this.activeRuns.size === 0) return
-    let timer: ReturnType<typeof setTimeout> | undefined
+    const pending = this.scheduler.close(timeoutMs)
+    for (const member of this.members.values()) member.close()
     try {
-      await Promise.race([
-        Promise.allSettled([...this.activeRuns]),
-        new Promise<void>((resolve) => {
-          timer = setTimeout(resolve, Math.max(0, timeoutMs))
-        }),
-      ])
+      await pending
     } finally {
-      if (timer) clearTimeout(timer)
+      if (this.worktrees) {
+        for (const [memberName, worktreeName] of this.memberWorktrees) {
+          const member = this.members.get(memberName)
+          if (!member?.isBusy()) {
+            this.releaseMemberWorktree(memberName, worktreeName)
+            continue
+          }
+          void member.whenIdle().then(() => {
+            this.releaseMemberWorktree(memberName, worktreeName)
+          }).catch((error: unknown) => {
+            console.warn(`[团队] 成员 ${memberName} 延迟释放 worktree 失败: ${(error as Error).message}`)
+          })
+        }
+      } else {
+        this.memberWorktrees.clear()
+      }
     }
-  }
-
-  private trackRun<T>(promise: Promise<T>): Promise<T> {
-    this.activeRuns.add(promise)
-    void promise.then(
-      () => this.activeRuns.delete(promise),
-      () => this.activeRuns.delete(promise),
-    )
-    return promise
   }
 
   // 派生成员（协程驻留）：worktree 隔离 + 加入花名册 + 注册邮箱
@@ -136,37 +136,32 @@ export class TeamManager {
       updatedAt?: number
     } = {},
   ): Promise<MemberHost> {
+    if (this.scheduler.isClosed()) throw new Error('TeamManager 已关闭，无法派生成员')
+    assertTeamActorName(name)
+    const memberKey = teamActorKey(name)
+    if (memberKey === teamActorKey(group.lead)) throw new Error(`成员名不能与负责人 ${group.lead} 相同`)
     // 幂等：同名成员已驻留直接返回（不覆盖 host，避免双写同一 historyFile/worktree）
-    const existing = this.members.get(name)
-    if (existing) return existing
-    // 成员独立 worktree（分支 wt-member-<name>），写文件不污染主仓库
-    // 恢复场景(opts.workdir):复用已记录的 workdir,不重新 create
-    let workdir = opts.workdir ?? process.cwd()
-    if (!opts.workdir && this.worktrees) {
-      try {
-        const wt = await this.worktrees.create(`member-${name}`)
-        workdir = wt.path
-      } catch (e) {
-        throw new Error(`成员 ${name} worktree 创建失败，已拒绝无隔离启动: ${(e as Error).message}`)
-      }
+    const existingName = [...this.members.keys()].find((current) => teamActorKey(current) === memberKey)
+    const existing = existingName ? this.members.get(existingName) : undefined
+    if (existing) {
+      const ownerGroup = this.memberGroups.get(existingName!)
+      if (existingName !== name) throw new Error(`成员名大小写冲突: ${name} 与 ${existingName}`)
+      if (ownerGroup === group.name) return existing
+      throw new Error(`成员名 ${name} 已属于小组 ${ownerGroup ?? '未知'}，不能加入小组 ${group.name}`)
     }
-    const member: TeamMember = {
-      name,
-      agentId: opts.agentId ?? createRuntimeId('agent'),
-      role,
-      workdir,
-      backend: 'coroutine',
-      needsApproval: opts.needsApproval ?? false,
-      status: 'idle',
-      ...(opts.updatedAt !== undefined ? { updatedAt: opts.updatedAt } : {}),
+    const persistedGroup = this.store.loadGroup(group.name)
+    if (!persistedGroup || persistedGroup.lead !== group.lead) throw new Error(`小组 ${group.name} 不存在或已发生变化`)
+    for (const groupName of this.store.listGroups()) {
+      const candidate = groupName === group.name ? persistedGroup : this.store.loadGroup(groupName)
+      const conflict = candidate?.members.find((member) => teamActorKey(member.name) === memberKey)
+      if (!conflict) continue
+      if (conflict.name !== name) throw new Error(`成员名大小写冲突: ${name} 与 ${conflict.name}`)
     }
-    if (opts.deferGroupSave) {
-      group.members = group.members.filter((current) => current.name !== member.name)
-      group.members.push(member)
-    } else {
-      this.store.addMember(group, member)
+    const agentId = opts.agentId ?? createRuntimeId('agent')
+    const agentOwner = this.memberAgents.get(agentId)
+    if (agentOwner && (agentOwner.groupName !== group.name || agentOwner.memberName !== name)) {
+      throw new Error(`Agent ID ${agentId} 已属于成员 ${agentOwner.memberName}`)
     }
-    this.mail.register(name)
     // 专家角色（对齐 Qoder 专家团）：按 role 名从角色文件加载 SOP 正文与工具限制
     let rolePrompt = ''
     let roleToolsDeny: string[] = []
@@ -176,7 +171,7 @@ export class TeamManager {
     try {
       const found = 'roleDefinition' in opts
         ? opts.roleDefinition
-        : loadAgentRoles(agentDirs(process.cwd())).find((r) => r.name === role)
+        : loadAgentRoles(agentDirs(this.repoRoot)).find((r) => r.name === role)
       if (found) {
         rolePrompt = found.content
         roleToolsDeny = found.toolsDeny ?? []
@@ -188,42 +183,108 @@ export class TeamManager {
       // 角色加载失败降级为基础成员
     }
     // 全局共享产物区：成员中间产物互通（实战: 抓的页面他人读不到）
-    const sharedArtifacts = join(this.repoRoot, '.mewcode', 'artifacts')
+    const sharedArtifacts = projectStatePath(this.repoRoot, 'artifacts')
     mkdirSync(sharedArtifacts, { recursive: true })
-    const host = new MemberHost(
-      member,
-      group.name,
-      {
-        provider: this.opts.provider,
-        registry: this.opts.registry,
-        // rootLock：成员文件工具只能写 worktree 内（隔离主仓库）；rootLockExtra：契约报告目录 + 共享产物区
-        ctx: {
-          ...this.opts.ctx,
-          agentId: member.agentId,
-          cwd: workdir,
-          rootLock: workdir,
-          rootLockExtra: [...(roleWritePaths.length ? roleWritePaths : []), sharedArtifacts],
+    // 成员独立 worktree（分支 wt-member-<name>），写文件不污染主仓库
+    // 恢复场景(opts.workdir):复用已记录的 workdir,不重新 create
+    let workdir = opts.workdir ?? this.repoRoot
+    let createdWorktreeName: string | undefined
+    let leasedWorktreeName: string | undefined
+    if (!opts.workdir && this.worktrees) {
+      createdWorktreeName = `member-${name}`
+      try {
+        const wt = await this.worktrees.create(createdWorktreeName)
+        workdir = wt.path
+        leasedWorktreeName = createdWorktreeName
+      } catch (e) {
+        throw new Error(`成员 ${name} worktree 创建失败，已拒绝无隔离启动: ${(e as Error).message}`)
+      }
+    } else if (opts.workdir && this.worktrees) {
+      const root = resolve(this.worktrees.getRoot())
+      const restored = resolve(opts.workdir)
+      const rootKey = process.platform === 'win32' ? root.toLowerCase() : root
+      const restoredKey = process.platform === 'win32' ? restored.toLowerCase() : restored
+      if (restoredKey.startsWith(`${rootKey}/`) || restoredKey.startsWith(rootKey + '\\')) {
+        leasedWorktreeName = `member-${name}`
+        try {
+          const wt = await this.worktrees.attach(leasedWorktreeName, restored)
+          workdir = wt.path
+        } catch (e) {
+          throw new Error(`成员 ${name} worktree 恢复失败，已拒绝无租约启动: ${(e as Error).message}`)
+        }
+      }
+    }
+    const member: TeamMember = {
+      name,
+      agentId,
+      role,
+      workdir,
+      backend: 'coroutine',
+      needsApproval: opts.needsApproval ?? false,
+      status: 'idle',
+      ...(opts.updatedAt !== undefined ? { updatedAt: opts.updatedAt } : {}),
+    }
+    let host: MemberHost
+    try {
+      this.mail.register(name)
+      host = new MemberHost(
+        member,
+        group.name,
+        {
+          provider: this.opts.provider,
+          registry: this.opts.registry,
+          // rootLock：成员文件工具只能写 worktree 内（隔离主仓库）；rootLockExtra：契约报告目录 + 共享产物区
+          ctx: {
+            ...this.opts.ctx,
+            agentId: member.agentId,
+            cwd: workdir,
+            rootLock: workdir,
+            rootLockExtra: [...(roleWritePaths.length ? roleWritePaths : []), sharedArtifacts],
+          },
+          historyFile: join(this.store.groupDir(group.name), 'members', `${name}.history.jsonl`),
+          store: this.store,
+          mail: this.mail,
+          rolePrompt,
+          roleToolsDeny,
+          roleToolsAllow,
+          roleMaxRounds,
+          parentAgentId: this.opts.ctx.agentId,
         },
-        historyFile: join(this.store.groupDir(group.name), 'members', `${name}.history.jsonl`),
-        store: this.store,
-        mail: this.mail,
-        rolePrompt,
-        roleToolsDeny,
-        roleToolsAllow,
-        roleMaxRounds,
-      },
-    )
+      )
+      if (opts.deferGroupSave) {
+        group.members = group.members.filter((current) => current.name !== member.name)
+        group.members.push(member)
+      } else {
+        this.store.addMember(group, member)
+      }
+    } catch (error) {
+      if (createdWorktreeName && this.worktrees) {
+        try {
+          const rollback = await this.worktrees.remove(createdWorktreeName)
+          if (!rollback.startsWith('已删除')) console.warn(`[团队] 成员 ${name} 初始化失败，worktree 回滚未完成: ${rollback}`)
+        } catch (rollbackError) {
+          console.warn(`[团队] 成员 ${name} 初始化失败，worktree 回滚异常: ${(rollbackError as Error).message}`)
+        }
+      } else if (leasedWorktreeName && this.worktrees) {
+        this.worktrees.release?.(leasedWorktreeName)
+      }
+      throw error
+    }
+    this.memberGroups.set(name, group.name)
+    this.memberAgents.set(member.agentId!, { groupName: group.name, memberName: name })
     this.members.set(name, host)
+    if (leasedWorktreeName) this.memberWorktrees.set(name, leasedWorktreeName)
     return host
   }
 
-  getMember(name: string): MemberHost | undefined {
+  getMember(name: string, groupName?: string): MemberHost | undefined {
+    if (groupName && this.memberGroups.get(name) !== groupName) return undefined
     return this.members.get(name)
   }
 
   // 跨重启恢复:从 group.yaml 重建所有成员(workdir/history 复用,不重新 create worktree)
   async restore(roleDefinitions?: readonly AgentRole[]): Promise<string[]> {
-    if (this.closed) return []
+    if (this.scheduler.isClosed()) return []
     const restored: string[] = []
     let restoreRoles = roleDefinitions
       ? new Map(roleDefinitions.map((role) => [role.name, role]))
@@ -231,7 +292,7 @@ export class TeamManager {
     const findRestoreRole = (name: string): AgentRole | null => {
       if (!restoreRoles) {
         try {
-          restoreRoles = new Map(loadAgentRoles(agentDirs(process.cwd())).map((role) => [role.name, role]))
+          restoreRoles = new Map(loadAgentRoles(agentDirs(this.repoRoot)).map((role) => [role.name, role]))
         } catch {
           restoreRoles = new Map()
         }
@@ -244,7 +305,12 @@ export class TeamManager {
       const persistedMembers = [...group.members]
       const refreshedMembers: TeamMember[] = []
       for (const m of persistedMembers) {
-        if (this.members.has(m.name)) continue
+        if (this.members.has(m.name)) {
+          if (this.memberGroups.get(m.name) !== groupName) {
+            console.warn(`[团队] 恢复成员 ${m.name} 失败: 成员名已属于小组 ${this.memberGroups.get(m.name)}`)
+          }
+          continue
+        }
         try {
           await this.spawnMember(group, m.name, m.role, {
             needsApproval: m.needsApproval,
@@ -264,9 +330,11 @@ export class TeamManager {
       const membersChanged = persistedMembers.length !== group.members.length
         || persistedMembers.some((member, index) => !sameTeamMember(member, group.members[index]))
       if (membersChanged) this.store.addMembers(group, refreshedMembers)
-      this.recoverStaleTasks(groupName)
-      this.schedulePendingRetries(groupName)
-      this.scheduleReadyTasks(groupName)
+      try {
+        this.scheduler.restoreGroup(groupName)
+      } catch (error) {
+        console.warn(`[团队] 恢复小组 ${groupName} 的任务失败: ${(error as Error).message}`)
+      }
     }
     return restored
   }
@@ -277,266 +345,149 @@ export class TeamManager {
   }
 
   // Lead 审批响应：向成员发 APPROVE/DENY（成员 needsApproval 时执行前等待此消息）
-  respondApproval(groupName: string, memberName: string, approve: boolean, note?: string): string {
+  respondApproval(
+    groupName: string,
+    memberName: string,
+    approve: boolean,
+    note?: string,
+    taskId?: string,
+    correlationId?: string,
+  ): string {
     const group = this.store.loadGroup(groupName)
-    if (!group) return `小组不存在: ${groupName}`
-    if (!this.members.has(memberName)) return `成员不存在: ${memberName}`
+    if (!group) return `审批失败: 小组不存在: ${groupName}`
+    const member = group.members.find((item) => item.name === memberName)
+    if (!member || this.memberGroups.get(memberName) !== groupName) {
+      return `审批失败: 成员 ${memberName} 不属于小组 ${groupName}`
+    }
+    if (!member.needsApproval) return `审批失败: 成员 ${memberName} 不需要审批`
+    const activeTasks = this.store.listTasks(groupName).filter((task) => task.assignee === memberName && task.status === 'in_progress')
+    const plans = this.mail.read(group.lead).filter((message) =>
+      message.from === memberName
+      && message.groupId === groupName
+      && message.kind === 'approval_plan'
+      && message.taskId,
+    )
+    let plan = correlationId ? plans.find((message) => message.correlationId === correlationId) : undefined
+    if (correlationId && !plan) return `审批失败: 审批关联不存在或已过期: ${correlationId}`
+    if (taskId && plan?.taskId !== undefined && plan.taskId !== taskId) return '审批失败: taskId 与 correlationId 不匹配'
+    const targetTaskId = taskId ?? plan?.taskId ?? (activeTasks.length === 1 ? activeTasks[0].id : undefined)
+    if (!targetTaskId) return `审批失败: 无法唯一确定 ${memberName} 的待审批任务`
+    const activeTask = activeTasks.find((task) => task.id === targetTaskId)
+    if (!activeTask) return `审批失败: 任务 ${targetTaskId} 当前不在等待审批`
+    plan ??= [...plans].reverse().find((message) => message.taskId === targetTaskId)
+    if (!plan?.correlationId) return `审批失败: 任务 ${targetTaskId} 的 PLAN 尚未到达`
     const body = `${approve ? 'APPROVE' : 'DENY'} ${note ?? ''}`.trim()
-    this.mail.send(group.lead, memberName, body)
-    return `已${approve ? '批准' : '拒绝'} ${memberName} 的审批请求${note ? `（${note}）` : ''}`
+    this.mail.send(group.lead, memberName, body, {
+      groupId: groupName,
+      kind: 'approval_decision',
+      taskId: targetTaskId,
+      correlationId: plan.correlationId,
+    })
+    return `已${approve ? '批准' : '拒绝'} ${memberName} 的任务 ${targetTaskId}${note ? `（${note}）` : ''}`
   }
 
   // 按工作目录反查成员身份（成员协作工具用，支持多组多成员全局注册）
   resolveMemberByCwd(cwd: string): { group: TeamGroup; member: TeamMember } | null {
     const target = resolve(cwd).toLowerCase()
+    let found: { group: TeamGroup; member: TeamMember } | null = null
     for (const groupName of this.store.listGroups()) {
       const g = this.store.loadGroup(groupName)
       if (!g) continue
       for (const m of g.members) {
-        if (resolve(m.workdir).toLowerCase() === target) return { group: g, member: m }
+        if (this.memberGroups.get(m.name) !== g.name) continue
+        if (resolve(m.workdir).toLowerCase() !== target) continue
+        if (found) return null
+        found = { group: g, member: m }
       }
     }
-    return null
+    return found
+  }
+
+  resolveMember(context: Pick<ToolContext, 'cwd' | 'agentId'>): { group: TeamGroup; member: TeamMember } | null {
+    if (!context.agentId) return this.resolveMemberByCwd(context.cwd)
+    const identity = this.memberAgents.get(context.agentId)
+    if (!identity) return null
+    const group = this.store.loadGroup(identity.groupName)
+    const member = group?.members.find((item) => item.name === identity.memberName && item.agentId === context.agentId)
+    return group && member ? { group, member } : null
+  }
+
+  private isLeadContext(context: Pick<ToolContext, 'cwd' | 'agentId'>): boolean {
+    return context === this.opts.ctx
+      || Boolean(context.agentId && this.opts.ctx.agentId && context.agentId === this.opts.ctx.agentId)
   }
 
   // 成员协作工具（全局注册一份）：执行时按 ctx.cwd 解析成员身份
   memberTools(): Tool[] {
     return createMemberTools({
-      resolveMemberByCwd: (cwd) => this.resolveMemberByCwd(cwd),
+      resolveMember: (context) => this.resolveMember(context),
+      isLeadContext: (context) => this.isLeadContext(context),
       listTasks: (groupName) => this.store.listTasks(groupName),
       addTask: (groupName, title, assignee, dependencies, maxAttempts) =>
         this.addTask(groupName, title, assignee, dependencies, maxAttempts),
-      updateTask: (groupName, taskId, patch) => this.store.updateTask(groupName, taskId, patch),
+      updateTask: (groupName, memberName, taskId, patch) =>
+        this.scheduler.updateTaskFromMember(groupName, memberName, taskId, patch),
       sendMail: (from, to, body) => this.mail.send(from, to, body),
     })
   }
 
   // Lead 指派：更新任务状态 + 触发成员执行（异步协程）
   async assignTask(group: TeamGroup, task: TeamTask, memberName: string): Promise<string> {
-    if (this.closed) return 'TeamManager 已关闭，无法分派任务'
-    const claim = this.claimTask(group, task, memberName)
-    if (typeof claim === 'string') return claim
-    void this.executeClaimedTask(group, task, memberName, claim, false)
-    const groupMember = group.members.find((m) => m.name === memberName)
-    return groupMember?.needsApproval
-      ? `已派发任务 ${task.id} 给 ${memberName}（需审批，成员已发 PLAN 等待 Lead 决定）`
-      : `已指派成员 ${memberName} 执行任务 ${task.id}`
+    return this.scheduler.assignTask(group, task, memberName)
   }
 
   // Lead 工具用：同步等待成员执行完成，返回执行结果（供 team_assign 工具回灌）
   // 120s 超时转后台——成员最长 15 轮×60s，不设限会挂死主对话；
   // 超时后成员完成仍会写 done（完成逻辑在 execPromise 内）
   async runTask(group: TeamGroup, task: TeamTask, memberName: string): Promise<string> {
-    if (this.closed) return 'TeamManager 已关闭，无法执行任务'
-    const claim = this.claimTask(group, task, memberName)
-    if (typeof claim === 'string') return claim
-    const execPromise = this.executeClaimedTask(group, task, memberName, claim, true)
-    let timeout: ReturnType<typeof setTimeout> | undefined
-    const timeoutPromise = new Promise<string>((resolve) => {
-      timeout = setTimeout(() => resolve('__TIMEOUT__'), 120000)
-    })
-    const settled = await Promise.race([execPromise, timeoutPromise])
-    if (timeout) clearTimeout(timeout)
-    return settled === '__TIMEOUT__'
-      ? `任务 ${task.id} 仍在执行中（成员 ${memberName}），稍后用 team_tasks 或 team_mail 查看结果`
-      : settled
-  }
-
-  private claimTask(group: TeamGroup, task: TeamTask, memberName: string): TaskExecutionClaim | string {
-    const host = this.members.get(memberName)
-    if (!host) return `成员不存在: ${memberName}`
-    const current = this.store.listTasks(group.name).find((item) => item.id === task.id)
-    if (!current) return `任务不存在: ${task.id}`
-    const blockers = this.taskBlockers(group.name, current)
-    if (blockers.length > 0) return `任务 ${task.id} 仍被依赖阻塞: ${blockers.join(', ')}`
-    if (host.isBusy()) return `成员 ${memberName} 正在执行其他任务，等它空闲再派`
-    const attempt = (current.attempt ?? 0) + 1
-    if (attempt > (current.maxAttempts ?? 1)) return `任务 ${task.id} 已达到最大执行次数`
-    const member = group.members.find((item) => item.name === memberName)
-    const claimed = this.store.claimTask(group.name, task.id, {
-      status: 'in_progress',
-      assignee: memberName,
-      attempt,
-      activeAgentId: member?.agentId,
-      leaseId: createRuntimeId('lease'),
-      leaseExpiresAt: Date.now() + TASK_LEASE_MS,
-      nextRetryAt: undefined,
-      updatedAt: Date.now(),
-    })
-    if (!claimed) return `任务 ${task.id} 已被其他执行者领取`
-    emitRuntimeEvent(this.opts.ctx, {
-      type: 'task_assigned',
-      taskId: task.id,
-      agentId: member?.agentId,
-      payload: { groupId: group.name, memberName, attempt },
-    })
-    return { host, member }
-  }
-
-  private executeClaimedTask(
-    group: TeamGroup,
-    task: TeamTask,
-    memberName: string,
-    claim: TaskExecutionClaim,
-    fireCompletionHook: boolean,
-  ): Promise<string> {
-    const execution = claim.host.execute(task.title).then((result) => {
-      this.completeTask(group, task, memberName, claim.member?.agentId, result)
-      if (fireCompletionHook) {
-        void this.opts.ctx.hooks?.fire('task_completed', {
-          cwd: this.opts.ctx.cwd,
-          stats: `task=${task.id} "${task.title.slice(0, 40)}" member=${memberName} status=${result.status}`,
-        })
-      }
-      return result.text
-    }).catch((error: unknown) => {
-      const message = (error as Error).message
-      const reportId = createRuntimeId('report')
-      this.completeTask(group, task, memberName, claim.member?.agentId, {
-        status: 'failed',
-        text: `执行异常: ${message}`,
-        report: { reportId, status: 'failed', summary: `执行异常: ${message}`, error: message },
-      })
-      return `任务执行异常: ${message}`
-    })
-    return this.trackRun(execution)
+    return this.scheduler.runTask(group, task, memberName)
   }
 
   listTasks(groupName: string): TeamTask[] {
-    return this.store.listTasks(groupName)
+    return this.scheduler.listTasks(groupName)
   }
 
   taskBlockers(groupName: string, task: TeamTask): string[] {
-    return taskBlockers(this.store.listTasks(groupName), task)
+    return this.scheduler.taskBlockers(groupName, task)
+  }
+
+  cancelTask(groupName: string, taskId: string): boolean {
+    return this.scheduler.cancelTask(groupName, taskId)
   }
 
   recoverStaleTasks(groupName: string, now = Date.now()): TeamTask[] {
-    const snapshot = this.store.listTasks(groupName)
-    if (!snapshot.some((task) => task.status === 'in_progress' && task.leaseExpiresAt !== undefined && task.leaseExpiresAt <= now)) return []
-    let recovered: TeamTask[] = []
-    this.store.mutateTasks(groupName, (tasks) => {
-      recovered = recoverExpiredTasks(tasks, now)
-    })
-    return recovered
-  }
-
-  private scheduleRetry(group: TeamGroup, task: TeamTask, memberName: string, delayMs: number): void {
-    const key = `${group.name}:${task.id}`
-    const existing = this.retryTimers.get(key)
-    if (existing) clearTimeout(existing)
-    const timer = setTimeout(() => {
-      this.retryTimers.delete(key)
-      if (this.closed) return
-      const latest = this.store.listTasks(group.name).find((item) => item.id === task.id)
-      if (!latest || latest.status !== 'todo' || (latest.nextRetryAt ?? 0) > Date.now()) return
-      void this.runTask(group, latest, memberName)
-    }, Math.max(0, delayMs))
-    this.retryTimers.set(key, timer)
-  }
-
-  private schedulePendingRetries(groupName: string): void {
-    const group = this.store.loadGroup(groupName)
-    if (!group) return
-    const now = Date.now()
-    for (const task of this.store.listTasks(groupName)) {
-      if (task.status !== 'todo' || !task.assignee || !task.nextRetryAt || task.nextRetryAt <= now) continue
-      if (!this.members.has(task.assignee)) continue
-      this.scheduleRetry(group, task, task.assignee, task.nextRetryAt - now)
-    }
-  }
-
-  private completeTask(group: TeamGroup, task: TeamTask, memberName: string, agentId: string | undefined, result: { status: 'done' | 'failed'; text: string; report: TeamTaskReport }): void {
-    const current = this.store.listTasks(group.name).find((item) => item.id === task.id)
-    if (!current) return
-    const retryable = result.status === 'failed' && (current.attempt ?? 0) < (current.maxAttempts ?? 1)
-    const nextRetryAt = retryable ? Date.now() + Math.min(30000, 1000 * 2 ** Math.max(0, (current.attempt ?? 1) - 1)) : undefined
-    this.store.updateTask(group.name, task.id, {
-      status: retryable ? 'todo' : result.status,
-      result: result.text.slice(0, 4000),
-      reportId: result.report.reportId,
-      report: result.report,
-      lastError: result.status === 'failed' ? result.report.error ?? result.text.slice(0, 500) : undefined,
-      nextRetryAt,
-      activeAgentId: undefined,
-      leaseId: undefined,
-      leaseExpiresAt: undefined,
-      updatedAt: Date.now(),
-    })
-    const protocol = retryable ? 'RETRY' : result.status === 'done' ? 'IDLE' : 'ERR'
-    this.mail.send(memberName, group.lead, `${protocol} 任务 ${task.id}: ${result.text.split('\n')[0].slice(0, 200)}`, {
-      groupId: group.name,
-      kind: retryable ? 'task_retry' : 'task_result',
-      taskId: task.id,
-      correlationId: result.report.reportId,
-    })
-    emitRuntimeEvent(this.opts.ctx, { type: 'task_finished', taskId: task.id, agentId, payload: { groupId: group.name, status: result.status, retryable, reportId: result.report.reportId, nextRetryAt } })
-    if (retryable && nextRetryAt) this.scheduleRetry(group, { ...task, nextRetryAt }, memberName, Math.max(0, nextRetryAt - Date.now()))
-    if (result.status === 'done') this.scheduleReadyTasks(group.name)
+    return this.scheduler.recoverStaleTasks(groupName, now)
   }
 
   listReadyTasks(groupName: string): TeamTask[] {
-    return readyTasks(this.store.listTasks(groupName))
+    return this.scheduler.listReadyTasks(groupName)
   }
 
   scheduleReadyTasks(groupName: string): string[] {
-    if (this.closed) return []
-    const group = this.store.loadGroup(groupName)
-    if (!group) return []
-    const scheduled: string[] = []
-    for (const task of this.listReadyTasks(groupName)) {
-      if (!task.assignee || (task.attempt ?? 0) >= (task.maxAttempts ?? 1)) continue
-      const host = this.members.get(task.assignee)
-      if (!host || host.isBusy()) continue
-      void this.assignTask(group, task, task.assignee)
-      scheduled.push(task.id)
-    }
-    return scheduled
+    return this.scheduler.scheduleReadyTasks(groupName)
   }
 
-  addTask(groupName: string, title: string, assignee?: string, dependsOn: string[] = [], maxAttempts = 1): TeamTask {
-    const normalizedDeps = [...new Set(dependsOn)]
-    const id = createRuntimeId('task')
-    const now = Date.now()
-    const task: TeamTask = {
-      id,
-      title,
-      status: 'todo',
-      createdAt: now,
-      updatedAt: now,
-      attempt: 0,
-      maxAttempts: Math.max(1, Math.floor(maxAttempts)),
-      ...(normalizedDeps.length ? { depends_on: normalizedDeps } : {}),
-      ...(assignee ? { assignee } : {}),
-    }
-    let dependencyError: string | null = null
-    this.store.mutateTasks(groupName, (tasks) => {
-      dependencyError = validateTaskDependencies(tasks, id, normalizedDeps)
-      if (!dependencyError) tasks.push(task)
-    })
-    if (dependencyError) throw new Error(dependencyError)
-    emitRuntimeEvent(this.opts.ctx, {
-      type: 'task_created',
-      taskId: task.id,
-      payload: { groupId: groupName, title, assignee, dependsOn: normalizedDeps },
-    })
-    // task_created hook:外部感知任务创建(主会话可自动跟踪/汇报)
-    void this.opts.ctx.hooks?.fire('task_created', {
-      cwd: this.opts.ctx.cwd,
-      stats: `task=${task.id} "${title.slice(0, 60)}"${assignee ? ` assignee=${assignee}` : ''}`,
-    })
-    return task
+  addTask(groupName: string, title: string, assignee?: string, dependsOn: string[] = [], maxAttempts = 1, dispatchId?: string): TeamTask {
+    return this.scheduler.addTask(groupName, title, assignee, dependsOn, maxAttempts, dispatchId)
   }
 
   // 成员空闲标记（成员自己完成后调用）
   markMemberIdle(group: TeamGroup, name: string): void {
+    if (this.memberGroups.get(name) !== group.name) return
     const member = group.members.find((m) => m.name === name)
     if (member) member.status = 'idle'
-    this.store.saveGroup(group)
+    this.store.updateMemberStatus(group.name, name, 'idle')
   }
 
   // 全部完成后合并各成员 worktree：成员改动先 commit，再合并回主仓库
-  async mergeAll(group: TeamGroup): Promise<string> {
-    return mergeTeamWorktrees(group, this.worktrees, this.repoRoot)
+  async mergeAll(group: TeamGroup): Promise<TeamMergeResult> {
+    const current = this.store.loadGroup(group.name)
+    if (!current) return { success: false, output: `拒绝合并：小组不存在: ${group.name}` }
+    const busy = current.members.filter((member) => this.memberGroups.get(member.name) === current.name && this.members.get(member.name)?.isBusy())
+    if (busy.length > 0) return { success: false, output: `拒绝合并：成员仍在执行任务: ${busy.map((member) => member.name).join(', ')}` }
+    const pending = this.store.listTasks(current.name).filter((task) => task.status === 'todo' || task.status === 'in_progress')
+    if (pending.length > 0) return { success: false, output: `拒绝合并：仍有未完成任务: ${pending.map((task) => task.id).join(', ')}` }
+    return mergeTeamWorktrees(current, this.worktrees, this.repoRoot)
   }
 
   // coordinator 开启时 Lead 工具集：移除 write/edit（保留读 + run_command + spawn）

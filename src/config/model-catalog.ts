@@ -1,6 +1,5 @@
 import { existsSync, readFileSync } from 'node:fs'
-import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { userStatePath } from '../state-paths.ts'
 
 // 模型目录 schema(对齐 Zcode model-providers.v1):
 // provider 级 = 端点(baseURL + 各协议路径)+ 默认协议
@@ -91,9 +90,9 @@ const BUILTIN: ModelCatalog = {
   ],
 }
 
-// 用户覆盖/扩展: ~/.mewcode/model-providers.json(同 schema,merge by provider id)
+// 用户覆盖/扩展: ~/.meicode/model-providers.json(同 schema,merge by provider id)
 export function loadModelCatalog(): ModelCatalog {
-  const userFile = join(homedir(), '.mewcode', 'model-providers.json')
+  const userFile = userStatePath('model-providers.json')
   if (!existsSync(userFile)) return BUILTIN
   try {
     const user = JSON.parse(readFileSync(userFile, 'utf8')) as ModelCatalog

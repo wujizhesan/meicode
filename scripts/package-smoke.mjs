@@ -15,9 +15,10 @@ const runNpm = (args, options = {}) => npmExecPath
   : execFileSync(npm, args, { shell: process.platform === 'win32', ...options })
 
 try {
-  runNpm(['run', 'build'], { cwd: root, stdio: 'inherit' })
+  if (process.env.MEICODE_SKIP_BUILD !== 'true') runNpm(['run', 'build'], { cwd: root, stdio: 'inherit' })
   const output = runNpm(['pack', '--pack-destination', temp, '--json', '--ignore-scripts'], { cwd: root, encoding: 'utf8', env: cleanNpmEnv })
   const packageInfo = JSON.parse(output)[0]
+  if (packageInfo.files.some((file) => file.path.endsWith('.map'))) throw new Error('发行包不应包含 source map')
   const tarball = join(temp, packageInfo.filename)
   const installRoot = join(temp, 'install')
   mkdirSync(installRoot, { recursive: true })

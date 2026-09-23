@@ -83,7 +83,7 @@ function createService(cwd: string, typescript: typeof ts): Pick<ServiceEntry, '
       const walk = (dir: string, depth: number) => {
         if (depth > 4) return
         for (const f of typescript.sys.readDirectory(dir, ['.ts', '.tsx', '.js', '.jsx'])) {
-          if (f.includes('node_modules') || f.includes('.mewcode')) continue
+          if (f.includes('node_modules') || f.includes('.meicode') || f.includes('.mewcode')) continue
           out.push(f)
         }
       }

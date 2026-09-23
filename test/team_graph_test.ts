@@ -6,6 +6,10 @@ import {
   validateTaskDependencies,
 } from '../src/team/task-graph.ts'
 import type { TeamGroup, TeamTask } from '../src/team/types.ts'
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
+import { spawnSync } from 'node:child_process'
+import { WorktreeManager } from '../src/worktree/index.ts'
 
 let passed = 0
 let failed = 0
@@ -80,7 +84,53 @@ await check('mergeTeamWorktrees: 无 worktree 时逐成员跳过', async () => {
     ],
   }
   const result = await mergeTeamWorktrees(group, null, '.')
-  assert(result.includes('alice') && result.includes('bob'), '未返回全部成员的跳过结果')
+  assert(result.success && result.output.includes('alice') && result.output.includes('bob'), '未返回全部成员的跳过结果')
+})
+
+await check('mergeTeamWorktrees: 主仓库脏状态拒绝合并', async () => {
+  const root = join(import.meta.dirname, 'fixtures_team_merge_preflight')
+  rmSync(root, { recursive: true, force: true })
+  mkdirSync(root, { recursive: true })
+  spawnSync('git', ['init', '-b', 'feature'], { cwd: root })
+  writeFileSync(join(root, 'tracked.txt'), 'clean', 'utf8')
+  spawnSync('git', ['add', '-A'], { cwd: root })
+  spawnSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-m', 'init'], { cwd: root })
+  writeFileSync(join(root, 'tracked.txt'), 'dirty', 'utf8')
+  const group: TeamGroup = { name: 'dirty', lead: 'lead', members: [] }
+  const result = await mergeTeamWorktrees(group, { exit: async () => { throw new Error('不应执行') } } as never, root)
+  assert(!result.success && result.output.includes('主仓库存在未提交修改'), `脏仓库未拒绝合并: ${result.output}`)
+  rmSync(root, { recursive: true, force: true })
+})
+
+await check('mergeTeamWorktrees: 冲突预演不产生主仓库部分合并', async () => {
+  const root = join(import.meta.dirname, 'fixtures_team_merge_atomic')
+  rmSync(root, { recursive: true, force: true })
+  mkdirSync(root, { recursive: true })
+  spawnSync('git', ['init', '-b', 'main'], { cwd: root })
+  writeFileSync(join(root, 'shared.txt'), 'base\n', 'utf8')
+  spawnSync('git', ['add', '-A'], { cwd: root })
+  spawnSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-m', 'init'], { cwd: root })
+  const manager = new WorktreeManager(root)
+  const alice = await manager.create('member-alice')
+  const bob = await manager.create('member-bob')
+  writeFileSync(join(alice.path, 'shared.txt'), 'alice\n', 'utf8')
+  writeFileSync(join(bob.path, 'shared.txt'), 'bob\n', 'utf8')
+  const before = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: root }).stdout.toString().trim()
+  const group: TeamGroup = {
+    name: 'atomic',
+    lead: 'lead',
+    members: [
+      { name: 'alice', role: 'worker', workdir: alice.path, backend: 'coroutine', needsApproval: false, status: 'idle' },
+      { name: 'bob', role: 'worker', workdir: bob.path, backend: 'coroutine', needsApproval: false, status: 'idle' },
+    ],
+  }
+  const result = await mergeTeamWorktrees(group, manager, root)
+  const after = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: root }).stdout.toString().trim()
+  assert(!result.success && result.output.includes('冲突'), `冲突合并未失败: ${result.output}`)
+  assert(before === after && readFileSync(join(root, 'shared.txt'), 'utf8') === 'base\n', '冲突预演修改了主仓库')
+  await manager.remove('member-alice')
+  await manager.remove('member-bob')
+  rmSync(root, { recursive: true, force: true })
 })
 
 console.log(`\nteam_graph_test: ${passed} passed, ${failed} failed`)
