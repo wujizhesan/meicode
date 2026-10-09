@@ -1,7 +1,6 @@
 node_modules/
 dist/
 .mewcode/
-reverse-notes/
 test/fixtures_*/
 test/fixtures/
 *.log
