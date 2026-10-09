@@ -12,4 +12,4 @@ _*.mjs
 _*.py
 _*.cjs
 AGENTS.md
-SESSION_LOG.md
+SESSION_LOG.md*
