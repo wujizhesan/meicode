@@ -206,7 +206,7 @@ async function main() {
     // 用 write_file(非查询工具)——read_file 等查询类已豁免(轮询合法)；阈值 5(写报告迭代合法,3 次误杀实锤)
     const p = new FakeAgentProvider(() => ({
       events: [
-        { type: 'tool_call', id: `call_${Math.random()}`, name: 'write_file', arguments: { path: 'same.txt', content: 'x' } },
+        { type: 'tool_call', id: `call_${Math.random()}`, name: 'write_file', arguments: { path: 'test/fixtures_loop_repeat/same.txt', content: 'x' } },
         { type: 'done' },
       ],
     }))

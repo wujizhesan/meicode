@@ -19,7 +19,7 @@ GitHub Release 提供编译后的发行包，不需要 npm 账户，也不需要
 
 MeiCode 是一个运行在终端里的命令行 AI 助手：可以直接操作文件系统、执行命令、搜索代码，通过 Skill 系统扩展能力，并内置**多智能体团队编排**——主会话可以派生专职专家成员（协程驻留、worktree 隔离），并行拆解复杂任务。
 
-TypeScript / ESM / Node.js，无框架依赖（终端 UI 用 Ink）。
+TypeScript / ESM / Node.js；终端 UI 基于 Ink + React，其余模块零框架依赖。
 
 ## 核心特性
 

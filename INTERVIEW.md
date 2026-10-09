@@ -5,7 +5,7 @@
 
 ## 一、30 秒自我介绍（项目段）
 
-> 我开发了一个叫 MeiCode 的**终端多智能体协作框架**：主会话可以把复杂任务拆解给多个 AI 专家成员并行执行——每个成员独立上下文、隔离工作区、邮箱协作、可跨会话恢复。整个项目 TypeScript 从零实现，包含 Agent 主循环、团队编排、Workflow 引擎、权限沙箱四个子系统，18 个测试文件全绿。
+> 我开发了一个叫 MeiCode 的**终端多智能体协作框架**：主会话可以把复杂任务拆解给多个 AI 专家成员并行执行——每个成员独立上下文、隔离工作区、邮箱协作、可跨会话恢复。整个项目 TypeScript 从零实现，包含 Agent 主循环、团队编排、Workflow 引擎、权限沙箱四个子系统，35 个测试文件全绿。
 
 ## 二、2 分钟创新点陈述（团队编排）
 
@@ -32,14 +32,14 @@
 | 追问 | 应答 |
 |---|---|
 | "借鉴了 Claude Code 吧？" | 架构模式对齐了主流 agent 框架，但团队协作的工程化——成员生命周期、隔离、契约、保障机制——是完整自研，并且用真实任务验证过 |
-| "规模多大？" | 205 个文件、18 个测试文件全绿、9 轮实战验证 5 个真实目标闭环 |
+| "规模多大？" | 237 个文件（src/ 119 个）、35 个测试文件全绿、9 轮实战验证 5 个真实目标闭环 |
 | "最难的点？" | 不是功能，是**可靠性**：上下文爆炸、死循环、成员失联、报告丢失——每个都是工程问题，我建了一整套防御机制 |
 | "下一步？" | Workflow 与团队打通已做（phase 可选协程成员）；计划做插件化、上下文精简 |
 | "为什么用 TypeScript？" | 类型安全 + 生态（Ink 终端 UI/react/playwright-core），Node 24 原生跑 TS 免构建 |
 
 ## 五、项目数据速查
 
-- 代码：205 文件，TypeScript/ESM，Node ≥20
-- 测试：18 文件全绿（team 12 / workflow 8 / loop 22 / audit 16 等）
+- 代码：237 文件（src/ 119），TypeScript/ESM，Node ≥20
+- 测试：35 个测试文件、220+ 用例全绿（loop 23 / tools 23 / permission 21 / commands 17 / audit 17 / team 15 等）
 - 子系统：agent / team / workflow / subagent / tools / permission / mcp / hook / worktree / tui / commands
 - 架构模式：主循环（model→tools→result）+ 协程成员 + 邮箱协议（IDLE/PLAN/APPROVE）+ worktree 隔离 + 契约目录
