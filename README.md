@@ -1,35 +1,81 @@
 # MeiCode
 
-## 安装发行版
+**一个本地运行的 agent 运行时**：自带工具调用主循环、权限围栏、上下文管理与多智能体团队编排；既能作为终端 CLI 使用，也能通过 ACP / A2A 协议被其他前端驱动。可以直接操作文件系统、执行命令、搜索代码，并通过 Skill 系统扩展能力；复杂任务可派生专职专家成员（协程驻留、worktree 隔离）并行拆解。
 
-两种方式装完都是同一个 `meicode` 命令。
+TypeScript / ESM / Node.js；终端 UI 基于 Ink + React，其余模块零框架依赖。
 
-从 npm 安装（公开包，无需登录）：
+只想跑起来看效果 → [五分钟上手](#五分钟上手)；想改代码 → [开发命令](#开发命令)。
 
-```powershell
+## 五分钟上手
+
+前提：Node.js >= 20.11，以及一个可用的模型 API key。
+
+### 1. 安装
+
+从公开的 npm 包安装，无需登录；装完得到同一个 `meicode` 命令：
+
+```bash
 npm install -g @wujizhesan/meicode
 meicode --version
+meicode --help
 ```
 
-或者从 GitHub Release 下载编译好的 tgz（仓库是私有的，需要 `gh auth login` 过）：
+交互模式需要 TTY，`--run` 无人值守模式不需要。
+
+### 2. 配置
+
+```bash
+meicode --init     # 创建 ~/.meicode/config.yaml；已存在则不覆盖
+```
+
+生成的是示例配置，`api_key: sk-ant-xxxx` 是占位值。最省事的写法是**把文件内容整体换成下面两行**，密钥走环境变量、不写进配置文件：
+
+```yaml
+provider: deepseek
+api_key_env: DEEPSEEK_API_KEY
+```
+
+不要只往示例文件里追加这两行：示例残留的 `model: claude-sonnet-5` 在目录模式下不会被覆盖，会把一个不存在的模型名带进请求。
+
+```bash
+export DEEPSEEK_API_KEY="sk-..."     # bash / zsh
+```
+
+PowerShell 用 `$env:DEEPSEEK_API_KEY = "sk-..."`。内置目录含 `deepseek` / `kimi` / `qwen` / `bigmodel` / `mimo` 五家，协议、端点与默认模型都从目录取；要用目录外的模型，照 `config.example.yaml` 的手写模式填 `protocol` / `model` / `base_url` / `api_key`。
+
+### 3. 静态自检
+
+```bash
+meicode --doctor
+```
+
+只读检查 Node 版本、`base_url` 协议与模型预算，**不联网、不调用模型**。通过时打印 `provider` / `protocol` / `model` 与 `context` / `output` 预算；key 仍是示例值时会给出警告。
+
+### 4. 跑第一个任务
+
+```bash
+meicode --run "列出当前目录下的文件，并说明这个仓库大概是做什么的"
+```
+
+`--run` 输出完成后退出。默认走受限权限：读工具直接执行，写文件与执行命令会按权限模式拦截或询问。要看交互式 TUI 就直接运行 `meicode`；要接着上一次会话用 `--resume <会话ID>`。
+
+### 5. 下一步
+
+- 斜杠命令（`/mode`、`/team`、`/workflow`、`/session` 等）见下方「常用命令」。
+- 把 CLI 变成服务：`--acp-port` / `--a2a-port`，见下方「ACP / A2A 服务」。
+- Web 控制台 [meicode-web](https://github.com/wujizhesan/meicode-web) 依赖工具事件、交互审批、跨任务上下文与 `tasks/list?query=` 四项扩展；这些能力在源码 `CHANGELOG.md` 的 *Unreleased* 段，**npm `0.1.6` 尚不包含**，需要从源码构建或等 `0.1.7`。
+
+### 另一种安装方式：GitHub Release 的 tgz
+
+发行包已编译，不需要 npm 账户，也不需要安装或加载 `tsx`（该仓库是私有的，需要 `gh auth login`）：
 
 ```powershell
 $tag = gh release view -R wujizhesan/meicode-private --json tagName --jq .tagName
 gh release download $tag -R wujizhesan/meicode-private -p "*.tgz"
 npm install -g "./wujizhesan-meicode-$($tag.TrimStart('v')).tgz"
-meicode --help
-meicode --version
-meicode --init
-meicode --doctor
 ```
 
-GitHub Release 提供编译后的发行包，不需要 npm 账户，也不需要安装或加载 `tsx`。
-`meicode --init` 会创建 `~/.meicode/config.yaml`，如果配置已存在则不会覆盖。已有 `.mewcode` 目录会继续自动使用，无需立即迁移。
-`meicode --doctor` 只读执行本地静态检查，不会调用模型。
-
-MeiCode 是一个运行在终端里的命令行 AI 助手：可以直接操作文件系统、执行命令、搜索代码，通过 Skill 系统扩展能力，并内置**多智能体团队编排**——主会话可以派生专职专家成员（协程驻留、worktree 隔离），并行拆解复杂任务。
-
-TypeScript / ESM / Node.js；终端 UI 基于 Ink + React，其余模块零框架依赖。
+已有 `.mewcode` 目录会继续自动使用，无需立即迁移。
 
 ## 核心特性
 
@@ -81,7 +127,9 @@ npm test
 npm run package:smoke
 ```
 
-## 快速开始
+## 开发命令
+
+本节面向从源码改代码的人；只想把工具跑起来，请回到[五分钟上手](#五分钟上手)。
 
 ```bash
 npm install
@@ -161,7 +209,7 @@ ACP/A2A 默认使用无人值守安全权限，限制危险命令和工作目录
 |---|---|---|
 | 类型 | `npm run typecheck` | `tsc --noEmit` 严格模式，零错误 |
 | 静态检查 | `npm run lint` | Biome，CI 只拦 error（含 `noFloatingPromises` / `noExplicitAny`） |
-| 测试 | `node scripts/test.mjs` | 168 个入口文件、3,300+ 处断言 |
+| 测试 | `node scripts/test.mjs` | 173 个入口文件、3,350 处断言 |
 
 用 **Biome** 而不是 ESLint（或 typescript-eslint）的原因：本项目用 TypeScript 7（Go 版 `tsc`），
 而 typescript-eslint 的 peer 范围仍停在 `>=4.8.4 <6.1.0`，TS 7 也尚未提供稳定的 compiler API——
@@ -173,7 +221,9 @@ Biome 自带 TS 解析器、不依赖 TypeScript 编译器，因此对编译器�
 
 ## 配置
 
-复制 `config.example.yaml` 为 `~/.meicode/config.yaml`，配置 provider，并优先用 `api_key_env` 从环境变量读取密钥（支持 deepseek / kimi / qwen / bigmodel / mimo 模型目录）。
+最简配置见[五分钟上手](#五分钟上手)第 2 步。配置文件默认在 `~/.meicode/config.yaml`，
+可用 `--config <path>` 指定别的位置。内置模型目录可用 `~/.meicode/model-providers.json`
+覆盖或扩展；密钥优先用 `api_key_env` 从环境变量读取，不要写进配置文件。
 
 ## 常用命令
 
@@ -214,11 +264,11 @@ npm run metrics
 
 | 项目 | 规模 |
 |---|---|
-| 源码 | 161 个文件 / 约 2.4 万行 |
-| 测试 | 168 个入口文件 / 约 3.6 万行 / 3,300+ 处断言 / 1,100+ 个具名用例 |
-| 测试 : 源码 | ≈ 1.47 : 1（测试代码比源码多） |
+| 源码 | 162 个文件 / 24,629 行 |
+| 测试 | 173 个入口文件 / 36,453 行 / 3,350 处断言 / 1,205 个具名用例 |
+| 测试 : 源码 | ≈ 1.48 : 1（测试代码比源码多） |
 | 内置角色 | 10 个 |
-| 设计文档 | `docs/` 58 个文件 / 约 5,500 行 |
+| 设计文档 | `docs/` 58 个文件 / 5,528 行 |
 | 依赖 | 10 个运行时 / 7 个开发 |
 
 ## 许可
