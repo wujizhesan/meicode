@@ -1,4 +1,4 @@
-export type PermissionMode = 'strict' | 'default' | 'permissive'
+export type PermissionMode = 'strict' | 'default' | 'unattended' | 'permissive'
 
 export type RuleSource = 'user' | 'project' | 'local' | 'session'
 
@@ -24,8 +24,9 @@ export interface ToolCallInfo {
 
 // 引擎最小接口（避免 types ↔ rules 循环依赖）
 export interface PermissionEngineLike {
-  match(call: ToolCallInfo): Rule | null
-  addSessionRule(rule: Omit<Rule, 'source'>): void
+  match(call: ToolCallInfo, sessionId?: string): Rule | null
+  addSessionRule(rule: Omit<Rule, 'source'>, sessionId?: string): void
+  clearSessionRules?(sessionId?: string): void
   appendProjectRule(rule: Omit<Rule, 'source'>): void
 }
 

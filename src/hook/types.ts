@@ -1,24 +1,27 @@
 import type { ChatMessage } from '../provider/types.ts'
 
-export type HookEventName =
-  | 'session_start'
-  | 'session_end'
-  | 'round_start'
-  | 'round_end'
-  | 'message'
-  | 'tool_before'
-  | 'tool_after'
-  | 'permission_request'
-  | 'permission_denied'
-  | 'subagent_start'
-  | 'subagent_stop'
-  | 'pre_compact'
-  | 'post_compact'
-  | 'task_created'
-  | 'task_completed'
-  | 'teammate_idle'
-  | 'app_start'
-  | 'app_exit'
+export const HOOK_EVENTS = [
+  'session_start',
+  'session_end',
+  'round_start',
+  'round_end',
+  'message',
+  'tool_before',
+  'tool_after',
+  'permission_request',
+  'permission_denied',
+  'subagent_start',
+  'subagent_stop',
+  'pre_compact',
+  'post_compact',
+  'task_created',
+  'task_completed',
+  'teammate_idle',
+  'app_start',
+  'app_exit',
+] as const
+
+export type HookEventName = (typeof HOOK_EVENTS)[number]
 
 export const INTERCEPT_EVENTS = new Set<HookEventName>(['tool_before'])
 
@@ -49,6 +52,8 @@ export interface HookRule {
 
 export interface HookContext {
   cwd: string
+  sessionId?: string
+  targetAgentId?: string
   call?: { name: string; args: Record<string, unknown> }
   message?: ChatMessage
   round?: number

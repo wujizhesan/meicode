@@ -1,16 +1,16 @@
 import { readFileSync, existsSync } from 'node:fs'
-import { homedir } from 'node:os'
 import { join, resolve, sep } from 'node:path'
+import { projectStatePath, userStatePath } from '../state-paths.ts'
 
 const MAX_DEPTH = 5
 const INCLUDE_RE = /^@include\s+(.+)$/
 
-// 三层指令：项目根 > 项目 .mewcode > 用户 ~/.mewcode（高优先级在前）
+// 三层指令：项目根 > 项目 .meicode > 用户 ~/.meicode（高优先级在前）
 export async function loadInstructions(cwd: string): Promise<string> {
   const layers = [
     { path: join(cwd, 'instructions.md'), label: '项目指令' },
-    { path: join(cwd, '.mewcode', 'instructions.md'), label: '项目级指令' },
-    { path: join(homedir(), '.mewcode', 'instructions.md'), label: '用户指令' },
+    { path: projectStatePath(cwd, 'instructions.md'), label: '项目级指令' },
+    { path: userStatePath('instructions.md'), label: '用户指令' },
   ]
 
   const parts: string[] = []

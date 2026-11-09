@@ -13,12 +13,27 @@ export interface WorkflowMeta {
   phases: WorkflowPhase[]
 }
 
-export type PhaseStatus = 'pending' | 'running' | 'completed' | 'failed' | 'paused'
+export type PhaseStatus = 'pending' | 'running' | 'completed' | 'failed' | 'paused' | 'cancelled'
+
+export interface PhaseDispatchSlot {
+  slot: number
+  dispatchId: string
+  status: 'dispatching' | 'running' | 'settled'
+  backend: 'subagent' | 'team'
+  agentId?: string
+  taskId?: string
+  teamGroup?: string
+}
 
 export interface PhaseRunRecord {
   title: string
   status: PhaseStatus
+  backend?: 'subagent' | 'team'
   agentId?: string
+  agentIds?: string[]
+  taskIds?: string[]
+  dispatchSlots?: PhaseDispatchSlot[]
+  teamGroup?: string
   artifactPath?: string // 产物：artifacts/<phase>.md
   startedAt?: number
   finishedAt?: number
@@ -30,8 +45,19 @@ export type WorkflowRunStatus = 'running' | 'completed' | 'failed' | 'paused' | 
 export interface WorkflowRunRecord {
   runId: string
   workflow: string
+  sessionId?: string
+  backend?: 'subagent' | 'team'
+  definitionHash?: string
   status: WorkflowRunStatus
   phases: PhaseRunRecord[]
   createdAt: number
+  updatedAt?: number
   finishedAt?: number
+  revision?: number
+  leaseId?: string
+  leaseExpiresAt?: number
+  reconcileAttempts?: number
+  lastReconcileError?: string
+  nextReconcileAt?: number
+  reconcileBlocked?: boolean
 }

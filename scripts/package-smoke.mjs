@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 
@@ -15,9 +15,10 @@ const runNpm = (args, options = {}) => npmExecPath
   : execFileSync(npm, args, { shell: process.platform === 'win32', ...options })
 
 try {
-  runNpm(['run', 'build'], { cwd: root, stdio: 'inherit' })
+  if (process.env.MEICODE_SKIP_BUILD !== 'true') runNpm(['run', 'build'], { cwd: root, stdio: 'inherit' })
   const output = runNpm(['pack', '--pack-destination', temp, '--json', '--ignore-scripts'], { cwd: root, encoding: 'utf8', env: cleanNpmEnv })
   const packageInfo = JSON.parse(output)[0]
+  if (packageInfo.files.some((file) => file.path.endsWith('.map'))) throw new Error('发行包不应包含 source map')
   const tarball = join(temp, packageInfo.filename)
   const installRoot = join(temp, 'install')
   mkdirSync(installRoot, { recursive: true })
@@ -26,7 +27,18 @@ try {
   consumerPackage.allowScripts = {}
   writeFileSync(join(installRoot, 'package.json'), JSON.stringify(consumerPackage, null, 2))
   runNpm(['install', '--omit=dev', '--ignore-scripts', '--no-audit', '--no-fund', tarball], { cwd: installRoot, stdio: 'inherit', env: cleanNpmEnv })
-  const entry = join(installRoot, 'node_modules', 'meicode', 'bin', 'meicode.mjs')
+  // 包名可能带 scope（@user/name），安装后在 node_modules 下是多级目录
+  const packageName = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8')).name
+  const installDir = join(installRoot, 'node_modules', ...packageName.split('/'))
+  const entry = join(installDir, 'bin', 'meicode.mjs')
+  const chunksDir = join(installDir, 'dist', 'chunks')
+  const chunks = readdirSync(chunksDir)
+  const runtimeChunks = ['App-', 'acp-', 'a2a-'].map((prefix) => {
+    const name = chunks.find((chunk) => chunk.startsWith(prefix) && chunk.endsWith('.mjs'))
+    if (!name) throw new Error(`发行包缺少动态分块: ${prefix}*.mjs`)
+    return join(chunksDir, name)
+  })
+  execFileSync(process.execPath, ['--input-type=module', '--eval', "import('node:url').then(({ pathToFileURL }) => Promise.all(process.argv.slice(1).map((path) => import(pathToFileURL(path)))))", ...runtimeChunks], { stdio: 'ignore' })
   const expectedVersion = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8')).version
   const version = execFileSync(process.execPath, [entry, '--version'], { encoding: 'utf8' }).trim()
   if (version !== expectedVersion) throw new Error(`版本检查失败: ${version} !== ${expectedVersion}`)
@@ -35,7 +47,7 @@ try {
   execFileSync(process.execPath, [entry, '--init', '--config', initConfig], { stdio: 'inherit' })
   if (!existsSync(initConfig)) throw new Error('发行包配置初始化失败')
   execFileSync(process.execPath, [entry, '--doctor', '--config', initConfig], { stdio: 'inherit' })
-  console.log(`Package smoke passed: meicode@${version}`)
+  console.log(`Package smoke passed: ${packageName}@${version}`)
 } finally {
   rmSync(temp, { recursive: true, force: true })
 }

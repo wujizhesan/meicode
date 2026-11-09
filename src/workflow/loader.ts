@@ -1,17 +1,18 @@
-// Workflow 文件加载：.mewcode/workflows/<name>.workflow.js（项目级）+ ~/.mewcode/workflows/（用户级）
+// Workflow 文件加载：.meicode/workflows/<name>.workflow.js（项目级）+ ~/.meicode/workflows/（用户级）
 // DSL: export const meta = { name, description, phases }
-import { existsSync, mkdirSync, readdirSync } from 'node:fs'
-import { homedir } from 'node:os'
-import { join, resolve } from 'node:path'
+import { existsSync, mkdirSync, readFileSync, readdirSync } from 'node:fs'
+import { createHash } from 'node:crypto'
+import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import type { WorkflowMeta } from './types.ts'
+import { projectStatePath, userStatePath } from '../state-paths.ts'
 
 export function projectWorkflowsDir(cwd: string): string {
-  return join(resolve(cwd), '.mewcode', 'workflows')
+  return projectStatePath(cwd, 'workflows')
 }
 
 export function userWorkflowsDir(): string {
-  return join(homedir(), '.mewcode', 'workflows')
+  return userStatePath('workflows')
 }
 
 export function ensureWorkflowDirs(cwd: string): { project: string; user: string } {
@@ -23,10 +24,10 @@ export function ensureWorkflowDirs(cwd: string): { project: string; user: string
 }
 
 export function workflowPath(cwd: string, name: string): string {
-  const safe = name.replace(/[^a-zA-Z0-9_-]/g, '_')
-  const project = join(projectWorkflowsDir(cwd), `${safe}.workflow.js`)
+  if (!/^[A-Za-z0-9_-]+$/.test(name)) throw new Error(`非法 workflow 名称: ${name}`)
+  const project = join(projectWorkflowsDir(cwd), `${name}.workflow.js`)
   if (existsSync(project)) return project
-  const user = join(userWorkflowsDir(), `${safe}.workflow.js`)
+  const user = join(userWorkflowsDir(), `${name}.workflow.js`)
   return existsSync(user) ? user : project // 默认落项目级
 }
 
@@ -36,7 +37,10 @@ export function listWorkflows(cwd: string): string[] {
   for (const dir of dirs) {
     if (!existsSync(dir)) continue
     for (const f of readdirSync(dir)) {
-      if (f.endsWith('.workflow.js')) names.add(f.replace(/\.workflow\.js$/, ''))
+      if (f.endsWith('.workflow.js')) {
+        const name = f.replace(/\.workflow\.js$/, '')
+        if (/^[A-Za-z0-9_-]+$/.test(name)) names.add(name)
+      }
     }
   }
   return [...names].sort()
@@ -46,11 +50,13 @@ export function listWorkflows(cwd: string): string[] {
 export async function loadWorkflow(cwd: string, name: string): Promise<WorkflowMeta> {
   const path = workflowPath(cwd, name)
   if (!existsSync(path)) throw new Error(`workflow 不存在: ${name}（${path}）`)
-  const mod = (await import(pathToFileURL(path).href)) as { meta?: WorkflowMeta }
+  const source = readFileSync(path)
+  const version = createHash('sha256').update(source).digest('hex')
+  const mod = (await import(`${pathToFileURL(path).href}?v=${version}`)) as { meta?: WorkflowMeta }
   if (!mod.meta || typeof mod.meta !== 'object') {
     throw new Error(`${path} 缺少 export const meta（DSL: export const meta = { name, description, phases }）`)
   }
-  return mod.meta
+  return structuredClone(mod.meta)
 }
 
 export const WORKFLOW_TEMPLATE = `// MeiCode Workflow DSL（对齐 Zcode：export const meta = { name, description, phases }）

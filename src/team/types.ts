@@ -15,7 +15,8 @@ export interface TeamTask {
   id: string
   title: string
   assignee?: string
-  status: 'todo' | 'in_progress' | 'done' | 'failed'
+  status: 'todo' | 'in_progress' | 'done' | 'failed' | 'cancelled'
+  dispatchId?: string
   depends_on?: string[]
   createdAt?: number
   updatedAt?: number
@@ -29,11 +30,12 @@ export interface TeamTask {
   nextRetryAt?: number
   lastError?: string
   result?: string
+  notifications?: MailMessage[]
 }
 
 export interface TeamTaskReport {
   reportId: string
-  status: 'done' | 'failed'
+  status: 'done' | 'failed' | 'cancelled'
   summary: string
   tokens?: number
   durationMs?: number
@@ -42,6 +44,28 @@ export interface TeamTaskReport {
   artifacts?: string[]
   changedFiles?: string[]
   tests?: { command: string; passed: boolean; output?: string }[]
+}
+
+export interface TeamTaskOutcome {
+  status: 'done' | 'failed'
+  text: string
+  report: TeamTaskReport
+  interrupted?: boolean
+}
+
+export interface TeamTaskSettlement {
+  kind: 'result' | 'cancel'
+  groupName: string
+  taskId: string
+  memberName: string
+  leaseId?: string
+  agentId?: string
+  sessionId?: string
+  parentAgentId?: string
+  reportId: string
+  result?: TeamTaskOutcome
+  requeueOnShutdown?: boolean
+  queuedTask?: Pick<TeamTask, 'title' | 'assignee' | 'attempt' | 'updatedAt' | 'reportId'>
 }
 
 export interface MailMessage {

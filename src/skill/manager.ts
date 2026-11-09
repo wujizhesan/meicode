@@ -6,6 +6,7 @@ const SYSTEM_TOOLS = new Set(['read_file', 'write_file', 'edit_file', 'run_comma
 export class SkillManager {
   private all = new Map<string, SkillDef>()
   private active = new Map<string, ActiveSkill>()
+  private pendingIsolated = new Set<string>()
   private dirs: SkillDirs
   private onActivate: ((name: string, def: SkillDef) => void) | null = null
 
@@ -49,10 +50,18 @@ export class SkillManager {
     return [...this.all.values()]
   }
 
+  createScope(): SkillManager {
+    const scope = new SkillManager({ ...this.dirs })
+    for (const [name, def] of this.all) scope.all.set(name, structuredClone(def))
+    return scope
+  }
+
   activate(name: string, params: Record<string, string> = {}): string {
     const def = this.all.get(name)
     if (!def) return `未找到 Skill: ${name}（/help 或查看可用 Skills 列表）`
     this.active.set(name, { def, params })
+    if (def.mode === 'isolated') this.pendingIsolated.add(name)
+    else this.pendingIsolated.delete(name)
     this.lastActivated = { name, mode: def.mode }
     this.onActivate?.(name, def)
     return `已激活 Skill: ${name}（${def.mode} 模式）`
@@ -60,10 +69,31 @@ export class SkillManager {
 
   deactivate(name: string): void {
     this.active.delete(name)
+    this.pendingIsolated.delete(name)
+    if (this.lastActivated?.name === name) this.lastActivated = null
   }
 
   clear(): void {
     this.active.clear()
+    this.clearPendingIsolated()
+  }
+
+  clearPendingIsolated(): void {
+    this.pendingIsolated.clear()
+    this.lastActivated = null
+  }
+
+  takeNextIsolated(): SkillDef | undefined {
+    for (const name of this.pendingIsolated) {
+      this.pendingIsolated.delete(name)
+      const active = this.active.get(name)
+      const def = this.all.get(name)
+      if (!active || def?.mode !== 'isolated') continue
+      let content = def.content
+      for (const [key, value] of Object.entries(active.params)) content = content.replaceAll(`{{${key}}}`, value)
+      return { ...def, tools: def.tools ? [...def.tools] : undefined, content }
+    }
+    return undefined
   }
 
   isActive(name: string): boolean {
@@ -73,6 +103,7 @@ export class SkillManager {
   activePrompt(): string {
     const parts: string[] = []
     for (const { def, params } of this.active.values()) {
+      if (def.mode !== 'shared') continue
       let content = def.content
       for (const [k, v] of Object.entries(params)) {
         content = content.replaceAll(`{{${k}}}`, v)
@@ -82,16 +113,17 @@ export class SkillManager {
     return parts.join('\n\n')
   }
 
-  // 激活白名单并集（无激活或全部无 tools → null = 不限制）
   activeToolNames(): string[] | null {
     if (this.active.size === 0) return null
     const set = new Set<string>()
+    let constrained = false
     for (const { def } of this.active.values()) {
-      for (const t of def.tools ?? []) set.add(t)
+      if (def.mode !== 'shared' || def.tools === undefined) continue
+      constrained = true
+      for (const t of def.tools) set.add(t)
     }
-    return set.size === 0 ? null : [...set]
+    return constrained ? [...set] : null
   }
 
-  // 最近激活的 Skill（供 useStream 检测 isolated 触发）
   lastActivated: { name: string; mode: 'shared' | 'isolated' } | null = null
 }

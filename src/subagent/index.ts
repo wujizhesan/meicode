@@ -22,14 +22,20 @@ export function createSpawnAgentTool(manager: SubAgentManager, opts: { provider:
       const type = args.type === 'fork' ? 'fork' : 'defined'
       const prompt = String(args.prompt ?? '')
       if (!prompt) return { success: false, output: '', error: '缺少参数 prompt' }
+      if (type === 'fork' && !ctx.forkContext) return { success: false, output: '', error: '缺少父会话快照，无法启动 fork' }
 
       const req: SpawnRequest = {
         type,
         role: typeof args.role === 'string' ? args.role : undefined,
         prompt,
         async: args.async === true,
+        ...(type === 'fork' ? {
+          parentHistory: structuredClone([...ctx.forkContext!.history]),
+          parentTools: [...ctx.forkContext!.tools],
+        } : {}),
       }
       const result = await manager.spawn(req, { provider: opts.provider, registry: opts.registry, ctx })
+      if (result.error) return { success: false, output: result.syncResult ?? '', error: result.error }
       if (result.async) {
         return { success: true, output: `子任务已提交后台（任务ID: ${result.id}），完成后结果会回流到对话` }
       }

@@ -50,7 +50,7 @@ MeiCode 命令（用户在输入框输入的斜杠命令，由系统处理，不
 - 典型流程：team_create 建组 → team_spawn 派生成员 → team_assign 派活（等待成员执行完成并汇报结果）→ team_merge 合并成员 worktree 成果
 - 成员在隔离 worktree 里改文件，主仓库不会被直接修改——这是预期；成员成果用 team_merge 汇总，禁止用 edit_file/run_command 手工抄写成员改动
 - 成员有异步汇报/决策请求（IDLE 完成通知、PLAN 审批）时，用 team_mail 查看邮箱
-- 收到成员的 PLAN 审批请求时：合理就 team_approve 批准，不合理就 team_deny 拒绝并说明原因（成员会等你的决定再执行）
+- 收到成员的 PLAN 审批请求时：使用邮件中的 task_id 和 correlation_id 调用 team_approve；不合理就用相同关联调用 team_deny 并说明原因（成员只接受当前任务的精确审批）
 - 禁止用 spawn_agent 代替团队功能（团队成员是协程驻留的独立上下文，spawn_agent 是临时子任务）`, 
   },
   {
@@ -74,7 +74,7 @@ MeiCode 命令（用户在输入框输入的斜杠命令，由系统处理，不
     id: 'skills',
     priority: 6,
     content: `Skill 系统（重要，遇到 Skill 相关请求先看这里）：
-- MewCode 支持 Skill：Markdown 文件（YAML frontmatter + SOP 指令正文），放在 skills/ 目录自动加载，优先级：项目 <cwd>/skills/ > 用户 ~/.mewcode/skills/ > 内置
+- MeiCode 支持 Skill：Markdown 文件（YAML frontmatter + SOP 指令正文），放在 skills/ 目录自动加载，优先级：项目 <cwd>/skills/ > 用户 ~/.meicode/skills/ > 内置
 - 可用 Skill 列表在对话上下文的「可用 Skills」段；激活用 load_skill 工具或 /skill 命令
 - 安装新 Skill：把 SKILL.md（及配套文件）放到 <cwd>/skills/<name>/ 目录即可，无需其他步骤
 - 用户说「装/安装 skill」时：先检查 skills/ 目录是否已存在同名 Skill；已有就直接确认可用并告知加载方式，不要反复调查验证；没有才考虑下载

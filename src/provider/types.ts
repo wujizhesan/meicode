@@ -21,14 +21,22 @@ export type StreamEvent =
   | { type: 'done' }
   | { type: 'error'; message: string }
 
+export interface ProviderTool {
+  type: 'function'
+  function: {
+    name: string
+    description: string
+    parameters: JsonSchema
+  }
+}
+
+export interface StreamChatOptions {
+  thinking?: boolean
+  tools?: ProviderTool[]
+  signal?: AbortSignal
+}
+
 export interface Provider {
   readonly protocol: 'anthropic' | 'openai'
-  streamChat(
-    messages: ChatMessage[],
-    opts: {
-      thinking?: boolean
-      tools?: { type: 'function'; function: { name: string; description: string; parameters: JsonSchema } }[]
-      signal?: AbortSignal // 外部取消（用户 Ctrl+C）：中止请求并关闭流
-    },
-  ): AsyncGenerator<StreamEvent>
+  streamChat(messages: ChatMessage[], opts: StreamChatOptions): AsyncGenerator<StreamEvent>
 }

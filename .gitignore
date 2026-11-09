@@ -1,8 +1,12 @@
 node_modules/
 dist/
 .mewcode/
+reverse-notes/
+.archify/
+.local/
 test/fixtures_*/
 test/fixtures/
+test/.timings.json
 *.log
 .env*
 *.local.*
@@ -12,4 +16,4 @@ _*.mjs
 _*.py
 _*.cjs
 AGENTS.md
-SESSION_LOG.md*
+SESSION_LOG.md

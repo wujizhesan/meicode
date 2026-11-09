@@ -1,5 +1,6 @@
 import type { Provider, ChatMessage } from '../provider/types.ts'
 import type { ToolContext } from '../tools/index.ts'
+import { estimateMessageTokens } from './estimate.ts'
 
 export const SUMMARY_SYSTEM = `你是 MeiCode 的上下文压缩器。你的任务是把一段对话历史压缩成结构化摘要。
 
@@ -22,21 +23,21 @@ export const BOUNDARY_MESSAGE =
 
 // 从尾部往回保留 keepTokens（字符/4 估算）且至少 minCount 条
 export function tailKeep(
-  messages: ChatMessage[],
+  messages: readonly ChatMessage[],
   keepTokens = 10000,
   minCount = 5,
 ): { keep: ChatMessage[]; drop: ChatMessage[] } {
   let tokens = 0
   let count = 0
-  const keep: ChatMessage[] = []
-  for (let i = messages.length - 1; i >= 0; i--) {
-    tokens += Math.ceil(messages[i].content.length / 4)
+  let start = messages.length
+  while (start > 0) {
+    start--
+    tokens += estimateMessageTokens(messages[start])
     count++
-    keep.unshift(messages[i])
     if (tokens >= keepTokens && count >= minCount) break
   }
-  const drop = messages.slice(0, messages.length - keep.length)
-  return { keep, drop }
+  while (start > 0 && messages[start].role === 'tool') start--
+  return { keep: messages.slice(start), drop: messages.slice(0, start) }
 }
 
 // 独立调用 LLM 生成摘要（不进 history，无 tools）
@@ -45,14 +46,40 @@ export async function summarize(
   earlyMessages: ChatMessage[],
   ctx: ToolContext,
 ): Promise<string> {
+  if (ctx.signal?.aborted) throw new Error('摘要已取消')
   const msgs: ChatMessage[] = [{ role: 'system', content: SUMMARY_SYSTEM }, ...earlyMessages]
-  let text = ''
-  for await (const ev of provider.streamChat(msgs, { thinking: false })) {
-    if (ev.type === 'text') text += ev.text
-    else if (ev.type === 'error') throw new Error(`摘要请求失败: ${ev.message}`)
+  const controller = new AbortController()
+  const timeoutMs = ctx.timeoutMs ?? 60000
+  let rejectInterrupted!: (error: Error) => void
+  const interrupted = new Promise<never>((_, reject) => { rejectInterrupted = reject })
+  const stop = (error: Error): void => {
+    if (controller.signal.aborted) return
+    rejectInterrupted(error)
+    controller.abort(error)
   }
-  if (!text.trim()) throw new Error('摘要返回为空')
-  return text.trim()
+  const onAbort = (): void => stop(new Error('摘要已取消'))
+  ctx.signal?.addEventListener('abort', onAbort, { once: true })
+  const timer = setTimeout(() => stop(new Error(`摘要超时（${timeoutMs / 1000}s）`)), timeoutMs)
+  try {
+    if (ctx.signal?.aborted) onAbort()
+    const request = (async (): Promise<string> => {
+      controller.signal.throwIfAborted()
+      const textParts: string[] = []
+      for await (const ev of provider.streamChat(msgs, { thinking: false, signal: controller.signal })) {
+        controller.signal.throwIfAborted()
+        if (ev.type === 'text') textParts.push(ev.text)
+        else if (ev.type === 'error') throw new Error(`摘要请求失败: ${ev.message}`)
+      }
+      controller.signal.throwIfAborted()
+      const text = textParts.join('').trim()
+      if (!text) throw new Error('摘要返回为空')
+      return text
+    })()
+    return await Promise.race([request, interrupted])
+  } finally {
+    clearTimeout(timer)
+    ctx.signal?.removeEventListener('abort', onAbort)
+  }
 }
 
 export function summaryMessage(summary: string): ChatMessage {

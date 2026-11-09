@@ -1,6 +1,5 @@
 import { existsSync, readFileSync } from 'node:fs'
-import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { userStatePath } from '../state-paths.ts'
 
 // 模型目录 schema(对齐 Zcode model-providers.v1):
 // provider 级 = 端点(baseURL + 各协议路径)+ 默认协议
@@ -91,9 +90,9 @@ const BUILTIN: ModelCatalog = {
   ],
 }
 
-// 用户覆盖/扩展: ~/.mewcode/model-providers.json(同 schema,merge by provider id)
-export function loadModelCatalog(): ModelCatalog {
-  const userFile = join(homedir(), '.mewcode', 'model-providers.json')
+// 用户覆盖/扩展: ~/.meicode/model-providers.json(同 schema,merge by provider id)
+// userFile 参数仅为可测试性而加——默认值即真实路径,调用方无需改动。
+export function loadModelCatalog(userFile = userStatePath('model-providers.json')): ModelCatalog {
   if (!existsSync(userFile)) return BUILTIN
   try {
     const user = JSON.parse(readFileSync(userFile, 'utf8')) as ModelCatalog
@@ -110,10 +109,14 @@ export function loadModelCatalog(): ModelCatalog {
 }
 
 // 按 provider id + 协议取完整端点(baseURL + 路径拼接)
+// 两侧都做归一化：baseURL 去尾部斜杠、path 去开头斜杠后再用单个 / 拼接。
+// 原实现只处理了 baseURL 的尾斜杠；而 path 可由用户的 model-providers.json 覆盖，
+// 写 "v1/chat"（漏掉开头 /）是很自然的笔误，会把域名和路径粘成
+// "https://api.example.comv1/chat" 这种无效 URL。
 export function resolveCatalogEndpoint(catalog: ModelCatalog, providerId: string, kind: 'anthropic' | 'openai'): string | null {
   const p = catalog.providers.find((x) => x.id === providerId)
   if (!p) return null
   const path = kind === 'anthropic' ? p.paths.anthropic : p.paths.openai
   if (!path) return null
-  return `${p.baseURL.replace(/\/+$/, '')}${path}`
+  return `${p.baseURL.replace(/\/+$/, '')}/${path.replace(/^\/+/, '')}`
 }

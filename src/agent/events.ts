@@ -1,6 +1,12 @@
 import type { Provider } from '../provider/types.ts'
 import type { History } from '../session/history.ts'
 import type { JsonSchema, ToolContext, ToolRegistry } from '../tools/index.ts'
+import type { RuntimeEvidenceSummary } from '../runtime/evidence.ts'
+
+export interface AgentRequestOptions {
+  toolsOverride?: { type: 'function'; function: { name: string; description: string; parameters: JsonSchema } }[] | null
+  extraSystemMessages?: string[]
+}
 
 export type StopReason = 'complete' | 'max_iterations' | 'cancelled' | 'unknown_tool' | 'tool_failures' | 'tool_repeat' | 'error'
 
@@ -8,7 +14,7 @@ export type AgentEvent =
   | { type: 'text'; text: string }
   | { type: 'thinking'; text: string }
   | { type: 'tool_call'; id: string; name: string; args: Record<string, unknown> }
-  | { type: 'tool_result'; id: string; name: string; success: boolean; summary: string }
+  | { type: 'tool_result'; id: string; name: string; success: boolean; summary: string; diff?: string; output?: string }
   | {
       type: 'usage'
       round: number
@@ -25,13 +31,17 @@ export interface AgentOptions {
   history: History
   registry: ToolRegistry
   ctx: ToolContext
+  signal?: AbortSignal
   maxIterations: number
   mode: 'plan' | 'full'
   systemPrompt: string
   unknownToolLimit: number
   toolsOverride?: { type: 'function'; function: { name: string; description: string; parameters: JsonSchema } }[] | null
   extraSystemMessages?: string[] // P10：激活 Skill 指令（独立 system 消息，不进稳定前缀）
+  resolveRequestOptions?: () => AgentRequestOptions
   injectSystem?: () => string[] // P12：请求前注入（子任务结果回流，取后清空，永不插 assistant/tool 中间）
+  restoreUnsentSystem?: (messages: string[]) => void
+  persistSystemInjections?: boolean
   teamBusy?: () => boolean // 团队任务进行中判断器：纯文本轮且团队忙时不判 complete（防"[等待]"当最终输出中断编排）
 }
 
@@ -40,6 +50,7 @@ export interface AgentResult {
   rounds: number
   totalTokens: number
   finalText: string
+  evidence: RuntimeEvidenceSummary
   errorMessage?: string
 }
 

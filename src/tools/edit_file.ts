@@ -1,6 +1,11 @@
-import { readFile, writeFile } from 'node:fs/promises'
+import { readFileSync, realpathSync } from 'node:fs'
+import { createHash } from 'node:crypto'
+import { tmpdir } from 'node:os'
 import { join, isAbsolute } from 'node:path'
-import { guardPath } from './types.ts'
+import { withFileLock } from '../runtime/file-lock.ts'
+import { writeTextAtomicSync } from './atomic-write.ts'
+import { guardPath, truncateOutput } from './types.ts'
+import { unifiedDiff } from './diff.ts'
 import type { Tool, ToolContext, ToolResult } from './types.ts'
 
 export const editFileTool: Tool = {
@@ -21,40 +26,59 @@ export const editFileTool: Tool = {
     const path = args.path as string
     const oldText = args.old_text as string
     const newText = args.new_text as string
-    if (!path || typeof oldText !== 'string' || typeof newText !== 'string') {
+    if (!path || typeof oldText !== 'string' || oldText.length === 0 || typeof newText !== 'string') {
       return { success: false, output: '', error: '缺少参数 path / old_text / new_text' }
     }
+    if (ctx.signal?.aborted) return { success: false, output: '', error: '编辑已取消' }
 
     const target = isAbsolute(path) ? path : join(ctx.cwd, path)
     const blocked = guardPath(ctx, target)
     if (blocked) return { success: false, output: '', error: blocked }
-    let content: string
+    let canonical: string
     try {
-      content = await readFile(target, 'utf8')
+      canonical = realpathSync.native(target)
     } catch (e) {
       return { success: false, output: '', error: `读取失败: ${(e as Error).message}` }
     }
-
-    const count = content.split(oldText).length - 1
-    if (count === 0) {
-      return { success: false, output: '', error: '未找到原文片段（检查转义、换行与实际文件内容）' }
-    }
-    if (count > 1) {
-      const firstPos = content.indexOf(oldText)
-      return {
-        success: false,
-        output: '',
-        error: `原文匹配到 ${count} 处（首个匹配位置在第 ${firstPos} 个字符），请提供更长、更唯一的上下文`,
-      }
-    }
-
-    const updated = content.replace(oldText, newText)
+    const blockedCanonical = guardPath(ctx, canonical)
+    if (blockedCanonical) return { success: false, output: '', error: blockedCanonical }
+    const normalized = process.platform === 'win32' ? canonical.toLowerCase() : canonical
+    const lockFile = join(tmpdir(), 'meicode-edit-locks', `${createHash('sha256').update(normalized).digest('hex')}.lock`)
     try {
-      await writeFile(target, updated, 'utf8')
-      const summary = `已替换 1 处\n--- 旧 ---\n${oldText}\n--- 新 ---\n${newText}`
-      return { success: true, output: summary, evidence: { files: [target], changedFiles: [target] } }
+      return withFileLock(lockFile, () => {
+        let content: string
+        try {
+          content = readFileSync(canonical, 'utf8')
+        } catch (e) {
+          return { success: false, output: '', error: `读取失败: ${(e as Error).message}` }
+        }
+
+        const firstPos = content.indexOf(oldText)
+        if (firstPos < 0) {
+          return { success: false, output: '', error: '未找到原文片段（检查转义、换行与实际文件内容）' }
+        }
+        if (content.indexOf(oldText, firstPos + 1) >= 0) {
+          return {
+            success: false,
+            output: '',
+            error: `原文匹配到多处（首个匹配位置在第 ${firstPos} 个字符），请提供更长、更唯一的上下文`,
+          }
+        }
+
+        const updated = content.slice(0, firstPos) + newText + content.slice(firstPos + oldText.length)
+        if (ctx.signal?.aborted) return { success: false, output: '', error: '编辑已取消' }
+        try {
+          writeTextAtomicSync(canonical, updated, ctx)
+          const summary = `已替换 1 处\n--- 旧 ---\n${oldText}\n--- 新 ---\n${newText}`
+          const { output, truncated } = truncateOutput(summary)
+          const diff = unifiedDiff(content, updated)
+          return { success: true, output, truncated, evidence: { files: [target], changedFiles: [target] }, ...(diff ? { diff } : {}) }
+        } catch (e) {
+          return { success: false, output: '', error: `写入失败: ${(e as Error).message}` }
+        }
+      })
     } catch (e) {
-      return { success: false, output: '', error: `写入失败: ${(e as Error).message}` }
+      return { success: false, output: '', error: `编辑锁失败: ${(e as Error).message}` }
     }
   },
 }

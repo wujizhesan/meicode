@@ -3,6 +3,7 @@ import { join } from 'node:path'
 import { TeamManager } from '../src/team/index.ts'
 import type { Provider, StreamEvent } from '../src/provider/types.ts'
 import type { ToolContext } from '../src/tools/index.ts'
+import { ToolRegistry } from '../src/tools/registry.ts'
 
 class FakeProvider implements Provider {
   readonly protocol = 'openai' as const
@@ -21,7 +22,7 @@ mkdirSync(repo, { recursive: true })
 const ctx: ToolContext = { cwd: repo }
 const manager = new TeamManager(join(root, 'team'), repo, {
   provider: new FakeProvider(),
-  registry: { toOpenAITools: () => [] } as never,
+  registry: new ToolRegistry(),
   ctx,
 })
 const group = manager.createGroup('dag', 'lead')

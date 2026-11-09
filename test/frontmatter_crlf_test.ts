@@ -2,8 +2,12 @@ import { mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { parseSkillFile } from '../src/skill/loader.ts'
 import { parseAgentFile } from '../src/subagent/loader.ts'
+import { parseFrontmatter } from '../src/frontmatter.ts'
 
 const root = join(import.meta.dirname, 'fixtures_frontmatter_crlf')
+const complex = parseFrontmatter<{ description: string; tools: string[] }>('description: "quoted: value # kept"\ntools:\n  - read_file\n  - run_command')
+if (complex.description !== 'quoted: value # kept' || complex.tools.join(',') !== 'read_file,run_command') throw new Error('复杂 YAML frontmatter 回退解析失败')
+
 rmSync(root, { recursive: true, force: true })
 mkdirSync(root, { recursive: true })
 

@@ -1,6 +1,7 @@
 import { mkdirSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import { SubAgentManager } from '../src/subagent/index.ts'
+import { ToolRegistry } from '../src/tools/registry.ts'
 import type { Provider, StreamEvent } from '../src/provider/types.ts'
 
 class CountingProvider implements Provider {
@@ -19,7 +20,7 @@ rmSync(root, { recursive: true, force: true })
 mkdirSync(root, { recursive: true })
 const provider = new CountingProvider()
 const manager = new SubAgentManager({ builtin: root, user: root, project: root })
-const result = await manager.spawn({ type: 'fork', prompt: '执行简单任务' }, { provider, registry: { toOpenAITools: () => [] } as never, ctx: { cwd: root } })
+const result = await manager.spawn({ type: 'fork', prompt: '执行简单任务' }, { provider, registry: new ToolRegistry(), ctx: { cwd: root } })
 if (!result.async) throw new Error('fork 应后台执行')
 await new Promise((resolve) => setTimeout(resolve, 250))
 const record = manager.getRecord(result.id)

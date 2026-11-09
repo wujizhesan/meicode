@@ -1,6 +1,9 @@
-import { chromium } from 'playwright-core'
-import type { Browser, Page } from 'playwright-core'
+import { guardPath, truncateOutput } from './types.ts'
+import { resolveBrowserShotPath } from './browser_path.ts'
+import { BrowserSessionPool } from './browser_sessions.ts'
 import type { Tool, ToolContext, ToolResult } from './types.ts'
+import { settleCloseTask } from '../runtime/close-timeout.ts'
+import { resolveOnAbort } from './abort.ts'
 
 // 浏览器自动化工具(对齐 Qoder navigate/click/execute_js/network):
 // launch 启动系统 Edge(headless) / navigate 打开 URL / eval 执行 JS
@@ -8,8 +11,29 @@ import type { Tool, ToolContext, ToolResult } from './types.ts'
 // 采集(acquisition)、验证(verifier 截图)、复刻(DOM 对比)的通用能力
 
 const EDGE_PATH = 'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe'
-let browser: Browser | null = null
-let page: Page | null = null
+const browserSessions = new BrowserSessionPool(async (headless) => {
+  const { chromium } = await import('playwright-core')
+  return chromium.launch({ executablePath: EDGE_PATH, headless })
+})
+
+export async function closeBrowserScope(ctx: ToolContext): Promise<void> {
+  await browserSessions.close(ctx)
+}
+
+export async function disposeBrowserScope(ctx: ToolContext, signal = ctx.signal): Promise<void> {
+  const closing = settleCloseTask('Browser', () => closeBrowserScope(ctx))
+  await resolveOnAbort(closing, signal, undefined)
+}
+
+export async function closeAllBrowserScopes(): Promise<void> {
+  await browserSessions.closeAll()
+}
+
+export function formatBrowserEvalResult(value: unknown): ToolResult {
+  const serialized = value !== null && typeof value === 'object' ? JSON.stringify(value) : String(value)
+  const { output, truncated } = truncateOutput(serialized || '(空结果)')
+  return { success: true, output, truncated }
+}
 
 export const browserTool: Tool = {
   name: 'browser',
@@ -28,24 +52,47 @@ export const browserTool: Tool = {
     required: ['action'],
   },
 
-  async execute(args: Record<string, unknown>, _ctx: ToolContext): Promise<ToolResult> {
+  async execute(args: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult> {
+    if (ctx.signal?.aborted) return { success: false, output: '', error: '浏览器操作已取消' }
     const action = String(args.action ?? '')
 
-    if (action === 'launch') {
-      if (browser) return { success: true, output: '浏览器已在运行' }
+    if (action === 'shot') {
+      const path = resolveBrowserShotPath(args, ctx.cwd)
+      if (!path) return { success: false, output: '', error: '缺少 path' }
+      const blocked = guardPath(ctx, path)
+      if (blocked) return { success: false, output: '', error: blocked }
+      const session = browserSessions.get(ctx)
+      if (!session) return { success: false, output: '', error: '浏览器未启动(先 launch)' }
       try {
-        browser = await chromium.launch({
-          executablePath: EDGE_PATH,
-          headless: args.headless !== false,
-        })
-        page = await browser.newPage()
-        return { success: true, output: '✅ 浏览器已启动(系统 Edge)' }
+        await session.page.screenshot({ path, fullPage: false })
+        return { success: true, output: `截图已保存: ${path}` }
+      } catch (e) {
+        return { success: false, output: '', error: `截图失败: ${(e as Error).message.slice(0, 150)}` }
+      }
+    }
+
+    if (action === 'launch') {
+      try {
+        const started = await browserSessions.launch(ctx, args.headless !== false)
+        return { success: true, output: started ? '✅ 浏览器已启动(系统 Edge)' : '浏览器已在运行' }
       } catch (e) {
         return { success: false, output: '', error: `浏览器启动失败: ${(e as Error).message.slice(0, 200)}` }
       }
     }
 
-    if (!browser || !page) return { success: false, output: '', error: '浏览器未启动(先 launch)' }
+    if (action === 'close') {
+      try {
+        const closed = await browserSessions.close(ctx)
+        return closed ? { success: true, output: '浏览器已关闭' }
+          : { success: false, output: '', error: '浏览器未启动(先 launch)' }
+      } catch (e) {
+        return { success: false, output: '', error: `关闭浏览器失败: ${(e as Error).message.slice(0, 150)}` }
+      }
+    }
+
+    const session = browserSessions.get(ctx)
+    if (!session) return { success: false, output: '', error: '浏览器未启动(先 launch)' }
+    const { page } = session
 
     if (action === 'navigate') {
       const url = String(args.url ?? '')
@@ -63,21 +110,9 @@ export const browserTool: Tool = {
       if (!expr) return { success: false, output: '', error: '缺少 expr' }
       try {
         const result = await page.evaluate(expr)
-        const text = typeof result === 'object' ? JSON.stringify(result).slice(0, 2000) : String(result)
-        return { success: true, output: text || '(空结果)' }
+        return formatBrowserEvalResult(result)
       } catch (e) {
         return { success: false, output: '', error: `执行失败: ${(e as Error).message.slice(0, 150)}` }
-      }
-    }
-
-    if (action === 'shot') {
-      const path = String(args.path ?? '')
-      if (!path) return { success: false, output: '', error: '缺少 path' }
-      try {
-        await page.screenshot({ path, fullPage: false })
-        return { success: true, output: `截图已保存: ${path}` }
-      } catch (e) {
-        return { success: false, output: '', error: `截图失败: ${(e as Error).message.slice(0, 150)}` }
       }
     }
 
@@ -90,13 +125,6 @@ export const browserTool: Tool = {
       } catch (e) {
         return { success: false, output: '', error: `点击失败: ${(e as Error).message.slice(0, 150)}` }
       }
-    }
-
-    if (action === 'close') {
-      await browser.close()
-      browser = null
-      page = null
-      return { success: true, output: '浏览器已关闭' }
     }
 
     return { success: false, output: '', error: `未知 action: ${action}(launch/navigate/eval/shot/click/close)` }

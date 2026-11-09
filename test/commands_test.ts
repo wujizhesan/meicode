@@ -199,6 +199,15 @@ async function main() {
     d.dispatch('/audit task task-1 10')
     if (!calls.some((c) => c.method === 'auditAction' && JSON.stringify(c.args[0]).includes('task-1'))) throw new Error('auditAction 未调用')
   })
+  await check('分发: /workflow 保留后续 flags', () => {
+    const { ui, calls } = makeMockUi()
+    const d = createDispatcher(makeRegistry(), ui)
+    d.dispatch('/workflow run demo --team')
+    const call = calls.find((item) => item.method === 'workflowAction')
+    if (!call || call.args[0] !== 'run' || JSON.stringify(call.args[1]) !== JSON.stringify(['demo', '--team'])) {
+      throw new Error(`workflow flags 丢失: ${JSON.stringify(call)}`)
+    }
+  })
 
   // ---------- 补全 ----------
   await check('补全: 单匹配直接补', () => {

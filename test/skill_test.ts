@@ -1,7 +1,7 @@
 // Skill 系统测试：解析/覆盖/管理/白名单/load_skill/runIsolated
-import { mkdirSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { SkillManager, loadAllSkills, parseSkillFile, createLoadSkillTool, runIsolated } from '../src/skill/index.ts'
+import { SkillManager, loadAllSkills, parseSkillFile, createLoadSkillTool, runIsolated, buildSummaryTail } from '../src/skill/index.ts'
 import { createTools, ToolRegistry } from '../src/tools/index.ts'
 import { History } from '../src/session/history.ts'
 import type { ChatMessage, Provider, StreamEvent } from '../src/provider/types.ts'
@@ -30,6 +30,12 @@ mkdirSync(BUILTIN, { recursive: true })
 mkdirSync(USER, { recursive: true })
 mkdirSync(PROJECT, { recursive: true })
 
+const summaryTail = buildSummaryTail([
+  { role: 'tool', tool_call_id: 'a', content: 'old' },
+  { role: 'tool', tool_call_id: 'b', content: `${'x'.repeat(9000)}🚀` },
+], 'output', 8000)
+if (summaryTail.length !== 8000 || !summaryTail.endsWith('🚀') || summaryTail.includes('old')) throw new Error('Skill 摘要尾部截取错误')
+
 function skillMd(name: string, desc: string, extra = ''): string {
   return `---
 name: ${name}
@@ -54,7 +60,7 @@ class FakeSkillProvider implements Provider {
   constructor(reply = '这是摘要') {
     this.reply = reply
   }
-  async *streamChat(messages: ChatMessage[], opts: { tools?: unknown }): AsyncGenerator<StreamEvent> {
+  async *streamChat(messages: ChatMessage[], _opts: { tools?: unknown }): AsyncGenerator<StreamEvent> {
     // 摘要请求（系统提示含「压缩」）返回 reply；主请求返回文本
     const isSummary = messages.some((m) => m.content.includes('压缩成'))
     yield { type: 'text', text: isSummary ? this.reply : '任务输出内容' }
@@ -78,9 +84,23 @@ async function main() {
   })
   await check('解析: 目录型 SKILL.md', () => {
     mkdirSync(join(PROJECT, 'my-skill'), { recursive: true })
-    writeFileSync(join(PROJECT, 'my-skill', 'SKILL.md'), skillMd('my-skill', '目录型'), 'utf8')
+    const file = join(PROJECT, 'my-skill', 'SKILL.md')
+    writeFileSync(file, skillMd('my-skill', '目录型', 'history: 3\n'), 'utf8')
     const { skills } = loadAllSkills({ builtin: BUILTIN, user: USER, project: PROJECT })
-    if (!skills.some((s) => s.name === 'my-skill')) throw new Error('目录型未识别')
+    const loaded = skills.find((s) => s.name === 'my-skill')
+    if (!loaded || loaded.history !== 3) throw new Error('目录型未识别')
+    loaded.tools?.push('cache-poison')
+    if (loadAllSkills({ builtin: BUILTIN, user: USER, project: PROJECT }).skills.find((s) => s.name === 'my-skill')?.tools?.includes('cache-poison')) throw new Error('Skill 缓存被调用方污染')
+    // 这里刻意保持字节数不变（3 → 4），失效只能靠 mtime/ctime；
+    // Windows NTFS 的时间戳有粒度（实测连续两次写入可能落在同一刻度），
+    // 会让自动更新落到同一毫秒而失效 —— 显式拨表，避免依赖平台时间精度
+    // 这里刻意保持字节数不变（3 → 4），失效只能靠 mtime/ctime 变化。
+    // Windows NTFS 的时间戳有粒度，连续两次写入可能落在同一刻度，
+    // 导致自动写入的时间戳与缓存记录相同 —— 显式拨到 2s 前，不再依赖平台精度
+    writeFileSync(file, skillMd('my-skill', '目录型', 'history: 4\n'), 'utf8')
+    const stamp = (Date.now() - 2000) / 1000
+    utimesSync(file, stamp, stamp)
+    if (loadAllSkills({ builtin: BUILTIN, user: USER, project: PROJECT }).skills.find((s) => s.name === 'my-skill')?.history !== 4) throw new Error('同尺寸 Skill 修改未使缓存失效')
   })
 
   // ---------- 三级覆盖 ----------
@@ -168,7 +188,9 @@ async function main() {
     const def = manager.get('commit')
     if (!def) throw new Error('commit 缺失')
     const registry = new ToolRegistry()
-    createTools({ cwd: TMP }).forEach((t) => registry.register(t))
+    createTools({ cwd: TMP }).forEach((t) => {
+      registry.register(t)
+    })
     const history = new History()
     history.push({ role: 'user', content: '问题' })
     const p = new FakeSkillProvider('摘要：任务完成')

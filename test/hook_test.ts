@@ -3,7 +3,7 @@ import { mkdirSync, rmSync, writeFileSync, readFileSync, existsSync } from 'node
 import { join } from 'node:path'
 import http from 'node:http'
 import type { AddressInfo } from 'node:net'
-import { matchPattern, matchCondition, loadHooks, HookEngine } from '../src/hook/index.ts'
+import { matchPattern, matchCondition, loadHooks, HookEngine, setSubagentSpawner } from '../src/hook/index.ts'
 import type { HookRule } from '../src/hook/index.ts'
 
 let passed = 0
@@ -93,11 +93,21 @@ async function main() {
     if (rules.length !== 2) throw new Error(`规则数 ${rules.length}，期望 2`)
     if (skipped !== 2) throw new Error(`跳过数 ${skipped}，期望 2（坏事件 + tool_before async）`)
   })
+  await check('加载: 扩展事件清单全部可用', () => {
+    const root = join(TMP, 'extended-events')
+    mkdirSync(join(root, '.mewcode'), { recursive: true })
+    const events = ['permission_request', 'permission_denied', 'subagent_start', 'subagent_stop', 'pre_compact', 'post_compact', 'task_created', 'task_completed', 'teammate_idle']
+    writeFileSync(join(root, '.mewcode', 'hooks.yaml'), `hooks:\n${events.map((event) => `  - event: ${event}\n    action:\n      type: inject_prompt\n      content: ${event}`).join('\n')}\n`, 'utf8')
+    const loaded = loadHooks(root)
+    if (loaded.skipped !== 0 || loaded.rules.length !== events.length) {
+      throw new Error(`扩展事件加载错误: ${loaded.rules.length}/${loaded.skipped}`)
+    }
+  })
 
   // ---------- 引擎 ----------
   await check('引擎: 事件触发与 once', async () => {
-    let count = 0
-    const engine = new HookEngine([
+    const count = 0
+    const _engine = new HookEngine([
       rule({ event: 'round_start', once: true, action: { type: 'command', command: 'node -e ""' } }),
     ])
     // 用 inject 检测：once 后第二次不注入
@@ -114,8 +124,113 @@ async function main() {
     await engine.fire('round_start', { cwd: TMP })
     const inj = engine.collectInjections()
     if (inj.length !== 1 || inj[0] !== '提示A') throw new Error('注入缓冲失败')
+    if (engine.collectInjections().length !== 0) throw new Error('注入被重复投递')
     engine.resetRound()
     if (engine.collectInjections().length !== 0) throw new Error('resetRound 失败')
+  })
+  await check('引擎: 未发送提示回退时保留原作用域和先后顺序', async () => {
+    const engine = new HookEngine([
+      rule({ event: 'app_start', action: { type: 'inject_prompt', content: '全局提示' } }),
+      rule({ event: 'session_start', action: { type: 'inject_prompt', content: '会话提示' } }),
+      rule({ event: 'subagent_start', action: { type: 'inject_prompt', content: 'Agent 提示' } }),
+      rule({ event: 'round_start', once: true, action: { type: 'inject_prompt', content: '本轮提示' } }),
+      rule({ event: 'round_end', action: { type: 'inject_prompt', content: '稍后到达' } }),
+    ])
+    await engine.fire('app_start', { cwd: TMP })
+    await engine.fire('session_start', { cwd: TMP, sessionId: 'lease-session' })
+    await engine.fire('subagent_start', { cwd: TMP, agentId: 'lease-agent' })
+    await engine.fire('round_start', { cwd: TMP, sessionId: 'lease-session', agentId: 'lease-agent' })
+    const scope = { sessionId: 'lease-session', agentId: 'lease-agent' }
+    const lease = engine.checkoutInjections(scope)
+    if (lease.messages.join(',') !== '全局提示,会话提示,Agent 提示,本轮提示') throw new Error('取出顺序错误')
+    await engine.fire('round_end', { cwd: TMP, ...scope })
+    lease.rollback()
+    lease.rollback()
+    await engine.fire('round_start', { cwd: TMP, ...scope })
+    if (engine.collectInjections(scope).join(',') !== '全局提示,会话提示,Agent 提示,本轮提示,稍后到达') {
+      throw new Error('回退顺序、作用域或 once 消费错误')
+    }
+    if (engine.collectInjections(scope).length !== 0) throw new Error('回退后重复投递')
+  })
+  await check('引擎: 会话或 Agent 清理后不复活已借出的提示', async () => {
+    const scope = { sessionId: 'lease-session', agentId: 'lease-agent' }
+    for (const clear of ['session', 'agent', 'round', 'commit'] as const) {
+      const engine = new HookEngine([rule({ event: 'round_start', action: { type: 'inject_prompt', content: clear } })])
+      await engine.fire('round_start', { cwd: TMP, ...scope })
+      const lease = engine.checkoutInjections(scope)
+      if (clear === 'session') engine.clearSession(scope.sessionId)
+      else if (clear === 'agent') engine.clearAgent(scope.sessionId, scope.agentId)
+      else if (clear === 'round') engine.resetRound(scope)
+      else lease.commit()
+      lease.rollback()
+      if (engine.collectInjections(scope).length !== 0) throw new Error(`${clear} 后提示复活`)
+    }
+  })
+  await check('引擎: 慢命令不延迟 prompt 注入', async () => {
+    const slowCommand = process.platform === 'win32'
+      ? 'ping -n 2 127.0.0.1 >nul'
+      : 'node -e "setTimeout(function(){}, 200)"'
+    const engine = new HookEngine([
+      rule({ event: 'subagent_start', action: { type: 'command', command: slowCommand } }),
+      rule({ event: 'subagent_start', action: { type: 'inject_prompt', content: '立即注入' } }),
+    ])
+    const pending = engine.fire('subagent_start', { cwd: TMP, sessionId: 'session-fast', agentId: 'child' })
+    const immediate = engine.collectInjections({ sessionId: 'session-fast', agentId: 'child' })
+    await pending
+    if (immediate.join(',') !== '立即注入') throw new Error('prompt 注入被前置慢命令延迟')
+  })
+  await check('引擎: 子任务结束注入路由到父 Agent', async () => {
+    const engine = new HookEngine([rule({ event: 'subagent_stop', action: { type: 'inject_prompt', content: '子任务已完成' } })])
+    await engine.fire('subagent_stop', {
+      cwd: TMP,
+      sessionId: 'session-route',
+      agentId: 'child-agent',
+      targetAgentId: 'parent-agent',
+    })
+    if (engine.collectInjections({ sessionId: 'session-route', agentId: 'child-agent' }).length !== 0) {
+      throw new Error('结束注入仍投递给已退出的子 Agent')
+    }
+    if (engine.collectInjections({ sessionId: 'session-route', agentId: 'parent-agent' }).join(',') !== '子任务已完成') {
+      throw new Error('结束注入未投递给父 Agent')
+    }
+  })
+  await check('引擎: 会话结束清理遗留注入', async () => {
+    const engine = new HookEngine([rule({ event: 'round_end', action: { type: 'inject_prompt', content: '遗留提示' } })])
+    await engine.fire('round_end', { cwd: TMP, sessionId: 'session-clear', agentId: 'agent-clear' })
+    engine.clearSession('session-clear')
+    if (engine.collectInjections({ sessionId: 'session-clear', agentId: 'agent-clear' }).length !== 0) throw new Error('会话注入未清理')
+  })
+  await check('引擎: sessionId 可用于会话条件匹配', async () => {
+    const engine = new HookEngine([
+      rule({
+        event: 'session_start',
+        if: { all: [{ match: 'sessionId', pattern: 'session-target' }] },
+        action: { type: 'inject_prompt', content: 'session matched' },
+      }),
+    ])
+    await engine.fire('session_start', { cwd: TMP, sessionId: 'session-other' })
+    await engine.fire('session_start', { cwd: TMP, sessionId: 'session-target' })
+    if (engine.collectInjections({ sessionId: 'session-target' }).join(',') !== 'session matched') throw new Error('sessionId 未进入 Hook 匹配上下文')
+  })
+  await check('引擎: 注入按会话和 Agent 隔离', async () => {
+    const engine = new HookEngine([rule({ event: 'round_start', action: { type: 'inject_prompt', content: 'agent-a-only' } })])
+    const agentA = { sessionId: 'session-1', agentId: 'agent-a' }
+    const agentB = { sessionId: 'session-1', agentId: 'agent-b' }
+    await engine.fire('round_start', { cwd: TMP, ...agentA })
+    if (engine.collectInjections(agentB).length !== 0) throw new Error('Agent A 注入泄漏到 Agent B')
+    engine.resetRound(agentB)
+    if (engine.collectInjections(agentA).join(',') !== 'agent-a-only') throw new Error('Agent B reset 清除了 Agent A 注入')
+  })
+  await check('引擎: agentId 与 stats 可参与条件匹配', async () => {
+    const engine = new HookEngine([rule({
+      event: 'subagent_stop',
+      if: { all: [{ match: 'agentId', pattern: 'agent-target' }, { match: 'stats', pattern: '*status=done*' }] },
+      action: { type: 'inject_prompt', content: 'context matched' },
+    })])
+    await engine.fire('subagent_stop', { cwd: TMP, sessionId: 'session-1', agentId: 'agent-target', stats: 'status=done tokens=1' })
+    if (engine.collectInjections({ sessionId: 'session-1', agentId: 'agent-target' }).join(',') !== 'context matched') {
+      throw new Error('新增 Hook 上下文字段未进入条件匹配')
+    }
   })
   await check('引擎: intercept 命中与未命中', async () => {
     const engine = new HookEngine([
@@ -130,9 +245,21 @@ async function main() {
     const ok = await engine.intercept({ name: 'read_file', args: { path: 'x' } }, TMP)
     if (ok !== null) throw new Error(`不应拦截: ${ok}`)
   })
+  await check('引擎: intercept 保留会话上下文', async () => {
+    const engine = new HookEngine([
+      rule({
+        event: 'tool_before',
+        if: { all: [{ match: 'sessionId', pattern: 'session-target' }, { match: 'name', pattern: 'run_command' }] },
+        action: { type: 'command', command: 'echo blocked' },
+      }),
+    ])
+    const other = await engine.intercept({ name: 'run_command', args: { command: 'echo ok' } }, { cwd: TMP, sessionId: 'session-other' })
+    const target = await engine.intercept({ name: 'run_command', args: { command: 'echo ok' } }, { cwd: TMP, sessionId: 'session-target' })
+    if (other !== null || !target) throw new Error('tool_before 未按 sessionId 隔离')
+  })
   await check('引擎: http 动作发出', async () => {
     let received = false
-    const server = http.createServer((req, res) => {
+    const server = http.createServer((_req, res) => {
       received = true
       res.writeHead(200)
       res.end()
@@ -151,6 +278,23 @@ async function main() {
     const engine = new HookEngine([rule({ event: 'round_end', action: { type: 'subagent', name: 'test' } })])
     await engine.fire('round_end', { cwd: TMP }) // 不应抛
   })
+  await check('引擎: async 规则拒绝被捕获', async () => {
+    const warnings: string[] = []
+    const originalWarn = console.warn
+    console.warn = (...args: unknown[]) => { warnings.push(args.map(String).join(' ')) }
+    try {
+      setSubagentSpawner(() => { throw new Error('async hook failed') })
+      const engine = new HookEngine([rule({ event: 'round_end', async: true, action: { type: 'subagent', name: 'broken' } })])
+      await engine.fire('round_end', { cwd: TMP })
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    } finally {
+      setSubagentSpawner(() => {})
+      console.warn = originalWarn
+    }
+    if (!warnings.some((message) => message.includes('异步规则执行失败') && message.includes('async hook failed'))) {
+      throw new Error('async Hook 拒绝未被记录')
+    }
+  })
   await check('引擎: 失败隔离——坏命令不中断', async () => {
     const engine = new HookEngine([
       rule({ event: 'round_start', action: { type: 'command', command: 'no_such_cmd_xyz_123' } }),
@@ -161,8 +305,13 @@ async function main() {
     if (!inj.includes('第二条仍执行')) throw new Error('失败后后续规则未执行')
   })
   await check('引擎: 命令超时被杀', async () => {
+    // 非 Windows 用 node 自身睡眠：新版 ubuntu-latest 运行器禁止 ICMP 原始套接字，
+    // ping 会立刻失败，"超时被杀"就变成了假通过/假失败。
+    const slowCommand = process.platform === 'win32'
+      ? 'ping -n 100 127.0.0.1'
+      : 'node -e "setTimeout(function(){},60000)"'
     const engine = new HookEngine([
-      rule({ event: 'round_start', action: { type: 'command', command: 'ping -n 100 127.0.0.1', timeout: 500 } }),
+      rule({ event: 'round_start', action: { type: 'command', command: slowCommand, timeout: 500 } }),
     ])
     const t0 = Date.now()
     await engine.fire('round_start', { cwd: TMP })
@@ -205,6 +354,18 @@ async function main() {
     if (!existsSync(logFile)) throw new Error('compact hook 未执行')
     if (!readFileSync(logFile, 'utf8').includes('post')) throw new Error('post_compact 缺失')
     rmSync(logFile, { force: true })
+  })
+
+  await check('命令模板: Hook 字段不能注入额外 shell 命令', async () => {
+    const marker = join(TMP, 'shell-injected.txt')
+    const payload = process.platform === 'win32'
+      ? `safe&echo injected>${marker}`
+      : `safe; printf injected > ${marker}`
+    const engine = new HookEngine([
+      { event: 'tool_after', action: { type: 'command', command: `echo ${'${hook.call.args.path}'}` } },
+    ])
+    await engine.fire('tool_after', { cwd: TMP, call: { name: 'read_file', args: { path: payload } } })
+    if (existsSync(marker)) throw new Error('Hook 字段触发了额外 shell 命令')
   })
 
   try { rmSync(TMP, { recursive: true, force: true }) } catch { /* 忽略 */ }

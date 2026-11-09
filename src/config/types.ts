@@ -7,4 +7,5 @@ export interface ProviderConfig {
   thinking?: boolean
   mcpServers?: Record<string, unknown>
   context_window?: number
+  max_output_tokens?: number
 }

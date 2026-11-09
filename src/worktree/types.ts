@@ -4,4 +4,5 @@ export interface WorktreeInfo {
   branch: string
   createdAt: number
   dirty: boolean
+  created?: boolean
 }

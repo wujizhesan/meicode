@@ -6,6 +6,7 @@ interface BlacklistEntry {
 
 const DANGEROUS_PATTERNS: BlacklistEntry[] = [
   { re: /^\s*rm\s+(-{1,2}[a-zA-Z]*[rf][a-zA-Z]*\s+)*\/(\s|$)/i, desc: 'rm 删除根目录' },
+  { re: /^\s*rm\s+(-{1,2}[a-zA-Z]*[rf][a-zA-Z]*\s+)*(~|\$HOME|\$\{HOME\})\/?(\s|$)/i, desc: 'rm 删除用户主目录' },
   { re: /^\s*(del|erase|rd|rmdir)\s+\/s(\s+\/q)?/i, desc: 'Windows 递归删除' },
   { re: /^\s*format\b/i, desc: '格式化磁盘' },
   { re: /^\s*diskpart(\s|$)/i, desc: '磁盘分区操作' },
@@ -13,6 +14,8 @@ const DANGEROUS_PATTERNS: BlacklistEntry[] = [
   { re: /^\s*sc\s+delete/i, desc: '服务删除' },
   { re: /^\s*shutdown\b/i, desc: '关机/重启' },
   { re: /^\s*fsutil\s+/i, desc: '文件系统底层操作' },
+  { re: /^\s*find\b.*\s-delete(\s|$)/i, desc: 'find -delete 批量删除文件' },
+  { re: /^\s*find\b.*\s-exec\s+(?:rm|shred|unlink|srm)\b/i, desc: 'find -exec 删除文件' },
 ]
 
 export function matchBlacklist(command: string): { matched: boolean; desc: string } {

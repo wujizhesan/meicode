@@ -1,0 +1,117 @@
+{
+  // MeiCode 的 lint/format 门禁（Biome 2.5）。
+  //
+  // 为什么用 Biome 而不是 ESLint：本项目用 TypeScript 7（Go 版 tsc），
+  // 而 typescript-eslint 的 peer 范围仍停在 `>=4.8.4 <6.1.0`，且 TS 7 尚不提供
+  // 稳定的 compiler API（官方指引是让 `typescript` 别名指向 TS6 —— 那会改动
+  // `tsc` 的解析链，风险大于收益）。Biome 自带 TS 解析器，不依赖 TS 编译器，
+  // 因此对编译器大版本升级免疫，同时补齐了项目原本缺失的格式化能力。
+  //
+  // 规则定位：只挡回归，不管风格。`preset: recommended` 之外，
+  // 逐条记录下面这些开关的理由——**关掉的规则都是有意为之，不是遗漏**。
+  "$schema": "https://biomejs.dev/schemas/2.5.15/schema.json",
+  "vcs": {
+    "enabled": true,
+    "clientKind": "git",
+    "useIgnoreFile": true
+  },
+  "files": {
+    "includes": [
+      "src/**/*.ts",
+      "src/**/*.tsx",
+      "test/**/*.ts",
+      "test/**/*.tsx",
+      "scripts/**/*.mjs",
+      // 自 2.2.0 起忽略目录不再需要 `/**` 后缀（带后缀会触发 useBiomeIgnoreFolder）
+      "!!test/fixtures*"
+    ]
+  },
+  "formatter": {
+    "enabled": true,
+    "indentStyle": "space",
+    "indentWidth": 2,
+    "lineWidth": 120
+  },
+  "javascript": {
+    "formatter": {
+      "quoteStyle": "single",
+      "semicolons": "asNeeded",
+      "trailingCommas": "all",
+      "arrowParentheses": "always"
+    }
+  },
+  "linter": {
+    "enabled": true,
+    "domains": {
+      "types": "recommended"
+    },
+    "rules": {
+      "preset": "recommended",
+
+      // 最高价值的一条：agent 运行时到处是 fire-and-forget，
+      // 漏掉一个 await 就是"任务静默不执行"，排查成本极高。
+      "nursery": {
+        "noFloatingPromises": "error"
+      },
+
+      // 把项目已有的好习惯钉死：src/ 目前 any 注解 0 处，这条就是护栏。
+      "suspicious": {
+        "noExplicitAny": "error",
+        // 项目用 `X | void` 表达"回调可以不返回"（如 `mutator: (g) => void | boolean`、
+        // `beforeRequest?: (...) => Promise<Result | void>`），是有意的 API 契约而非笔误；
+        // 规则建议的 `undefined` 与"函数返回 void"的写法互相打架，故关掉（4 处均已逐条确认）。
+        "noConfusingVoidType": "off"
+      },
+
+      "correctness": {
+        // React 依赖数组在 TUI 的流式状态机里是语境敏感的：
+        // 补依赖可能引发重渲染循环，9 处告警均需人工判断，故只提示不阻断。
+        "useExhaustiveDependencies": "warn",
+        "useYield": "error"
+      },
+
+      "style": {
+        // strict 模式下 `arr[i]!` 是正确写法而非坏味道（586 处）。
+        "noNonNullAssertion": "off",
+        // 字符串拼接 vs 模板串，纯口味（369 处）。
+        "useTemplate": "off"
+      },
+
+      "complexity": {
+        // 可选链 vs && 短路，纯口味（52 处）。
+        "useOptionalChain": "off",
+        // **不能**开：测试里大量用 `obj['privateField']` 绕过 TS 私有可见性来断言内部状态
+        //（如 `mail['waiters']`，而 `waiters` 在 src/team/mail.ts 里是 `private`）。
+        // 这条规则的自动修复会把下标改成点号，直接把编译跑挂——它不是风格问题，是必需的逃生舱。
+        "useLiteralKeys": "off"
+      }
+    }
+  },
+
+  // 仅测试目录放宽：`${...}` 在测试里几乎都是被测系统的**运行时模板占位符**，
+  // 必须是字面量——hook 命令模板的 `${hook.call.name}`、MCP 配置的 `${MEW_TEST_VAR}`
+  // 展开都是如此。它们被写成 `${'...'}` 正是为了阻止 JS 侧提前插值，
+  // 规则在这里报的全是误报（9 处已逐条确认）。src/ 仍保持该规则开启。
+  "overrides": [
+    {
+      "includes": ["test/**"],
+      "linter": {
+        "rules": {
+          "suspicious": {
+            "noTemplateCurlyInString": "off"
+          }
+        }
+      }
+    }
+  ],
+
+  "assist": {
+    "enabled": true,
+    "actions": {
+      "source": {
+        // 不做自动整理 import：会与手写的分组顺序打架。
+        "organizeImports": "off"
+      }
+    }
+  }
+}

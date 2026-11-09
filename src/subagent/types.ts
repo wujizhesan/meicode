@@ -30,7 +30,11 @@ export interface SpawnRequest {
   parentTools?: Tool[]
 }
 
-export type SubAgentStatus = 'created' | 'running' | 'done' | 'error' | 'cancelled' | 'timed_out'
+export type SubAgentStatus = 'created' | 'running' | 'saving' | 'done' | 'error' | 'cancelled' | 'timed_out'
+
+export function isActiveSubAgentStatus(status: SubAgentStatus): boolean {
+  return status === 'created' || status === 'running' || status === 'saving'
+}
 
 export interface SubAgentRecord {
   id: string
@@ -43,6 +47,10 @@ export interface SubAgentRecord {
   startedAt: number
   updatedAt?: number
   finishedAt?: number
+  ownerId?: string
+  leaseExpiresAt?: number
+  cancelRequestedAt?: number
+  cancelReason?: string
   tokens?: number
   reportId?: string
   result?: string

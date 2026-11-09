@@ -18,8 +18,8 @@ export function toMewTool(serverName: string, info: RemoteToolInfo, manager: Mcp
     name: `${serverName}_${info.name}`,
     description: info.description || `远程工具（MCP Server: ${serverName}）`,
     parameters: convertSchema(info.inputSchema),
-    async execute(args) {
-      return manager.callTool(serverName, info.name, args)
+    async execute(args, ctx) {
+      return manager.callTool(serverName, info.name, args, ctx.signal)
     },
   }
 }

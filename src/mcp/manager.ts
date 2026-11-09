@@ -2,8 +2,11 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
 import type { McpServerConfig } from './config.ts'
+import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js'
 import type { ToolResult } from '../tools/index.ts'
 import { withIdleTimeout } from '../provider/timeout.ts'
+import { resolveOnAbort } from '../tools/abort.ts'
+import { MEICODE_VERSION } from '../version.ts'
 
 export interface RemoteToolInfo {
   name: string
@@ -32,8 +35,8 @@ export class McpClientManager {
   }
 
   private async connect(server: McpServerConfig): Promise<Client> {
-    const client = new Client({ name: 'meicode', version: '0.1.0' }, { capabilities: {} })
-    let transport
+    const client = new Client({ name: 'meicode', version: MEICODE_VERSION }, { capabilities: {} })
+    let transport: Transport
     if (server.type === 'stdio') {
       const env: Record<string, string> = {}
       if (server.env && Object.keys(server.env).length > 0) {
@@ -146,28 +149,42 @@ export class McpClientManager {
     return this.toolCache.get(serverName)
   }
 
-  async callTool(serverName: string, toolName: string, args: Record<string, unknown>): Promise<ToolResult> {
+  async callTool(serverName: string, toolName: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<ToolResult> {
+    const cancelled: ToolResult = { success: false, output: '', error: '[MCP 错误] 工具调用已取消' }
+    if (signal?.aborted) return cancelled
     let client = this.clients.get(serverName)
     if (!client) {
       const server = this.findServer(serverName)
       if (!server) return { success: false, output: '', error: `[MCP 错误] 未找到 Server: ${serverName}` }
       try {
-        client = await this.ensureConnected(server)
+        client = await resolveOnAbort<Client | undefined>(() => this.ensureConnected(server), signal, undefined)
+        if (!client || signal?.aborted) return cancelled
       } catch (e) {
+        if (signal?.aborted) return cancelled
         return { success: false, output: '', error: `[MCP 错误] 连接失败: ${(e as Error).message}` }
       }
     }
+    if (signal?.aborted) return cancelled
+    // SDK 不移除请求的 abort 监听，用独立信号避免在会话信号上累积。
+    const controller = new AbortController()
+    const onAbort = (): void => controller.abort(signal?.reason)
+    signal?.addEventListener('abort', onAbort, { once: true })
+    if (signal?.aborted) onAbort()
     try {
       // 30s 超时兜底：MCP Server 挂起时不阻塞 Agent Loop
-      const result = await withIdleTimeout(client.callTool({ name: toolName, arguments: args }), 30000)
+      const result = await withIdleTimeout(client.callTool({ name: toolName, arguments: args }, undefined, { signal: controller.signal, timeout: 30000 }), 30000)
+      if (signal?.aborted) return cancelled
       return toToolResult(result)
     } catch (e) {
+      if (signal?.aborted) return cancelled
       if (this.clients.get(serverName) === client) {
         this.clients.delete(serverName)
         this.toolCache.delete(serverName)
         await this.closeClient(client)
       }
       return { success: false, output: '', error: `[MCP 错误] ${(e as Error).message}` }
+    } finally {
+      signal?.removeEventListener('abort', onAbort)
     }
   }
 

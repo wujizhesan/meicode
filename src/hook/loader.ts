@@ -1,14 +1,10 @@
 import { readFileSync, existsSync } from 'node:fs'
-import { homedir } from 'node:os'
-import { join } from 'node:path'
 import { parse } from 'yaml'
-import { INTERCEPT_EVENTS } from './types.ts'
+import { HOOK_EVENTS, INTERCEPT_EVENTS } from './types.ts'
 import type { HookAction, HookEventName, HookRule } from './types.ts'
+import { projectStatePath, userStatePath } from '../state-paths.ts'
 
-const VALID_EVENTS = new Set<HookEventName>([
-  'session_start', 'session_end', 'round_start', 'round_end',
-  'message', 'tool_before', 'tool_after', 'app_start', 'app_exit',
-])
+const VALID_EVENTS = new Set<HookEventName>(HOOK_EVENTS)
 
 function validateAction(action: unknown): action is HookAction {
   if (!action || typeof action !== 'object') return false
@@ -46,8 +42,8 @@ function parseRule(raw: Record<string, unknown>): HookRule | null {
 // 加载项目 + 用户 hooks.yaml（项目覆盖用户同名 index——按数组顺序合并）
 export function loadHooks(cwd: string): { rules: HookRule[]; skipped: number } {
   const files = [
-    join(homedir(), '.mewcode', 'hooks.yaml'),
-    join(cwd, '.mewcode', 'hooks.yaml'),
+    userStatePath('hooks.yaml'),
+    projectStatePath(cwd, 'hooks.yaml'),
   ]
   const rules: HookRule[] = []
   let skipped = 0

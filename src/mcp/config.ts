@@ -12,8 +12,7 @@ export function expandEnv(value: string): string {
 }
 
 export function parseMcpServers(
-  rawUser: unknown,
-  rawProject: unknown,
+  ...layers: unknown[]
 ): { servers: McpServerConfig[]; skipped: string[] } {
   // 兼容两种声明格式：
   //  map:   { name: { type, command, args, env, url, headers } }
@@ -38,8 +37,7 @@ export function parseMcpServers(
       }
     }
   }
-  absorb(rawUser)
-  absorb(rawProject)
+  for (const layer of layers) absorb(layer)
 
   const servers: McpServerConfig[] = []
   const skipped: string[] = []

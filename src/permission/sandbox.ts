@@ -20,9 +20,8 @@ export async function resolveReal(target: string): Promise<string> {
 
 export async function isPathAllowed(target: string, cwd: string, extraRoots: string[] = []): Promise<boolean> {
   const absolute = isAbsolute(target) ? target : join(cwd, target)
-  const real = await resolveReal(absolute)
+  const [real, ...roots] = await Promise.all([absolute, cwd, ...extraRoots].map((path) => resolveReal(path)))
   const normalize = (value: string): string => (process.platform === 'win32' ? value.toLowerCase() : value)
   const resolved = normalize(real)
-  const roots = await Promise.all([cwd, ...extraRoots].map((root) => resolveReal(root)))
   return roots.map(normalize).some((root) => resolved === root || resolved.startsWith(root + sep))
 }

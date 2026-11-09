@@ -1,4 +1,5 @@
 import type { Tool, ToolContext, ToolResult } from './types.ts'
+import { resolveOnAbort } from './abort.ts'
 
 // Elicitation 工具(对齐 Claude Code):agent 主动反问用户
 // 信息不足/需要决策时调用——不猜、不问死,拿用户回答继续
@@ -21,7 +22,7 @@ export const elicitTool: Tool = {
     if (!question) return { success: false, output: '', error: '缺少参数 question' }
     const options = Array.isArray(args.options) ? (args.options as unknown[]).map(String).filter(Boolean) : []
     if (!ctx.elicit) return { success: false, output: '', error: `[elicit 无交互通道] ${question}` }
-    const answer = await ctx.elicit(question, options)
+    const answer = await resolveOnAbort(() => ctx.elicit!(question, options, ctx.signal), ctx.signal, null)
     if (answer === null) return { success: false, output: '', error: '[elicit 用户未回答]' }
     return { success: true, output: `用户回答: ${answer}` }
   },

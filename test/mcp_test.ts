@@ -1,5 +1,5 @@
 // MCP 客户端测试：配置/发现/注册/调用/隔离/HTTP/缓存
-import { spawn, execSync } from 'node:child_process'
+import { spawn } from 'node:child_process'
 import { join } from 'node:path'
 import { parseMcpServers, McpClientManager, registerMcpTools } from '../src/mcp/index.ts'
 import { createTools, ToolRegistry } from '../src/tools/index.ts'
@@ -22,7 +22,7 @@ const FIXTURE = join(import.meta.dirname, 'fixtures_mcp', 'mcp_server.ts')
 const HTTP_FIXTURE = join(import.meta.dirname, 'fixtures_mcp', 'mcp_http_server.ts')
 const RUN = 'node'
 
-function stdioServer(name: string, command = 'node'): Parameters<typeof parseMcpServers>[0] {
+function _stdioServer(name: string, command = 'node'): Parameters<typeof parseMcpServers>[0] {
   return {
     [name]: { type: 'stdio', command, args: ['--import', 'tsx', FIXTURE] },
   }
@@ -46,7 +46,9 @@ async function startHttpServer(): Promise<{ url: string; kill: () => void }> {
 
 function makeRegistry(): ToolRegistry {
   const r = new ToolRegistry()
-  createTools({ cwd: process.cwd() }).forEach((t) => r.register(t))
+  createTools({ cwd: process.cwd() }).forEach((t) => {
+    r.register(t)
+  })
   return r
 }
 

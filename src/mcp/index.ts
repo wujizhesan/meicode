@@ -6,13 +6,24 @@ export interface McpRegisterResult {
   ok: string[]
   failed: { name: string; error: string }[]
   toolCount: number
+  registered: string[]
 }
 
-// 发现并注册全部远端工具（懒连接；单 Server 失败不影响其他）
-export async function registerMcpTools(registry: ToolRegistry, manager: McpClientManager): Promise<McpRegisterResult> {
+export interface McpToolRegistrar {
+  readonly ready: boolean
+  discover(): Promise<McpRegisterResult>
+}
+
+export async function registerMcpTools(
+  registry: ToolRegistry,
+  manager: McpClientManager,
+  registeredServers = new Set<string>(),
+): Promise<McpRegisterResult> {
   const { ok, failed } = await manager.discoverAll()
   let toolCount = 0
+  const registered: string[] = []
   for (const serverName of ok) {
+    if (registeredServers.has(serverName)) continue
     const tools = manager.getTools(serverName) ?? []
     for (const info of tools) {
       try {
@@ -22,8 +33,25 @@ export async function registerMcpTools(registry: ToolRegistry, manager: McpClien
         // 重名等注册失败跳过
       }
     }
+    registeredServers.add(serverName)
+    registered.push(serverName)
   }
-  return { ok, failed, toolCount }
+  return { ok, failed, toolCount, registered }
+}
+
+export function createMcpToolRegistrar(registry: ToolRegistry, manager: McpClientManager): McpToolRegistrar {
+  const registeredServers = new Set<string>()
+  let ready = false
+  return {
+    get ready() {
+      return ready
+    },
+    async discover() {
+      const result = await registerMcpTools(registry, manager, registeredServers)
+      ready = result.failed.length === 0
+      return result
+    },
+  }
 }
 
 export { McpClientManager, type RemoteToolInfo, type DiscoverResult } from './manager.ts'

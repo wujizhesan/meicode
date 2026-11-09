@@ -18,6 +18,8 @@ const DANGEROUS_WARNINGS: WarningEntry[] = [
   { re: /^\s*git\s+branch\s+-D/i, category: 'git', warning: 'git branch -D 强制删除分支' },
   { re: /^\s*git\s+--no-verify/i, category: 'git', warning: 'git --no-verify 跳过 commit/push 钩子(绕过检查)' },
   { re: /^\s*git\s+commit\s+--amend/i, category: 'git', warning: 'git commit --amend 改写已提交信息' },
+  { re: /^\s*git\s+remote\s+(add|remove|rename|set-url|prune|update)\b/i, category: 'git', warning: 'git remote 修改远端配置或远端跟踪状态' },
+  { re: /^\s*git\s+config\b/i, category: 'git', warning: 'git config 可能修改仓库或全局 Git 配置' },
   { re: /^\s*(rm|Remove-Item)\s+(-[a-zA-Z]*r[a-zA-Z]*\s+)+/i, category: 'file', warning: 'rm -r 递归删除目录' },
   { re: /^\s*(rm|Remove-Item)\s+(-[a-zA-Z]*f[a-zA-Z]*)/i, category: 'file', warning: 'rm -f 强制删除文件' },
   { re: /^\s*rm\s+-rf/i, category: 'file', warning: 'rm -rf 递归强制删除' },

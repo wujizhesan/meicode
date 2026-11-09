@@ -1,15 +1,51 @@
-import { readdirSync, readFileSync, existsSync, statSync } from 'node:fs'
+import { closeSync, fstatSync, openSync, readdirSync, readFileSync, statSync, type Dirent } from 'node:fs'
 import { join } from 'node:path'
-import { parse } from 'yaml'
+import { parseFrontmatter } from '../frontmatter.ts'
 import type { SkillDef, SkillSource } from './types.ts'
 
 interface Frontmatter {
-  name?: string
-  description?: string
-  tools?: string[]
-  mode?: string
-  history?: number
-  model?: string
+  name?: unknown
+  description?: unknown
+  tools?: unknown
+  mode?: unknown
+  history?: unknown
+  model?: unknown
+}
+
+interface CachedSkillDef {
+  size: number
+  mtimeMs: number
+  ctimeMs: number
+  ino: number
+  def: SkillDef | null
+}
+
+const skillDefCache = new Map<string, CachedSkillDef>()
+
+function cloneSkillDef(def: SkillDef): SkillDef {
+  return { ...def, tools: def.tools ? [...def.tools] : undefined }
+}
+
+function loadCachedSkillDef(file: string, source: SkillSource): SkillDef | null {
+  const key = `${source}:${file}`
+  let fd: number
+  try {
+    fd = openSync(file, 'r')
+  } catch {
+    return null
+  }
+  try {
+    const stats = fstatSync(fd)
+    const cached = skillDefCache.get(key)
+    if (cached && cached.size === stats.size && cached.mtimeMs === stats.mtimeMs && cached.ctimeMs === stats.ctimeMs && cached.ino === stats.ino) {
+      return cached.def ? cloneSkillDef(cached.def) : null
+    }
+    const def = parseSkillContent(readFileSync(fd, 'utf8'), file, source)
+    skillDefCache.set(key, { size: stats.size, mtimeMs: stats.mtimeMs, ctimeMs: stats.ctimeMs, ino: stats.ino, def })
+    return def ? cloneSkillDef(def) : null
+  } finally {
+    closeSync(fd)
+  }
 }
 
 export function parseSkillFile(file: string, source: SkillSource): SkillDef | null {
@@ -19,6 +55,14 @@ export function parseSkillFile(file: string, source: SkillSource): SkillDef | nu
   } catch {
     return null
   }
+  return parseSkillContent(raw, file, source)
+}
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === 'string' && value.trim().length > 0
+}
+
+function parseSkillContent(raw: string, file: string, source: SkillSource): SkillDef | null {
   // frontmatter：---\n...\n---
   const m = raw.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/)
   if (!m) {
@@ -27,13 +71,33 @@ export function parseSkillFile(file: string, source: SkillSource): SkillDef | nu
   }
   let fm: Frontmatter
   try {
-    fm = (parse(m[1]) ?? {}) as Frontmatter
+    fm = parseFrontmatter<Frontmatter>(m[1])
   } catch (e) {
     console.warn(`[Skill] frontmatter 解析失败，跳过: ${file}（${(e as Error).message}）`)
     return null
   }
-  if (!fm.name || !fm.description) {
-    console.warn(`[Skill] 缺 name/description，跳过: ${file}`)
+  if (!fm || typeof fm !== 'object' || Array.isArray(fm)) {
+    console.warn(`[Skill] frontmatter 必须是字段对象，跳过: ${file}`)
+    return null
+  }
+  if (!isNonEmptyString(fm.name) || !isNonEmptyString(fm.description)) {
+    console.warn(`[Skill] name/description 必须是非空字符串，跳过: ${file}`)
+    return null
+  }
+  if (fm.tools !== undefined && (!Array.isArray(fm.tools) || !fm.tools.every(isNonEmptyString))) {
+    console.warn(`[Skill] tools 必须是字符串数组，且工具名不能为空，跳过: ${file}`)
+    return null
+  }
+  if (fm.mode !== undefined && fm.mode !== 'shared' && fm.mode !== 'isolated') {
+    console.warn(`[Skill] mode 必须是 shared 或 isolated，跳过: ${file}`)
+    return null
+  }
+  if (fm.history !== undefined && (typeof fm.history !== 'number' || !Number.isSafeInteger(fm.history) || fm.history < 0)) {
+    console.warn(`[Skill] history 必须是非负安全整数，跳过: ${file}`)
+    return null
+  }
+  if (fm.model !== undefined && !isNonEmptyString(fm.model)) {
+    console.warn(`[Skill] model 必须是非空字符串，跳过: ${file}`)
     return null
   }
   return {
@@ -50,18 +114,29 @@ export function parseSkillFile(file: string, source: SkillSource): SkillDef | nu
 
 // 扫描一个目录：文件型 *.md + 目录型 <name>/SKILL.md
 export function scanDir(dir: string, source: SkillSource): SkillDef[] {
-  if (!existsSync(dir)) return []
   const out: SkillDef[] = []
-  for (const entry of readdirSync(dir)) {
-    const full = join(dir, entry)
-    if (statSync(full).isDirectory()) {
-      const entryMd = join(full, 'SKILL.md')
-      if (existsSync(entryMd)) {
-        const def = parseSkillFile(entryMd, source)
-        if (def) out.push(def)
+  let entries: Dirent[]
+  try {
+    entries = readdirSync(dir, { withFileTypes: true })
+  } catch {
+    return out
+  }
+  for (const entry of entries) {
+    const full = join(dir, entry.name)
+    let isDirectory = entry.isDirectory()
+    if (entry.isSymbolicLink()) {
+      try {
+        isDirectory = statSync(full).isDirectory()
+      } catch {
+        continue
       }
-    } else if (entry.endsWith('.md')) {
-      const def = parseSkillFile(full, source)
+    }
+    if (isDirectory) {
+      const entryMd = join(full, 'SKILL.md')
+      const def = loadCachedSkillDef(entryMd, source)
+      if (def) out.push(def)
+    } else if (entry.name.endsWith('.md')) {
+      const def = loadCachedSkillDef(full, source)
       if (def) out.push(def)
     }
   }

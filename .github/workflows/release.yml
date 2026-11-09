@@ -1,41 +1,61 @@
 name: Release
 
+# 发版：推送 v* 标签触发。
+# 鉴权走 npm Trusted Publishing（GitHub OIDC），仓库里不放任何 npm token。
 on:
-  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
 
 permissions:
-  contents: write
+  contents: write # 创建 GitHub Release
+  id-token: write # Trusted Publishing 必需的 OIDC 权限
 
 jobs:
   publish:
-    runs-on: windows-latest
+    # 必须是 GitHub 托管运行器，自托管 runner 不支持 OIDC
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@v4
       - name: Setup Node.js
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 24
+          registry-url: 'https://registry.npmjs.org'
           cache: npm
+      # Trusted Publishing 要求 npm CLI >= 11.5.1。
+      # 锁在 11.x：npm 12 的 EALLOWREMOTE 策略会拒绝任何 remote tarball URL，
+      # 在发布链路上多一个不必要的变量。
+      - name: Pin npm CLI
+        run: npm install -g 'npm@^11.5.1' && npm --version
       - name: Install dependencies
         run: npm ci
-      - name: Test
+      - name: Lint
+        run: npm run lint
+      - name: Typecheck and test
         run: npm test
-      - name: Package smoke test
+      - name: Build package
+        run: npm run build
+      - name: Production package smoke test
         run: npm run package:smoke
+        env:
+          MEICODE_SKIP_BUILD: 'true'
+      # 私有仓库不支持 provenance 自动生成，显式关掉避免发布阶段报错
+      - name: Publish to npm
+        run: npm publish --ignore-scripts --access=public
+        env:
+          NPM_CONFIG_PROVENANCE: 'false'
       - name: Build release asset
-        shell: pwsh
         run: |
-          npm run build
-          New-Item -ItemType Directory -Force release | Out-Null
-          npm pack --pack-destination release --ignore-scripts
+          mkdir -p release
+          npm pack --ignore-scripts --pack-destination release
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        shell: pwsh
         run: |
-          $version = node -p "require('./package.json').version"
-          gh release create "v$version" "release/meicode-$version.tgz" `
-            --repo "$env:GITHUB_REPOSITORY" `
-            --title "MeiCode v$version" `
+          version=$(node -p "require('./package.json').version")
+          gh release create "v$version" release/*.tgz \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "MeiCode v$version" \
             --generate-notes

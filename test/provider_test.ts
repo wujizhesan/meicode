@@ -1,7 +1,6 @@
 import { OpenAIProvider, toOpenAIMessages } from '../src/provider/openai.ts'
 import { AnthropicProvider, toAnthropicBody } from '../src/provider/anthropic.ts'
 import type { ProviderConfig } from '../src/config/types.ts'
-import type { ChatMessage } from '../src/provider/types.ts'
 
 let passed = 0
 let failed = 0
@@ -37,8 +36,12 @@ await check('openai: tool 消息 → tool_call_id', () => {
 })
 
 await check('openai: 普通消息原样', () => {
-  const out = toOpenAIMessages([{ role: 'user', content: 'hi' }])
+  const input = { role: 'user' as const, content: 'hi' }
+  const out = toOpenAIMessages([input])
   assert(out[0].role === 'user' && out[0].content === 'hi', 'user 消息转换错')
+  assert(out[0] === input, '普通消息应复用原对象')
+  const emptyTools = toOpenAIMessages([{ role: 'assistant', content: 'ok', tool_calls: [] }])
+  assert(!('tool_calls' in emptyTools[0]), '空工具数组不应进入请求')
 })
 
 // ---------- Anthropic 转换 ----------
@@ -99,6 +102,24 @@ await check('anthropic: 连续同角色合并 + 带 tool_calls 不合并', () =>
   assert(msgs[0].role === 'user' && String(msgs[0].content).includes('a\n\nb'), 'user 未合并')
 })
 
+await check('anthropic: system 不打断 assistant 合并', () => {
+  const body = toAnthropicBody(
+    [{ role: 'assistant', content: '' }, { role: 'system', content: '规则' }, { role: 'assistant', content: '继续' }],
+    'm', false,
+  )
+  const messages = body.messages as { role: string; content: { type: string; text?: string }[] }[]
+  assert(messages.length === 1 && messages[0].content[0]?.text === '\n\n继续', 'assistant 合并语义变化')
+})
+
+await check('anthropic: 工具参数缓存随字符串修改失效', () => {
+  const toolCall = { id: 'cached', name: 'read_file', arguments: '{"path":"a.ts"}' }
+  toAnthropicBody([{ role: 'assistant', content: '', tool_calls: [toolCall] }], 'm', false)
+  toolCall.arguments = '{"path":"b.ts"}'
+  const body = toAnthropicBody([{ role: 'assistant', content: '', tool_calls: [toolCall] }], 'm', false)
+  const messages = body.messages as { content: { type: string; input?: { path?: string } }[] }[]
+  assert(messages[0].content[0]?.input?.path === 'b.ts', '工具参数缓存返回旧值')
+})
+
 await check('anthropic: 多工具轮 result 合并到同一条消息(400 根因回归)', () => {
   // Anthropic 要求 assistant(tool_use) 的所有 result 在"下一条消息"——
   // 分开成多条会报 tool_use without tool_result；但合并不能丢 id
@@ -137,6 +158,12 @@ await check('anthropic: thinking 参数', () => {
   const body = toAnthropicBody([{ role: 'user', content: 'x' }], 'm', true)
   assert((body.thinking as { type: string }).type === 'enabled', 'thinking 未开启')
   assert(body.max_tokens === 32000, 'thinking 时 max_tokens 应 32000')
+})
+
+await check('anthropic: 配置输出预算限制 thinking budget', () => {
+  const body = toAnthropicBody([{ role: 'user', content: 'x' }], 'm', true, undefined, 4096)
+  assert(body.max_tokens === 4096, '自定义 max_tokens 未生效')
+  assert((body.thinking as { budget_tokens: number }).budget_tokens === 4095, 'thinking budget 未限制在输出预算内')
 })
 
 await check('provider: 预取消信号会传递到请求', async () => {

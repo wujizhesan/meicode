@@ -5,10 +5,8 @@ import { editFileTool } from './edit_file.ts'
 import { runCommandTool } from './run_command.ts'
 import { findFilesTool } from './find_files.ts'
 import { grepCodeTool } from './grep_code.ts'
-import { shotDiffTool } from './shot_diff.ts'
-import { snapshotTool, rollbackTool } from './snapshot.ts'
-import { codeIntelTool } from './code_intel.ts'
-import { browserTool } from './browser.ts'
+import { browserTool, rollbackTool, shotDiffTool, snapshotTool } from './low_frequency.ts'
+import { codeIntelTool } from './code_intel_lazy.ts'
 import { elicitTool } from './elicit.ts'
 
 export function createTools(_ctx: ToolContext): Tool[] {

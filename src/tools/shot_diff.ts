@@ -1,8 +1,8 @@
 import { readFileSync, writeFileSync } from 'node:fs'
 import { resolve } from 'node:path'
-import { PNG } from 'pngjs'
-import pixelmatch from 'pixelmatch'
+import { resolveOnAbort } from './abort.ts'
 import { guardPath } from './types.ts'
+import { resolveShotDiffOutputPath } from './shot_diff_path.ts'
 import type { Tool, ToolContext, ToolResult } from './types.ts'
 
 // 复刻验证工具：两张 PNG 像素对比（原版 vs 复刻），输出 diff 百分比 + 差异区域 + diff 图
@@ -23,14 +23,19 @@ export const shotDiffTool: Tool = {
   },
 
   async execute(args: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult> {
+    if (ctx.signal?.aborted) return { success: false, output: '', error: '图片对比已取消' }
+    const loaded = await resolveOnAbort(() => Promise.all([import('pngjs'), import('pixelmatch')]), ctx.signal, null)
+    if (!loaded || ctx.signal?.aborted) return { success: false, output: '', error: '图片对比已取消' }
+    const [{ PNG }, { default: pixelmatch }] = loaded
     const basePath = resolve(ctx.cwd, String(args.base ?? ''))
     const targetPath = resolve(ctx.cwd, String(args.target ?? ''))
-    const blocked = guardPath(ctx, basePath, false) ?? guardPath(ctx, targetPath, false) // 纯读截图
+    const outPath = resolveShotDiffOutputPath(args, ctx.cwd)
+    const blocked = guardPath(ctx, outPath)
     if (blocked) return { success: false, output: '', error: blocked }
     const threshold = typeof args.threshold === 'number' ? Math.max(0, Math.min(1, args.threshold)) : 0.1
 
-    let base: PNG
-    let target: PNG
+    let base: InstanceType<typeof PNG>
+    let target: InstanceType<typeof PNG>
     try {
       base = PNG.sync.read(readFileSync(basePath))
       target = PNG.sync.read(readFileSync(targetPath))
@@ -70,7 +75,7 @@ export const shotDiffTool: Tool = {
       }
     }
 
-    const outPath = args.out ? resolve(ctx.cwd, String(args.out)) : `${targetPath}.diff.png`
+    if (ctx.signal?.aborted) return { success: false, output: '', error: '图片对比已取消' }
     try {
       writeFileSync(outPath, PNG.sync.write(diff))
     } catch (e) {

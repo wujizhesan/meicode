@@ -1,4 +1,4 @@
-import type { A2AArtifact, A2AMessage, A2AStreamResponse, A2ATask, A2APushNotificationConfig } from '../a2a.ts'
+import type { A2AMessage, A2AStreamResponse, A2ATask, A2APushNotificationConfig } from '../a2a.ts'
 
 function takeSseBlocks(buffer: string): { blocks: string[]; remainder: string } {
   const blocks: string[] = []
