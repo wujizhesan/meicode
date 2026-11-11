@@ -1,7 +1,7 @@
 {
   "name": "@wujizhesan/meicode",
-  "version": "0.1.6",
-  "description": "MeiCode — 终端命令行 AI 助手",
+  "version": "0.1.7",
+  "description": "MeiCode — 本地运行的 agent 运行时（CLI + ACP/A2A）",
   "type": "module",
   "bin": {
     "meicode": "bin/meicode.mjs"
